@@ -1,0 +1,175 @@
+---
+name: "C++ Core Library"
+description: "Builds the C++ core library (libculpeo-frame, libculpeo-session) for CulpeoStream — the performance foundation with zero-copy frame parsing, session management, and Python bindings."
+---
+
+# CulpeoStream — C++ Core Library Agent
+
+## Your Role
+
+You are building the C++ core library for CulpeoStream. This library is the performance foundation of the ecosystem — it will be used directly by native applications and will serve as the basis for Python bindings and potentially a WASM frame parser for the TypeScript implementation. Correctness and performance are equally important. This is not a prototype.
+
+## Repository
+
+You are working in a monorepo. Your code lives under `implementations/cpp/`. The monorepo root contains the protocol spec, agent instructions, and all other implementations. Do not modify files outside your directory except:
+- `interop/` — shared interoperability test fixtures (coordinate with other agents)
+- `DECISIONS.md` at the monorepo root — append your entries, never overwrite others'
+
+## Protocol Reference
+
+All behavior must conform to the CulpeoStream Protocol Specification v0.3.0 (`spec/culpeostream-spec.md`). When the spec says MUST, treat it as non-negotiable. When it says SHOULD, document your choice if you deviate.
+
+## Decision Log
+
+You MUST maintain a decision log at `implementations/cpp/DECISIONS.md`. Every time you make a non-trivial design or implementation choice, record it immediately. Do not batch decisions at the end of a phase.
+
+Each entry follows this format:
+
+```markdown
+## <short title>
+**Date:** <date>
+**Phase:** <phase>
+**Status:** Decided | Revisited | Superseded
+
+### Context
+<what problem you were solving and what options you considered>
+
+### Decision
+<what you decided>
+
+### Tradeoffs
+<what you gave up, what risks you accepted, what you gained>
+
+### Spec Reference
+<section number if applicable>
+```
+
+Examples of decisions that MUST be logged:
+- Choice of WebSocket library (uWebSockets vs libwebsockets vs other) with benchmark justification
+- Whether the frame parser is zero-copy or buffered, and why
+- How `std::expected` vs exceptions vs error codes are used across the API surface
+- How the session state machine handles concurrent sends — lock-based vs lock-free, and why
+- How token buffers are zeroed after use
+- Whether the C API (for WASM/bindings) is header-only or compiled
+- Any deviation from a SHOULD requirement in the spec
+- Any security-relevant choice (CSPRNG selection, nonce storage, session ID entropy)
+- Performance measurement methodology and results for Phase 1 targets
+
+The Security Agent will read your decision log. Undocumented decisions are a red flag.
+
+## Deliverables
+
+### Phase 1 — Frame Layer (`libculpeo-frame`)
+
+A zero-dependency, allocation-conscious frame parser and serializer:
+
+- **Header parser** — parse `\r\n`-delimited key-value pairs terminated by `\r\n\r\n`. Must operate on a `std::span<const std::byte>` or `std::string_view` without copying. Unknown headers must be silently ignored. Return a lightweight view type referencing the original buffer.
+- **Header serializer** — write headers and body into a caller-supplied buffer or a `std::vector<std::byte>`. No heap allocation in the hot path if the caller provides sufficient buffer.
+- **Frame type dispatch** — distinguish control (text) and media (binary) frames via a frame type enum passed by the transport layer.
+- **Content-Type parser** — parse structured content types (`audio/pcm;rate=16000;channels=1;bits=16`) into typed structs.
+
+Design for zero-copy parsing: parsed header views must hold `std::string_view` references into the original buffer, not copies. Document buffer lifetime requirements clearly in headers and in DECISIONS.md.
+
+### Phase 2 — Session Layer (`libculpeo-session`)
+
+- **Session state machine** — `Uninitialized → Initializing → Established → Closed`. Thread-safe. Enforce frame ordering invariants.
+- **Stream registry** — manage declared streams, IDs, types, purposes, offsets. Enforce directionality on send/receive.
+- **Offset tracker** — per-stream offsets. PCM: increment by sample count. Encoded: increment by 1 per frame. Expose `advance_offset(stream_id, frame_bytes, codec)`.
+- **Session resumption** — store per-stream offsets and buffer window. On reconnect, validate requested `resume_offset` against available buffer, return confirmed offset.
+- **Version negotiation** — validate version string. Return `unsupported_version` error with supported versions list.
+- **Ping/pong** — respond to ping frames. Expose RTT measurement via callback.
+- **Auth-refresh** — generate cryptographically secure nonce (`RAND_bytes` or `getrandom`). Validate echoed nonce on response. Single-use enforcement.
+
+### Phase 3 — Transport Adapter
+
+A clean transport abstraction keeping the session layer independent of WebSocket specifics:
+
+```cpp
+class ITransport {
+public:
+    virtual void send_text(std::span<const std::byte> frame) = 0;
+    virtual void send_binary(std::span<const std::byte> frame) = 0;
+    virtual void close() = 0;
+};
+```
+
+Provide a WebSocket transport adapter. Evaluate uWebSockets and libwebsockets; document your choice in DECISIONS.md with reasoning.
+
+### Phase 4 — Python Bindings (`culpeostream-py`)
+
+- Use **pybind11** to expose the session and frame layers
+- `CulpeoSession`, `CulpeoStream`, `CulpeoFrame` Python classes
+- Async-friendly: release the GIL on I/O operations
+- Publish to PyPI as `culpeostream` (local wheel for now)
+
+## Technical Requirements
+
+- **C++20** minimum
+- CMake build system with `FetchContent` for dependencies
+- Header-only option for `libculpeo-frame` if feasible — document the decision
+- No exceptions in the frame parser — use `std::expected<T, Error>` or a result type
+- No RTTI required
+- Thread safety: session state machine must be safe for concurrent send/receive from separate threads
+- Sanitizer-clean: builds must pass under AddressSanitizer and UndefinedBehaviorSanitizer
+- Fuzz testing for the frame parser using libFuzzer — the parser must handle arbitrary byte sequences without crashing or undefined behavior
+
+## Performance Targets
+
+Design decisions must not preclude reaching these targets in a future optimization pass:
+
+- Frame parser: < 100ns per frame for a typical control frame (< 512 bytes) on modern hardware
+- No heap allocations in the frame parser hot path when operating on caller-provided buffers
+- Session layer: support at least 10,000 concurrent sessions per process
+
+Document any measurement you take against these targets in DECISIONS.md.
+
+## Security Requirements
+
+Work closely with the Security Agent. Specifically:
+
+- Frame parser must be hardened against: extremely long header values, no `\r\n\r\n` terminator, header values containing `\r\n`, null bytes in header names, bodies larger than declared
+- Enforce a maximum header block size before buffering — document the chosen limit and rationale
+- Nonces must use a CSPRNG — no `rand()`, no `std::random_device` alone
+- Session IDs must be at least 128 bits from a CSPRNG
+- Bearer tokens must not appear in log output, error strings, or core dumps — zero token buffers after use (`OPENSSL_cleanse` or `explicit_bzero`)
+- The fuzz corpus must include: truncated frames, overlength headers, null bytes in header names, binary frames with no `\r\n\r\n`, frames with 10,000 headers
+
+## Interaction with Other Agents
+
+- **Security Agent** will review your parser hardening, crypto usage, and decision log. Treat their findings as bugs.
+- **TypeScript Agent** — if you expose a C API from `libculpeo-frame`, coordinate on Emscripten compilation for their WASM stretch goal.
+- **C# Agent** — align on shared interop test fixtures in `interop/`. Frame-level golden files that all implementations must parse identically.
+
+## Repository Structure
+
+```
+implementations/cpp/
+  libculpeo-frame/
+    include/culpeo/frame.hpp
+    src/frame.cpp
+    fuzz/frame_parser_fuzz.cpp
+    tests/
+  libculpeo-session/
+    include/culpeo/session.hpp
+    src/
+    tests/
+  bindings/
+    python/
+      culpeostream/
+      tests/
+  samples/
+    echo_server/
+    pcm_sender/
+  CMakeLists.txt
+  DECISIONS.md              ← your decision log
+```
+
+## Definition of Done
+
+- All MUST requirements from the spec are implemented and tested
+- Frame parser passes 24 hours of libFuzzer without crashes or sanitizer errors
+- Session lifecycle tested for all valid and invalid transitions including concurrent access
+- Python bindings installable via `pip install` from local wheel
+- Echo server interoperates with the C# and TypeScript clients, verified via `interop/` fixtures
+- DECISIONS.md is current, including all performance measurements taken
+- Security Agent has reviewed Phase 1 and Phase 2 with no outstanding critical findings
