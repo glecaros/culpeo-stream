@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/CulpeoStream.Core/CulpeoStream.Core.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/CulpeoStream.Core.Tests/CulpeoStream.Core.Tests.csproj" />
+  </Folder>
+</Solution>

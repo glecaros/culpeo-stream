@@ -2,7 +2,7 @@
 
 **Version:** 0.3.0-draft  
 **Status:** Draft  
-**Last Updated:** 2026-05-25
+**Last Updated:** 2026-05-28
 
 ---
 
@@ -94,12 +94,30 @@ Frames are distinguished by a `Frame-Type` property communicated by the transpor
 ### 4.1 Header Syntax
 
 ```
-header-field = field-name ":" SP field-value CRLF
-field-name   = token          ; case-insensitive ASCII
+header-field = field-name ":" OWS field-value OWS CRLF
+field-name   = token          ; case-insensitive ASCII, no leading/trailing whitespace
 field-value  = *( VCHAR / SP )
+OWS          = *( SP / HTAB )  ; optional whitespace
 ```
 
-Header names follow the same token rules as HTTP/1.1. Implementations MUST ignore unknown headers. Duplicate headers with the same name are not permitted; behavior on receipt of duplicate headers is undefined.
+Implementations MUST parse the header value by stripping leading and trailing `SP` and `HTAB` characters (optional whitespace). The colon separator MAY be followed by zero or more `SP` or `HTAB` characters before the field value begins. Header names MUST NOT contain leading or trailing whitespace; implementations MUST NOT trim or normalize header names beyond case-insensitive matching of reserved headers.
+
+Header names follow the same token rules as HTTP/1.1. Implementations MUST ignore unknown headers. Duplicate headers with the same name MUST NOT appear in a frame. If a frame contains duplicate headers, the implementation MUST reject the frame as a protocol error. The order of headers within a frame is not significant; implementations MUST NOT depend on header ordering for correctness.
+
+Header names and values MUST NOT contain CR (`\r`), LF (`\n`), or NUL (`\0`) bytes. Implementations MUST reject any frame containing these bytes in a header field name or value as a protocol error.
+
+### 4.1.1 Parser Limits
+
+Implementations MUST enforce the following limits during header parsing. A frame that exceeds any limit MUST be rejected before further buffering or processing.
+
+| Limit | Minimum Required | Recommended Default |
+|---|---|---|
+| Maximum header block size (bytes) | 8,192 | 8,192 |
+| Maximum number of headers per frame | 64 | 64 |
+| Maximum individual header name length (bytes) | 256 | 256 |
+| Maximum individual header value length (bytes) | 4,096 | 4,096 |
+
+Implementations MAY allow operators to configure higher limits but MUST NOT default to unlimited. If the header block terminator (`\r\n\r\n`) is not found within the maximum header block size, the implementation MUST reject the frame without buffering additional data.
 
 ### 4.2 Reserved Headers
 
@@ -109,7 +127,7 @@ The following headers are defined by this specification:
 |---|---|---|
 | `Event` | Control / event | The event type. Required on all control and event frames. |
 | `Content-Type` | All | Media type of the body. Required when body is non-empty. |
-| `Authorization` | `culpeo.init` | Credentials for session authentication. See Addendum A. |
+| `Authorization` | `culpeo.init`, `culpeo.auth-response` | Credentials for session authentication. See Addendum A. |
 | `Session-Id` | `culpeo.init-ack`, `culpeo.init` (resume) | Server-assigned session identifier. |
 | `Stream-Id` | Media, stream-scoped events | Identifies the stream this frame belongs to. |
 | `Offset` | Media, `culpeo.init-ack` (resume) | Frame sequence offset within the stream. See Section 8.2. |
@@ -118,11 +136,13 @@ The following headers are defined by this specification:
 | `Reason` | `culpeo.init-error`, `culpeo.close` | Human-readable description of an error or close condition. |
 | `Code` | `culpeo.init-error`, `culpeo.close` | Machine-readable error or close code. |
 
+Integer-valued headers (`Offset`, `Timestamp`, `Buffer-Window`) MUST be serialized as base-10 decimal integers with no leading zeros, no leading `+` sign, no exponent notation, and no decimal point. Implementations MUST reject non-integer values for these headers as a protocol error.
+
 ### 4.3 Body
 
 The body is the octets following the header terminator (`\r\n\r\n`) to the end of the frame.
 
-- For **control and event frames**, the body MUST be a valid UTF-8 JSON object. An empty body is represented as `{}`.
+- For **control and event frames**, the body MUST be a valid UTF-8 JSON object. An empty body is represented as `{}`. Serializers MUST emit `{}` when the body would otherwise be empty; an absent body is not permitted on control or event frames.
 - For **media frames**, the body is the raw media payload described by the `Content-Type` header.
 
 ---
@@ -161,6 +181,8 @@ Sending a media frame on a stream in a direction inconsistent with its declared 
 Stream identifiers are assigned by the server in `culpeo.init-ack`. They are opaque strings, unique within a session, and MUST be generated using a cryptographically secure random number generator.
 
 On resumption, the client MAY include previously assigned stream IDs as hints. The server MAY honor these IDs or assign new ones. If IDs are reassigned, the client MUST use the new IDs for all subsequent frames and SHOULD match streams by `type` and `purpose` when remapping.
+
+Resumption is all-or-nothing with respect to streams: the client MUST declare exactly the same set of streams (matched by `type`, `content_type`, and `purpose`) as the original session. If the server cannot match every declared stream to an existing stream in the session, it MUST reject the resumption with `culpeo.init-error` code `invalid-streams`. The server MUST NOT create new streams during resumption or silently drop unmatched declarations.
 
 On a fresh session, any client-provided IDs in stream declarations MUST be ignored by the server.
 
@@ -218,6 +240,12 @@ A server receiving a `culpeo.init` frame MUST validate the following. Violations
 3. `type` MUST be one of `input`, `output`, `duplex`.
 4. When two or more streams share the same `type`, all streams of that `type` MUST declare a `purpose`.
 5. `purpose` values MUST be unique within a `type`.
+
+### 5.6 Stream Count Limits
+
+Implementations MUST enforce a maximum number of streams per session. The default maximum MUST NOT exceed **16** streams. Implementations MAY allow operators to configure a higher limit.
+
+A `culpeo.init` frame declaring more streams than the server's configured maximum MUST be rejected with `culpeo.init-error` code `invalid-streams` and reason indicating the limit was exceeded. The server SHOULD reject the frame before allocating per-stream resources for the excess streams.
 
 ---
 
@@ -319,6 +347,7 @@ Sent by the server when `culpeo.init` fails. The server MUST close the connectio
 Event: culpeo.init-error
 Code: <error-code>
 Reason: <human-readable description>
+Content-Type: application/json
 
 {}
 ```
@@ -329,6 +358,7 @@ For `unsupported-version`, the body MUST include the versions the server support
 Event: culpeo.init-error
 Code: unsupported-version
 Reason: Protocol version not supported
+Content-Type: application/json
 
 {"supported_versions": ["0.2", "0.3"]}
 ```
@@ -348,7 +378,9 @@ Defined error codes:
 
 #### `culpeo.ping`
 
-Sent by either party at any time after session establishment to measure round-trip latency or verify connection liveness. The receiving party MUST respond with `culpeo.pong`.
+Sent by either party at any time after session establishment to measure round-trip latency or verify connection liveness. The receiving party MUST respond with `culpeo.pong`, subject to rate limiting.
+
+Implementations MUST enforce a per-session ping rate limit. The default limit MUST NOT exceed **5 pings per second** per session. Pings received in excess of the rate limit SHOULD be silently dropped without sending a pong response. Implementations MUST NOT close the session solely due to excess pings.
 
 ```
 Event: culpeo.ping
@@ -387,6 +419,8 @@ Content-Type: application/json
 {"nonce": "<server-generated-nonce>"}
 ```
 
+The server MUST NOT issue a new `culpeo.auth-refresh` while a previous challenge is outstanding (i.e., before receiving the corresponding `culpeo.auth-response` or closing the session due to timeout). A client that receives a second `culpeo.auth-refresh` while one is already pending SHOULD ignore the duplicate.
+
 ---
 
 #### `culpeo.auth-response`
@@ -401,6 +435,8 @@ Content-Type: application/json
 {"nonce": "<echoed-nonce>"}
 ```
 
+Clients MAY refuse to respond to `culpeo.auth-refresh` if the challenge frequency exceeds application policy. A client that chooses to refuse SHOULD close the session with code `protocol-error`.
+
 ---
 
 #### `culpeo.close`
@@ -411,6 +447,7 @@ Sent by either party to initiate graceful session termination. The receiving par
 Event: culpeo.close
 Code: <close-code>
 Reason: <human-readable description>
+Content-Type: application/json
 
 {}
 ```
@@ -440,7 +477,9 @@ Timestamp: <microseconds>
 <binary payload>
 ```
 
-`Stream-Id` MUST reference a stream confirmed in `culpeo.init-ack`. Sending a media frame on a stream whose `type` does not permit the sending direction MUST result in `culpeo.close` with code `protocol-error`.
+`Stream-Id` MUST reference a stream confirmed in `culpeo.init-ack`. The `Content-Type` header on a media frame MUST match the `content_type` declared for that stream. Comparison MUST be case-insensitive for the media type and subtype portions; parameter comparison MUST be case-insensitive for parameter names and case-sensitive for parameter values. A mismatch MUST result in `culpeo.close` with code `protocol-error`.
+
+Sending a media frame on a stream in a direction inconsistent with its declared `type` MUST result in `culpeo.close` with code `protocol-error`.
 
 #### Defined Media Content Types
 
@@ -449,6 +488,8 @@ Timestamp: <microseconds>
 | `audio/pcm;rate=<hz>;channels=<n>;bits=<depth>` | Raw linear PCM audio |
 | `audio/opus` | Opus-encoded audio frames |
 | `audio/aac` | AAC-encoded audio |
+
+For `audio/pcm`, the parameters `rate`, `channels`, and `bits` are all REQUIRED. Implementations MUST reject a stream declaration or media frame with an `audio/pcm` content type that is missing any of these three parameters. The `rate` parameter specifies the sample rate in hertz, `channels` specifies the number of audio channels (MUST be ≥ 1), and `bits` specifies the bit depth per sample (MUST be a positive multiple of 8). Unknown parameters on `audio/pcm` MUST be ignored. Parameter order is not significant.
 
 Implementations that receive an unknown `Content-Type` on a media frame SHOULD discard the frame and MAY send `culpeo.close` with code `protocol-error`.
 
@@ -497,6 +538,10 @@ Client                            Server
 
 If the `resume_offset` for a stream is within the server's buffer, the server resumes from that offset. If partially evicted, the server resumes from the earliest available offset for that stream and reports it in `culpeo.init-ack`. Streams whose buffer has fully expired resume from the current position with no replay.
 
+A client MUST NOT request a `resume_offset` greater than the highest offset it has received for that stream. If a `resume_offset` exceeds the server's current offset for that stream, the server MUST reject the resumption with `culpeo.init-error` code `invalid-streams`. The server MUST clamp each accepted `resume_offset` upward to the earliest available buffered offset (i.e., `confirmed_offset = max(requested_offset, earliest_available_offset)`).
+
+Session expiry MUST be determined by wall-clock time elapsed since disconnection. The server MUST track the time of disconnection and compare it against the negotiated `Buffer-Window` from the original session. If the elapsed time exceeds the buffer window, the session has expired.
+
 If the session itself has expired, the server responds with `culpeo.init-error` code `invalid-session`. The client SHOULD treat this as a new session.
 
 ### 7.3 Version Negotiation
@@ -509,12 +554,20 @@ The client MUST NOT retry version negotiation on the same connection. It MAY ope
 
 Sessions are maintained server-side for the duration of the negotiated `Buffer-Window` after a connection drop. After this window elapses, the session and its buffers are discarded. The server MAY adjust the effective buffer window based on resource constraints and MUST reflect the actual window in `culpeo.init-ack`.
 
+If the client omits the `Buffer-Window` header from `culpeo.init`, the server MUST use its configured default (up to the maximum). A `Buffer-Window` value of `0` indicates the client does not request resumption capability; the server MUST reflect `0` in `culpeo.init-ack` and MAY discard session state immediately on disconnect. Servers MUST NOT inherit `Buffer-Window` values from previous sessions during resumption; the client MUST explicitly request a buffer window on each `culpeo.init`.
+
+### 7.4.1 Buffer-Window Limits
+
+Implementations MUST enforce a maximum `Buffer-Window` value. The default maximum MUST NOT exceed **30,000 milliseconds** (30 seconds). Implementations MAY allow operators to configure a higher limit.
+
+If a client requests a `Buffer-Window` exceeding the server's maximum, the server MUST clamp it to the configured maximum and reflect the actual value in `culpeo.init-ack`. The server MUST NOT allocate buffer resources based on the client's requested value before clamping.
+
 ### 7.5 Ordering and Invariants
 
 - The client MUST send `culpeo.init` as its first frame. Any other frame before `culpeo.init-ack` is a protocol error.
 - The server MUST send `culpeo.init-ack` or `culpeo.init-error` as its first frame.
 - After session establishment, both parties MAY send media and event frames in any order.
-- `Offset` values on media frames are monotonically increasing within a stream.
+- `Offset` values on media frames MUST be strictly contiguous within a stream. Each frame's offset MUST equal the next expected offset (previous offset plus the previous frame's increment). A frame with an offset that does not match the expected next offset is a protocol error and MUST result in `culpeo.close` with code `protocol-error`. Gaps and reordering are not permitted.
 - Clients MUST track the highest `Offset` received per stream for use in resumption.
 
 ---
@@ -597,6 +650,12 @@ Applications requiring strict event ordering SHOULD use a single `duplex` stream
 | `x-<name>.*` | Recommended for private or experimental application events. |
 | Any other namespaced form | Permitted for registered or well-known application protocols. |
 
+### 9.5 Event Name Format
+
+Event names are **case-sensitive** ASCII strings. Implementations MUST NOT normalize event names (e.g., by lowercasing or trimming whitespace). An event name MUST NOT contain leading or trailing whitespace, consecutive dots, or empty segments.
+
+The reserved `culpeo.` prefix MUST be matched exactly — case-sensitive, no leading/trailing whitespace, no alternate encodings. Event names such as `CULPEO.init`, `culpeo..init`, or `culpeo.init ` are not valid protocol events and MUST be rejected as protocol errors.
+
 ---
 
 ## 10. Error Handling
@@ -607,7 +666,9 @@ If either party receives a frame that violates this specification, it MUST send 
 
 ### 10.2 Unknown Events
 
-Implementations MUST ignore frames with unknown `Event` values and continue the session. This applies to unknown application events and future protocol events from newer versions of this specification.
+Implementations MUST first validate event name syntax per Section 9.5. A syntactically invalid event name (e.g., malformed `culpeo.*` variants) MUST be rejected as a protocol error. Only after syntax validation passes SHOULD unknown, well-formed event names be ignored per the forward-compatibility rule below.
+
+Implementations MUST ignore frames with unknown but well-formed `Event` values and continue the session. This applies to unknown application events and future protocol events from newer versions of this specification.
 
 ### 10.3 Unknown Headers
 
@@ -649,15 +710,27 @@ Token validation is the responsibility of the server implementation. The protoco
 
 The server MAY issue a `culpeo.auth-refresh` challenge at any time, typically when a token is approaching expiry, a security policy requires periodic re-authentication, or suspicious activity is detected.
 
-The client MUST echo the nonce from `culpeo.auth-refresh` in its `culpeo.auth-response`. If the client fails to respond within a server-defined timeout, the server MUST close the session with code `auth-expired`.
+The server MUST NOT have more than one outstanding `culpeo.auth-refresh` challenge per session at any time. The server MUST NOT issue `culpeo.auth-refresh` challenges more frequently than once per **30 seconds** per session. Implementations MAY allow operators to configure a longer minimum interval but MUST NOT allow a shorter one.
+
+The client MUST echo the nonce from `culpeo.auth-refresh` in its `culpeo.auth-response`. If the client fails to respond within a server-defined timeout, the server MUST close the session with code `auth-expired`. Server implementations MUST enforce this timeout; the default timeout MUST NOT exceed **30 seconds**. Implementations MAY allow operators to configure a longer timeout but MUST NOT allow disabling it entirely.
+
+Nonces MUST be single-use. After a nonce has been validated in a `culpeo.auth-response`, the server MUST discard it and MUST reject any subsequent response echoing the same nonce.
 
 ### A.5 Security Considerations
 
 - CulpeoStream MUST be used over an encrypted transport in production.
 - Tokens SHOULD have a limited lifetime.
 - Nonces in `culpeo.auth-refresh` MUST be generated using a cryptographically secure random number generator and MUST be unique per challenge.
-- Session IDs MUST be generated using a cryptographically secure random number generator and MUST be unguessable.
+- Session IDs MUST be generated using a cryptographically secure random number generator with at least 128 bits of entropy and MUST be unguessable.
 - Server implementations SHOULD rate-limit connection attempts to mitigate credential stuffing.
+
+### A.6 Credential Confidentiality
+
+Implementations MUST NOT include the value of the `Authorization` header in log output, error messages, exception payloads, debug traces, telemetry attributes, or any other observable channel. When diagnostic output requires reference to an authorization event, the credential value MUST be redacted or omitted entirely.
+
+This requirement applies to all frames carrying `Authorization` — specifically `culpeo.init` and `culpeo.auth-response` — and to any internal representation of those frames (parsed structs, in-memory buffers, serialized traces).
+
+Implementations in languages with automatic memory management SHOULD avoid retaining credential strings longer than necessary. Implementations in native languages MUST zero credential buffers after use.
 
 ---
 
@@ -667,11 +740,15 @@ This addendum defines how CulpeoStream frames are carried over WebSocket ([RFC 6
 
 ### B.1 Sub-Protocol Declaration
 
-The sub-protocol identifier `culpeostream` SHOULD be declared during the WebSocket upgrade:
+Clients MUST include the `culpeostream` sub-protocol identifier in the WebSocket upgrade request:
 
 ```
 Sec-WebSocket-Protocol: culpeostream
 ```
+
+Servers MUST echo `Sec-WebSocket-Protocol: culpeostream` in the upgrade response. If the server does not include the sub-protocol in its response, the client MUST abort the connection before sending any CulpeoStream frames.
+
+Servers that do not recognize the `culpeostream` sub-protocol MUST reject the upgrade request per RFC 6455 Section 4.2.2.
 
 ### B.2 Frame Type Mapping
 
