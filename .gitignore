@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+build/
+bin/
+obj/
+
+# IDE
+.idea/
+*.suo
+*.user
+*.sln.docstates
+.vscode/settings.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# C++ / CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.o
+*.a
+*.so
+*.dylib
+
+# .NET
+*.nupkg
+*.snupkg
+project.lock.json
+*.nuget.props
+*.nuget.targets
