@@ -11,4 +11,4 @@ option(CULPEO_BUILD_TESTS "Build CulpeoStream unit tests" ON)
 option(CULPEO_ENABLE_FUZZ "Build libFuzzer targets" OFF)
 
 add_subdirectory(libculpeo-frame)
-# add_subdirectory(libculpeo-session)
+add_subdirectory(libculpeo-session)

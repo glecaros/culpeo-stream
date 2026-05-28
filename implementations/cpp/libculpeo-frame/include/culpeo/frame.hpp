@@ -62,6 +62,7 @@ enum class Error {
 struct ParseLimits {
     std::size_t max_header_block_bytes{8192};
     std::size_t max_header_value_bytes{4096};
+    std::size_t max_header_count{64};
 };
 
 struct HeaderFieldView {

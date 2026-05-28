@@ -68,6 +68,68 @@ Keep the development carve-out, but require production implementations to fail c
 ### Resolution
 Accepted Risk for local-only development. Production guidance still requires tightening.
 
+## Phase 1 implementation review — scope and methodology
+**Date:** 2026-05-28
+**Target:** C# | TypeScript | C++
+**Status:** Resolved
+
+### Context
+Reviewing all three Phase 1 implementations against the Part 2 checklists in the security agent instructions. Phase 2 is beginning in parallel.
+
+### Finding or Decision
+Reviewed all source files directly rather than delegating to sub-agents because the relevant files are few, well-bounded, and reading them in context produces higher-confidence findings than summarized output. This kept the review window clean and all tracing auditable in this log.
+
+### Recommended Action
+File findings immediately so Phase 2 agents see them before writing new code.
+
+### Resolution
+Resolved. Seven findings filed to `security/findings/`. See individual files for details.
+
+---
+
+## Accepting silent-drop as valid alternative to close for excess pings
+**Date:** 2026-05-28
+**Target:** C# | TypeScript
+**Status:** Open
+
+### Context
+Both C# and TypeScript DECISIONS.md claim the connection is closed with `rate-limit-exceeded` on ping flood, but the code silently drops excess pings. Both behaviors are defensible.
+
+### Finding or Decision
+I treated this as a Medium finding rather than High because:
+1. The silent-drop behavior is not weaker from a DoS perspective — it avoids reconnection storms.
+2. The failure is documentation vs. implementation divergence, not an active security gap.
+3. No monitoring code relying on `rate-limit-exceeded` exists in Phase 1.
+
+### Recommended Action
+The implementations must explicitly choose one behavior, document it correctly, and both must match. The current state (both drop silently, both document close) is a contract violation that can silently break monitoring code added in later phases.
+
+### Resolution
+Open. Awaiting decision from C# and TypeScript agents.
+
+---
+
+## Accepting TypeScript JSON.parse prototype pollution risk as Low
+**Date:** 2026-05-28
+**Target:** TypeScript
+**Status:** Accepted Risk
+
+### Context
+`parseJsonObject` uses `JSON.parse` on attacker-controlled frame bodies. Prototype pollution via `__proto__` keys in JSON is a known JavaScript vulnerability class.
+
+### Finding or Decision
+Modern JavaScript engines (V8, SpiderMonkey, JavaScriptCore) treat `JSON.parse` as using `[[DefineOwnProperty]]` semantics, not `[[Set]]`. The `__proto__` setter is not triggered; any `__proto__` key becomes an own property of the parsed object, not a prototype modification. Downstream property accesses (`frame.body.nonce`, `frame.body.streams`, etc.) operate on named own properties and are not affected.
+
+Additionally, no code path spreads a parsed body object into a shared singleton or mutable prototype.
+
+### Recommended Action
+Accepted. No action required for Phase 1. If the implementation later processes body objects with `Object.assign` or similar merges that could trigger the setter, revisit this.
+
+### Resolution
+Accepted Risk. Will monitor in Phase 2 if new body processing patterns emerge.
+
+---
+
 ## Limiting Phase 1 scope to spec deliverables
 **Date:** 2026-05-26
 **Target:** Spec

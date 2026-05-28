@@ -1,8 +1,10 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/CulpeoStream.Core/CulpeoStream.Core.csproj" />
+    <Project Path="src/CulpeoStream.AspNetCore/CulpeoStream.AspNetCore.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/CulpeoStream.Core.Tests/CulpeoStream.Core.Tests.csproj" />
+    <Project Path="tests/CulpeoStream.AspNetCore.Tests/CulpeoStream.AspNetCore.Tests.csproj" />
   </Folder>
 </Solution>

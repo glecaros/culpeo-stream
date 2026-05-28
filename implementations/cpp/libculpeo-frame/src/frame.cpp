@@ -80,7 +80,7 @@ constexpr std::array<std::string_view, 10> kReservedHeaderNames{
 
 [[nodiscard]] constexpr bool valid_header_value(std::string_view value) noexcept {
     for (const char ch : value) {
-        if (ch == '\r' || ch == '\n') {
+        if (ch == '\r' || ch == '\n' || ch == '\0') {
             return false;
         }
     }
@@ -200,7 +200,11 @@ parse_headers(FrameType frame_type, std::string_view frame, ParseLimits limits) 
     parsed.body = frame.substr(terminator + 4U);
 
     std::size_t line_start = 0;
+    std::size_t header_count = 0;
     while (line_start < parsed.header_block.size()) {
+        if (header_count >= limits.max_header_count) {
+            return std::unexpected(Error::header_block_too_large);
+        }
         auto line_end = parsed.header_block.find("\r\n", line_start);
         if (line_end == std::string_view::npos) {
             line_end = parsed.header_block.size();
@@ -230,6 +234,7 @@ parse_headers(FrameType frame_type, std::string_view frame, ParseLimits limits) 
             return std::unexpected(reserved_result.error());
         }
 
+        ++header_count;
         line_start = line_end + 2U;
     }
 

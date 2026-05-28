@@ -116,3 +116,105 @@ Adds one dev dependency and a formatting pass, but ensures consistent style acro
 
 ### Spec Reference
 TypeScript agent requirements
+
+---
+
+## Phase 2: Custom Typed Event Emitter (no EventTarget, no external library)
+**Date:** 2026-05-27
+**Phase:** Phase 2
+**Status:** Decided
+
+### Context
+The client needs a typed event emitter for `media`, `event`, `close`, `reconnecting`, `connected`, `disconnected`, `error`, and `rtt` events. Three options were considered:
+1. **EventTarget** (browser/Node built-in) — untyped, requires `CustomEvent<T>` wrappers, verbose
+2. **mitt** or **tiny-emitter** — external runtime dependency, violates the zero-dep requirement for the core; would add a dependency to the client package
+3. **Custom TypedEventEmitter** — zero deps, full TypeScript discriminated-union types, minimal code
+
+### Decision
+Implemented a custom `TypedEventEmitter<EventMap>` class in `src/events.ts`. It uses a `Map<key, Set<listener>>` internally, fires synchronously, and provides `on`, `off`, `once`, `emit`, and `removeAllListeners`. The generic constraint uses `extends object` (not `extends Record<string, unknown>`) to allow normal interface types without requiring index signatures.
+
+### Tradeoffs
+A custom emitter means slightly more code to maintain, but it gives us perfect TypeScript inference (discriminated-union payloads, `void` events that take no argument) with zero runtime dependencies and no coupling to Node.js EventEmitter.
+
+### Spec Reference
+TypeScript agent requirements — zero runtime dependencies in core; full type coverage
+
+---
+
+## Phase 2: Full-Jitter Exponential Backoff with crypto.getRandomValues()
+**Date:** 2026-05-27
+**Phase:** Phase 2
+**Status:** Decided
+
+### Context
+The reconnect strategy needs to avoid thundering-herd after mass disconnects while still converging quickly for isolated failures. Three jitter strategies were considered:
+1. **No jitter** — all clients retry at the same moment
+2. **Equal jitter** — `cap/2 + random(0, cap/2)` — guarantees a minimum wait
+3. **Full jitter** — `random(0, min(maxDelay, base × 2^attempt))` — lowest average delay, good spread
+
+Additionally, `Math.random()` is prohibited by the security spec. The security requirement states all randomness must use `crypto.getRandomValues()`.
+
+### Decision
+Full jitter using `crypto.getRandomValues()`. Formula: `floor(random() × min(maxDelayMs, baseDelayMs × 2^attempt))`. Default parameters: `baseDelayMs: 1000`, `maxDelayMs: 30000`, `maxAttempts: Infinity`.
+
+The `randomFloat()` function is injectable for testing (deterministic backoff in unit tests).
+
+### Tradeoffs
+Full jitter can produce very short delays at low attempt numbers, which is acceptable because the spread prevents coordination. The `crypto.getRandomValues()` dependency requires a modern runtime (Node.js 15+, modern browsers) — both already required by the rest of the stack.
+
+### Spec Reference
+TypeScript agent security requirements — `crypto.getRandomValues()`, never `Math.random()`
+
+---
+
+## Phase 2: auth-refresh While Media Frames Are In Flight
+**Date:** 2026-05-27
+**Phase:** Phase 2
+**Status:** Decided
+
+### Context
+The spec requires the client to respond to `culpeo.auth-refresh` by calling an async token callback and sending `culpeo.auth-response` with the echoed nonce. The question is: what happens to media frames received while the async token refresh is in progress?
+
+### Decision
+Delegate entirely to the core `CulpeoClientSession`, which handles `culpeo.auth-refresh` in `handleAuthRefresh()`. The session processes frames sequentially via `session.receive()` — each call returns a Promise, but since JavaScript is single-threaded and the WebSocket `message` event is synchronous, frames are processed in arrival order. The `void session.receive(frame)` pattern means we fire-and-forget, so multiple auth-refresh + media frames can be in the microtask queue simultaneously.
+
+This is acceptable because:
+1. Media frames arriving during auth-refresh are tracked by offset and delivered normally
+2. The nonce is echoed from the auth-refresh frame body (not regenerated), so there's no race on nonce generation
+3. The core session's `CulpeoClientSession` handles the auth-response dispatch atomically within the `handleAuthRefresh` method
+
+No explicit locking or queuing is added in the client layer.
+
+### Tradeoffs
+A strict sequential processing model (queue all frames until auth-response is sent) would provide stronger ordering guarantees but add complexity. The current approach is correct for the protocol because offset tracking and auth-refresh operate on orthogonal state.
+
+### Spec Reference
+Section 8.3 (auth-refresh); Addendum A.4 (token handling)
+
+---
+
+## Phase 2: wss:// Enforcement Implementation
+**Date:** 2026-05-27
+**Phase:** Phase 2
+**Status:** Decided
+
+### Context
+The security spec requires wss:// by default, with ws:// allowed only via explicit opt-in with a warning.
+
+### Decision
+`validateUrl()` is called at the start of `connect()` before any state is mutated. The check is:
+1. If URL starts with `wss://` (case-insensitive) → proceed silently
+2. If URL starts with `ws://` and `allowInsecure: true` → emit `console.warn` with a clear message mentioning token/data exposure risk, then proceed
+3. If URL starts with `ws://` without `allowInsecure` → return `Promise.reject(new Error(...))` (never throw synchronously from an async method)
+4. Any other scheme → `Promise.reject(new Error(...))`
+
+The function returns a rejected Promise rather than throwing, so all callers use a single async error channel (`await connect(...)` catches both validation and protocol errors consistently).
+
+The `console.warn` message includes the string "insecure" and warns about token/data exposure. It does NOT include the URL itself (which could contain credentials in query params in pathological cases).
+
+### Tradeoffs
+A synchronous throw would be simpler, but rejected Promises are more consistent for an async method. The `allowInsecure` flag must be explicitly `true` (not just truthy) to prevent accidental opt-in.
+
+### Spec Reference
+TypeScript agent security requirements — wss:// enforcement
+

@@ -99,3 +99,222 @@ Adds one more CMake file per library, but each library is self-contained and can
 
 ### Spec Reference
 C++ agent instructions Technical Requirements
+
+## Phase 2: Session-layer thread-safety strategy
+**Date:** 2026-05-28
+**Phase:** Phase 2 — Session Layer
+**Status:** Decided
+
+### Context
+The agent spec requires concurrent send/receive from separate threads. Options considered:
+1. Single `std::mutex` protecting all session state
+2. `std::shared_mutex` with shared reads for hot paths
+3. Lock-free state machine with `std::atomic`
+
+### Decision
+Single `std::mutex` (`impl_->mutex`) protecting all session state. The mutex is acquired at the start of each public method and released **before** any transport I/O. Callbacks are invoked without the mutex held to prevent deadlock if the callback re-enters the session.
+
+### Tradeoffs
+A coarse lock simplifies reasoning about state consistency and eliminates deadlock potential from re-entrant callbacks. The downside is that concurrent `send_media` calls from multiple threads are serialized. In practice the lock is held only for state validation and offset arithmetic (< 1µs), making contention negligible for real workloads. The transport's own buffering ensures the actual I/O cost isn't under the lock.
+
+### Spec Reference
+C++ agent instructions Technical Requirements
+
+## Phase 2: Nonce generation approach
+**Date:** 2026-05-28
+**Phase:** Phase 2 — Session Layer
+**Status:** Decided
+
+### Context
+The spec (§A.5) and agent instructions require CSPRNG nonces. Options: `RAND_bytes` (OpenSSL), `getrandom` syscall, `std::random_device`.
+
+### Decision
+Use `RAND_bytes(buf, 32)` from OpenSSL (already a dependency via `libssl-dev`). This generates 32 bytes (256 bits) per nonce, hex-encoded to a 64-character string.
+
+The choice of RAND_bytes over getrandom:
+- OpenSSL is already linked for `OPENSSL_cleanse` and `CRYPTO_memcmp`
+- RAND_bytes is available cross-platform
+- OpenSSL's CSPRNG seeding is well-tested and audited
+- No fallback to `rand()` or `std::random_device` anywhere in the codebase
+
+After use, the nonce buffer is zeroed via `OPENSSL_cleanse` (cannot be optimized away by the compiler).
+
+### Tradeoffs
+Adding OpenSSL as a dependency of `libculpeo-session`. This is acceptable given OpenSSL is already a system library in all target environments and is required by the TLS transport layer anyway.
+
+### Spec Reference
+Section A.4, A.5, agent instructions Security Requirements
+
+## Phase 2: Nonce comparison timing safety
+**Date:** 2026-05-28
+**Phase:** Phase 2 — Session Layer
+**Status:** Decided
+
+### Context
+Comparing the echoed nonce in `culpeo.auth-response` against the stored nonce must not leak timing information (oracle attack on nonce guessing).
+
+### Decision
+Use `CRYPTO_memcmp` from OpenSSL for the comparison. This performs a constant-time byte comparison that is not subject to short-circuit evaluation. The comparison runs on the decoded byte arrays (not the hex strings), ensuring equal-length comparison.
+
+Both the stored nonce and the locally-decoded echoed bytes are zeroed via `OPENSSL_cleanse` immediately after comparison, regardless of the comparison result.
+
+### Tradeoffs
+Constant-time comparison is marginally slower than a plain `memcmp`, but the difference is immeasurable in practice for 32-byte buffers. The security gain eliminates a class of timing oracle attacks.
+
+### Spec Reference
+Section A.4, A.5, agent instructions Security Requirements
+
+## Phase 2: Maximum stream count
+**Date:** 2026-05-28
+**Phase:** Phase 2 — Session Layer
+**Status:** Decided
+
+### Context
+The spec §5.6 says the default maximum MUST NOT exceed 16 streams. The implementation must reject `culpeo.init` frames that exceed this.
+
+### Decision
+Default `SessionConfig::max_streams = 16`, matching the spec default maximum. Configurable at construction time. Validation happens before any per-stream resource allocation (no partial allocation).
+
+### Tradeoffs
+Setting exactly 16 as the default gives maximum spec compliance. Operators wanting more streams must explicitly configure a higher limit.
+
+### Spec Reference
+Section 5.6
+
+## Phase 2: Buffer window limits
+**Date:** 2026-05-28
+**Phase:** Phase 2 — Session Layer
+**Status:** Decided
+
+### Context
+The spec §7.4.1 says the default maximum buffer window MUST NOT exceed 30,000 ms. Requests exceeding the maximum must be clamped.
+
+### Decision
+`SessionConfig::max_buffer_window_ms = 30,000`. Client-requested values are clamped to this maximum before being reflected in `culpeo.init-ack`. The `SessionConfig::default_buffer_window_ms = 5,000` is used when the client omits `Buffer-Window`.
+
+### Tradeoffs
+The 30-second maximum matches the spec requirement. A 5-second default is conservative but avoids large buffer allocations for applications that don't implement resumption.
+
+### Spec Reference
+Section 7.4, 7.4.1
+
+## Phase 2: PCM offset overflow protection
+**Date:** 2026-05-28
+**Phase:** Phase 2 — Session Layer
+**Status:** Decided
+
+### Context
+The PCM offset calculation `frame_bytes / (channels × bits/8)` involves two intermediate multiplications and a division that could theoretically overflow. The agent spec requires integer overflow protection.
+
+### Decision
+All intermediate values are promoted to `uint64_t` before arithmetic. The denominator `channels × (bits/8)` is computed as `uint64_t` to prevent uint16 overflow. The final addition `stream.offset + increment` is checked against `UINT64_MAX` before being applied. Zero channels or zero bits return `Error::offset_overflow` immediately.
+
+### Tradeoffs
+The overflow guard on `stream.offset + increment` is theoretically only reachable after ~584,542 years at 1M samples/sec, but the guard costs one comparison and eliminates undefined behavior regardless of workload.
+
+### Spec Reference
+Section 8.2, agent instructions Security Requirements
+
+## Phase 2: JSON body parsing with nlohmann/json
+**Date:** 2026-05-28
+**Phase:** Phase 2 — Session Layer
+**Status:** Decided
+
+### Context
+The session layer must parse JSON bodies for `culpeo.init`, `culpeo.ping`, `culpeo.pong`, `culpeo.auth-refresh`, and `culpeo.auth-response`. Options: write a custom parser, use nlohmann/json, use simdjson.
+
+### Decision
+Use nlohmann/json v3.11.3 fetched via CMake `FetchContent` (header-only mode). All JSON operations are wrapped in `try/catch` blocks that convert exceptions to `Error::json_error`. The public API remains `std::expected`-based throughout; nlohmann exceptions never escape the session layer.
+
+For outgoing JSON frames (serialized responses), simple string formatting is used instead of nlohmann for constant-structure bodies (`pong`, `auth-refresh`), avoiding per-frame JSON object construction overhead.
+
+### Tradeoffs
+nlohmann/json adds ~3 seconds of first-build compile time. In exchange, the parser handles all valid JSON edge cases correctly (escaped strings, Unicode, large integers) without custom implementation risk. Since JSON parsing only happens on `culpeo.init` (rare) and auth events (rare), the per-call cost is irrelevant.
+
+### Spec Reference
+Section 6.1 (all control frame bodies)
+
+## Phase 2: Session ID entropy
+**Date:** 2026-05-28
+**Phase:** Phase 2 — Session Layer
+**Status:** Decided
+
+### Context
+The spec §A.5 requires session IDs to be at least 128 bits of entropy from a CSPRNG.
+
+### Decision
+Session IDs: 16 bytes from `RAND_bytes` → hex-encoded to 32 characters (128 bits of entropy). Stream IDs: 8 bytes from `RAND_bytes` → hex-encoded to 16 characters (64 bits of entropy). Stream IDs only need uniqueness within a session (max 16 streams), so 64 bits provides negligible collision probability (birthday bound: ~4.3×10^-18 for 16 IDs).
+
+### Tradeoffs
+Session IDs exactly meet the 128-bit requirement. Stream IDs use less entropy than session IDs since their security requirement is only within-session uniqueness, not global unguessability.
+
+### Spec Reference
+Section 5.3, Section A.5, agent instructions Security Requirements
+
+## Phase 2: Pimpl idiom for Session
+**Date:** 2026-05-28
+**Phase:** Phase 2 — Session Layer
+**Status:** Decided
+
+### Context
+The session implementation includes nlohmann/json and OpenSSL headers. Exposing these in the public header would force all consumers to depend on them at compile time.
+
+### Decision
+`Session` uses the Pimpl idiom (`std::unique_ptr<Impl>`). All implementation details, internal helpers, and dependencies are in `session.cpp`. The public header only depends on `culpeo/frame.hpp` and the C++ standard library.
+
+### Tradeoffs
+One extra heap allocation per session for the Impl struct. This is negligible compared to session-level overhead. In exchange, the public header is clean and ABI-stable: changing implementation details (e.g., upgrading JSON library version) doesn't require recompiling consumers.
+
+### Spec Reference
+C++ agent instructions Technical Requirements
+
+## Security fix: max_header_count added to ParseLimits
+**Date:** 2026-05-28
+**Phase:** Phase 1 — Frame Layer (security fix)
+**Status:** Decided
+
+### Context
+The Security Agent Phase 1 review (finding: cpp-missing-header-count-limit, severity High) identified that `ParseLimits` had no `max_header_count` field, allowing an attacker to send a frame with an unbounded number of headers and exhaust server memory despite the header block size limit. This was a spec §4.1.1 violation.
+
+### Decision
+Added `max_header_count{64}` to `ParseLimits` and enforce it at the top of each iteration in the `parse_headers` loop, returning `header_block_too_large` when exceeded.
+
+### Tradeoffs
+64 headers is well above any legitimate protocol usage (CulpeoStream control frames use fewer than 10 reserved headers). The error code reuses `header_block_too_large` because the spec does not define a dedicated header count error; this is consistent with "block rejected before parsing is complete".
+
+### Spec Reference
+Section 4.1.1 (parser limits)
+
+## Security fix: NUL byte rejection in header values
+**Date:** 2026-05-28
+**Phase:** Phase 1 — Frame Layer (security fix)
+**Status:** Decided
+
+### Context
+The Security Agent Phase 1 review (finding: cpp-null-byte-in-header-values, severity Medium) identified that `valid_header_value` only rejected `\r` and `\n` but not NUL bytes. Spec §4.1 requires rejection of CR, LF, and NUL in both header names and values.
+
+### Decision
+Added `ch == '\0'` to the rejection check in `valid_header_value`. NUL bytes in header names were already rejected via `valid_header_name`.
+
+### Tradeoffs
+No tradeoffs — NUL bytes are never valid in header values per the spec.
+
+### Spec Reference
+Section 4.1
+
+## Fuzzer corpus seeded with required adversarial inputs
+**Date:** 2026-05-28
+**Phase:** Phase 1 — Frame Layer (security fix)
+**Status:** Decided
+
+### Context
+The Security Agent Phase 1 review (finding: cpp-no-fuzzer-corpus, severity Medium) identified that the fuzzer had no corpus directory. LibFuzzer with no corpus starts from scratch and takes much longer to find interesting paths.
+
+### Decision
+Created `libculpeo-frame/fuzz/corpus/` with 10 seed files covering all required adversarial inputs: valid frame, truncated (no terminator), CRLF injection in value, overlength block, NUL in name, NUL in value, binary with no terminator, too many headers (>64), empty frame, and only-terminator.
+
+### Tradeoffs
+Seed files make the fuzzer immediately effective at the boundaries the Security Agent identified. The corpus should be expanded over time as the fuzzer finds new interesting inputs.
+
+### Spec Reference
+Section 4.1, Section 4.1.1; C++ agent instructions (fuzz corpus requirements)

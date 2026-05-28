@@ -1,0 +1,4 @@
+Event: culpeo.ping
+X-Injected: foo
+Evil: bar
+
