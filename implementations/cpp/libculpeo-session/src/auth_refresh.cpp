@@ -1,8 +1,8 @@
 #include "auth_refresh.hpp"
 
+#include "crypto.hpp"
+
 #include <cstring>
-#include <openssl/crypto.h>
-#include <openssl/rand.h>
 
 namespace culpeo::session::internal {
 
@@ -65,7 +65,10 @@ AuthRefreshManager::generate(uint32_t min_interval_s) noexcept {
     }
 
     // Fill nonce buffer with CSPRNG bytes
-    if (RAND_bytes(nonce_.data(), static_cast<int>(kNonceBytes)) != 1) {
+    try {
+        culpeo::crypto::secure_random(
+            std::span<std::byte>(reinterpret_cast<std::byte*>(nonce_.data()), kNonceBytes));
+    } catch (...) {
         return std::unexpected(Error::transport_error);
     }
 
@@ -100,13 +103,15 @@ AuthRefreshManager::validate_and_consume(std::string_view echoed_hex,
     }
 
     // Constant-time comparison to prevent timing oracle attacks
-    const int eq = CRYPTO_memcmp(echoed_bytes.data(), nonce_.data(), kNonceBytes);
+    const bool eq = culpeo::crypto::constant_time_equal(
+        std::span<const uint8_t>(echoed_bytes.data(), kNonceBytes),
+        std::span<const uint8_t>(nonce_.data(), kNonceBytes));
 
     // Zero both buffers immediately after comparison, regardless of result
-    OPENSSL_cleanse(echoed_bytes.data(), kNonceBytes);
+    culpeo::crypto::secure_zero(echoed_bytes.data(), kNonceBytes);
     clear();
 
-    if (eq != 0) {
+    if (!eq) {
         return std::unexpected(Error::nonce_mismatch);
     }
 
@@ -121,8 +126,7 @@ bool AuthRefreshManager::is_expired(uint32_t timeout_s) const noexcept {
 }
 
 void AuthRefreshManager::clear() noexcept {
-    // OPENSSL_cleanse performs a secure zero that the compiler cannot optimize away
-    OPENSSL_cleanse(nonce_.data(), kNonceBytes);
+    culpeo::crypto::secure_zero(nonce_.data(), kNonceBytes);
     pending_ = false;
     // Keep last_issued_ so the rate limiter still works after a clear
 }

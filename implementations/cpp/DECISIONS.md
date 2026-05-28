@@ -123,24 +123,13 @@ C++ agent instructions Technical Requirements
 ## Phase 2: Nonce generation approach
 **Date:** 2026-05-28
 **Phase:** Phase 2 — Session Layer
-**Status:** Decided
+**Status:** Superseded
 
 ### Context
 The spec (§A.5) and agent instructions require CSPRNG nonces. Options: `RAND_bytes` (OpenSSL), `getrandom` syscall, `std::random_device`.
 
 ### Decision
-Use `RAND_bytes(buf, 32)` from OpenSSL (already a dependency via `libssl-dev`). This generates 32 bytes (256 bits) per nonce, hex-encoded to a 64-character string.
-
-The choice of RAND_bytes over getrandom:
-- OpenSSL is already linked for `OPENSSL_cleanse` and `CRYPTO_memcmp`
-- RAND_bytes is available cross-platform
-- OpenSSL's CSPRNG seeding is well-tested and audited
-- No fallback to `rand()` or `std::random_device` anywhere in the codebase
-
-After use, the nonce buffer is zeroed via `OPENSSL_cleanse` (cannot be optimized away by the compiler).
-
-### Tradeoffs
-Adding OpenSSL as a dependency of `libculpeo-session`. This is acceptable given OpenSSL is already a system library in all target environments and is required by the TLS transport layer anyway.
+~~Use `RAND_bytes(buf, 32)` from OpenSSL.~~ Superseded by "Remove OpenSSL dependency" decision below.
 
 ### Spec Reference
 Section A.4, A.5, agent instructions Security Requirements
@@ -148,18 +137,13 @@ Section A.4, A.5, agent instructions Security Requirements
 ## Phase 2: Nonce comparison timing safety
 **Date:** 2026-05-28
 **Phase:** Phase 2 — Session Layer
-**Status:** Decided
+**Status:** Superseded
 
 ### Context
 Comparing the echoed nonce in `culpeo.auth-response` against the stored nonce must not leak timing information (oracle attack on nonce guessing).
 
 ### Decision
-Use `CRYPTO_memcmp` from OpenSSL for the comparison. This performs a constant-time byte comparison that is not subject to short-circuit evaluation. The comparison runs on the decoded byte arrays (not the hex strings), ensuring equal-length comparison.
-
-Both the stored nonce and the locally-decoded echoed bytes are zeroed via `OPENSSL_cleanse` immediately after comparison, regardless of the comparison result.
-
-### Tradeoffs
-Constant-time comparison is marginally slower than a plain `memcmp`, but the difference is immeasurable in practice for 32-byte buffers. The security gain eliminates a class of timing oracle attacks.
+~~Use `CRYPTO_memcmp` from OpenSSL.~~ Superseded by "Remove OpenSSL dependency" decision below.
 
 ### Spec Reference
 Section A.4, A.5, agent instructions Security Requirements
@@ -318,3 +302,35 @@ Seed files make the fuzzer immediately effective at the boundaries the Security 
 
 ### Spec Reference
 Section 4.1, Section 4.1.1; C++ agent instructions (fuzz corpus requirements)
+
+## Remove OpenSSL dependency — use std::random_device with platform allowlist
+**Date:** 2026-05-28
+**Phase:** Phase 2 — Session Layer
+**Status:** Decided
+**Supersedes:** "Phase 2: Nonce generation approach", "Phase 2: Nonce comparison timing safety"
+
+### Context
+The session layer previously depended on OpenSSL (`libcrypto`) for three primitives: `RAND_bytes` (CSPRNG), `OPENSSL_cleanse` (secure zeroing), and `CRYPTO_memcmp` (constant-time comparison). OpenSSL is a heavy dependency (~2MB shared lib) pulled in for three small functions, complicates cross-compilation, and blocks potential WASM compilation of the session layer.
+
+Options considered:
+1. Keep OpenSSL (status quo)
+2. Direct OS CSPRNG APIs (`getrandom`, `arc4random_buf`, `BCryptGenRandom`) per platform
+3. `std::random_device` with a compile-time platform allowlist
+
+### Decision
+Introduced `libculpeo-session/src/crypto.hpp`, a thin internal wrapper providing three functions:
+
+**`secure_random(std::span<std::byte>)`** — uses `std::random_device` on platforms where the backing is a known CSPRNG (Linux/libstdc++ → `/dev/urandom`, macOS/libc++ → `/dev/urandom`, Windows/MSVC → `BCryptGenRandom`). A compile-time `static_assert` rejects unverified platforms. Emscripten is handled via `emscripten_get_entropy()`. The `random_device` instance is `thread_local` to avoid construction overhead per call.
+
+**`secure_zero(void*, size_t)`** — uses `explicit_bzero` on glibc/macOS, `SecureZeroMemory` on Windows, with a `volatile unsigned char*` loop fallback for other platforms (e.g., musl, older Android NDK).
+
+**`constant_time_equal(span<const uint8_t>, span<const uint8_t>)`** — XOR-accumulator over the full span length, returns false immediately on length mismatch (length is not secret). No content-dependent branches.
+
+### Tradeoffs
+- **Gained:** Eliminated the OpenSSL build dependency entirely from `libculpeo-session`. Simpler cross-compilation (Android NDK, iOS). Emscripten path available for future WASM builds. Single API across platforms instead of three OS-specific branches.
+- **Gave up:** Direct kernel API calls — we trust the toolchain's `std::random_device` mapping instead. This is well-documented and stable on the allowlisted platforms but is one layer of indirection further from the entropy source.
+- **Risk accepted:** The `volatile` fallback for `secure_zero` on unknown platforms is less formally guaranteed than `explicit_bzero`, but the `static_assert` on the random path ensures we only reach it on platforms we've consciously added.
+- **Risk accepted:** The XOR-accumulator for constant-time comparison is standard practice but lacks the formal audit pedigree of `CRYPTO_memcmp`. For 32-byte nonce buffers this is well-understood and sufficient.
+
+### Spec Reference
+Section A.4, A.5, agent instructions Security Requirements

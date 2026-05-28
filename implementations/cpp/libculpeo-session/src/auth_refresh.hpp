@@ -3,9 +3,9 @@
 // Internal auth-refresh nonce manager — not part of the public API.
 //
 // Security properties:
-//  - Nonces are 32 bytes (256 bits) from RAND_bytes (OpenSSL CSPRNG).
-//  - Stored bytes are zeroed via OPENSSL_cleanse after use.
-//  - Comparison uses CRYPTO_memcmp (constant-time) to prevent timing attacks.
+//  - Nonces are 32 bytes (256 bits) from the OS CSPRNG (getrandom/arc4random).
+//  - Stored bytes are zeroed via secure_zero (explicit_bzero) after use.
+//  - Comparison uses constant_time_equal (XOR accumulator) to prevent timing attacks.
 //  - Only one outstanding nonce per session at a time.
 //  - Minimum re-issue interval is enforced to prevent challenge flooding.
 
@@ -55,7 +55,7 @@ public:
     void clear() noexcept;
 
 private:
-    // Sensitive: must be zeroed via OPENSSL_cleanse, not memset.
+    // Sensitive: must be zeroed via secure_zero, not memset.
     alignas(std::size_t) std::array<uint8_t, kNonceBytes> nonce_{};
 
     bool pending_{false};

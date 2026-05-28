@@ -6,8 +6,7 @@
 #include <array>
 #include <cstring>
 
-// OpenSSL for CSPRNG
-#include <openssl/rand.h>
+#include "crypto.hpp"
 
 namespace culpeo::session::internal {
 
@@ -48,8 +47,11 @@ generate_csprng_id(std::size_t len_bytes) noexcept {
     std::array<uint8_t, 32> buf{};
     if (len_bytes > buf.size()) len_bytes = buf.size();
 
-    if (RAND_bytes(buf.data(), static_cast<int>(len_bytes)) != 1) {
-        return std::unexpected(Error::transport_error);  // OpenSSL CSPRNG failure
+    try {
+        culpeo::crypto::secure_random(
+            std::span<std::byte>(reinterpret_cast<std::byte*>(buf.data()), len_bytes));
+    } catch (...) {
+        return std::unexpected(Error::transport_error);
     }
 
     static constexpr char hex_chars[] = "0123456789abcdef";
@@ -61,8 +63,7 @@ generate_csprng_id(std::size_t len_bytes) noexcept {
     }
 
     // Zero the working buffer immediately after encoding
-    // (OPENSSL_cleanse is overkill for temporary IDs, but safe)
-    std::memset(buf.data(), 0, len_bytes);
+    culpeo::crypto::secure_zero(buf.data(), len_bytes);
 
     return result;
 }

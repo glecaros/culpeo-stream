@@ -31,11 +31,9 @@ target_include_directories(culpeo_session
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
-find_package(OpenSSL REQUIRED)
-
 target_link_libraries(culpeo_session
     PUBLIC  culpeo::frame
-    PRIVATE OpenSSL::Crypto nlohmann_json::nlohmann_json
+    PRIVATE nlohmann_json::nlohmann_json
 )
 
 target_compile_features(culpeo_session PUBLIC cxx_std_23)
@@ -80,7 +78,7 @@ if(CULPEO_BUILD_TESTS)
         src/stream_registry.cpp
     )
     target_link_libraries(stream_registry_tests
-        PRIVATE culpeo::frame Catch2::Catch2WithMain OpenSSL::Crypto
+        PRIVATE culpeo::frame Catch2::Catch2WithMain
     )
     target_include_directories(stream_registry_tests
         PRIVATE

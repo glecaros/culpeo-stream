@@ -21,10 +21,6 @@
 // nlohmann/json for body parsing
 #include <nlohmann/json.hpp>
 
-// OpenSSL for CSPRNG (session IDs)
-#include <openssl/crypto.h>
-#include <openssl/rand.h>
-
 namespace culpeo::session {
 
 using namespace internal;
