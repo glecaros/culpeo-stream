@@ -60,7 +60,7 @@ internal static class FrameHelper
         string? sessionId = null,
         CancellationToken ct = default)
     {
-        var streamsJson = """[{"content_type":"audio/pcm;rate=16000;channels=1;bits=16","type":"input"}]""";
+        var streamsJson = """[{"content_type":"audio/pcm;rate=16000;channels=1;bits=16","type":"input","offset_type":"time"}]""";
         var bodyObj = sessionId is null
             ? $@"{{""version"":""{version}"",""streams"":{streamsJson}}}"
             : $@"{{""version"":""{version}"",""streams"":{streamsJson}}}";

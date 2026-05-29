@@ -4,7 +4,7 @@
 #include "offset_tracker.hpp"
 #include "stream_registry.hpp"
 
-#include "culpeo/frame.hpp"
+#include "culpeo/message.hpp"
 
 #include <charconv>
 #include <chrono>
@@ -71,6 +71,7 @@ std::string build_init_ack_body(std::string_view version,
         entry["id"] = s.id;
         entry["content_type"] = s.content_type;
         entry["type"] = stream_direction_to_string(s.direction);
+        entry["offset_type"] = offset_type_to_string(s.offset_type);
         if (!s.purpose.empty()) {
             entry["purpose"] = s.purpose;
         }
@@ -143,14 +144,14 @@ bool is_valid_event_name(std::string_view name) noexcept {
     return true;
 }
 
-// Serialize a frame to bytes (uses culpeo::frame helpers).
+// Serialize a frame to bytes (uses culpeo::message helpers).
 std::vector<std::byte> make_text_frame(
-    std::initializer_list<culpeo::frame::HeaderFieldView> headers,
+    std::initializer_list<culpeo::message::HeaderFieldView> headers,
     std::string_view body) {
-    auto result = culpeo::frame::serialize_frame(
-        culpeo::frame::FrameType::control,
-        std::span<const culpeo::frame::HeaderFieldView>(headers.begin(), headers.size()),
-        culpeo::frame::as_bytes(body));
+    auto result = culpeo::message::serialize_frame(
+        culpeo::message::FrameType::control,
+        std::span<const culpeo::message::HeaderFieldView>(headers.begin(), headers.size()),
+        culpeo::message::as_bytes(body));
     if (!result) return {};
     return std::move(*result);
 }
@@ -158,7 +159,7 @@ std::vector<std::byte> make_text_frame(
 // Send a text frame; catches any transport exceptions.
 // Caller must NOT hold the session mutex when calling this.
 void send_text_frame_noexcept(ITransport& transport,
-                               std::initializer_list<culpeo::frame::HeaderFieldView> headers,
+                               std::initializer_list<culpeo::message::HeaderFieldView> headers,
                                std::string_view body) noexcept {
     try {
         auto frame = make_text_frame(headers, body);
@@ -283,7 +284,7 @@ struct Session::Impl {
     // ─ Event handlers (called with mutex held, but release before I/O) ────────
 
     [[nodiscard]] std::expected<void, Error>
-    handle_init(const culpeo::frame::ParsedHeadersView& f,
+    handle_init(const culpeo::message::ParsedHeadersView& f,
                  std::unique_lock<std::mutex>& lock) noexcept {
         if (state != SessionState::uninitialized) {
             // A second culpeo.init after session is established is a protocol error
@@ -389,6 +390,28 @@ struct Session::Impl {
                     d.resume_offset = s["resume_offset"].get<uint64_t>();
                     d.has_resume_offset = true;
                 }
+                // offset_type is REQUIRED (spec §5.6). Parse and reject unknown values.
+                if (!s.contains("offset_type")) {
+                    lock.unlock();
+                    send_init_error_and_close("invalid-streams",
+                        "Stream missing required offset_type field", "{}");
+                    std::unique_lock<std::mutex> re(mutex);
+                    transition_to_closed_locked();
+                    return std::unexpected(Error::invalid_streams);
+                }
+                {
+                    const std::string ot_str = s["offset_type"].get<std::string>();
+                    const auto ot = parse_offset_type(ot_str);
+                    if (!ot) {
+                        lock.unlock();
+                        send_init_error_and_close("invalid-streams",
+                            "Unrecognised offset_type value", "{}");
+                        std::unique_lock<std::mutex> re(mutex);
+                        transition_to_closed_locked();
+                        return std::unexpected(Error::invalid_streams);
+                    }
+                    d.offset_type = *ot;
+                }
                 decls.push_back(std::move(d));
             }
         } catch (...) {
@@ -451,7 +474,7 @@ struct Session::Impl {
     }
 
     [[nodiscard]] std::expected<void, Error>
-    handle_resumption_locked(const culpeo::frame::ParsedHeadersView& f,
+    handle_resumption_locked(const culpeo::message::ParsedHeadersView& f,
                               const std::vector<StreamDeclaration>& decls,
                               const std::string& version,
                               std::unique_lock<std::mutex>& lock) noexcept {
@@ -555,7 +578,7 @@ struct Session::Impl {
     }
 
     [[nodiscard]] std::expected<void, Error>
-    handle_ping(const culpeo::frame::ParsedHeadersView& f,
+    handle_ping(const culpeo::message::ParsedHeadersView& f,
                  std::unique_lock<std::mutex>& lock) noexcept {
         if (state != SessionState::established) {
             return std::unexpected(Error::wrong_state);
@@ -602,7 +625,7 @@ struct Session::Impl {
     }
 
     [[nodiscard]] std::expected<void, Error>
-    handle_pong(const culpeo::frame::ParsedHeadersView& f,
+    handle_pong(const culpeo::message::ParsedHeadersView& f,
                  std::unique_lock<std::mutex>& lock) noexcept {
         if (state != SessionState::established) {
             return std::unexpected(Error::wrong_state);
@@ -638,7 +661,7 @@ struct Session::Impl {
     }
 
     [[nodiscard]] std::expected<void, Error>
-    handle_auth_response(const culpeo::frame::ParsedHeadersView& f,
+    handle_auth_response(const culpeo::message::ParsedHeadersView& f,
                           std::unique_lock<std::mutex>& lock) noexcept {
         if (state != SessionState::established) {
             return std::unexpected(Error::wrong_state);
@@ -718,7 +741,7 @@ struct Session::Impl {
     }
 
     [[nodiscard]] std::expected<void, Error>
-    handle_close(const culpeo::frame::ParsedHeadersView& f,
+    handle_close(const culpeo::message::ParsedHeadersView& f,
                   std::unique_lock<std::mutex>& lock) noexcept {
         if (state == SessionState::closed) {
             return {};  // Already closed, ignore
@@ -759,8 +782,8 @@ Session::~Session() = default;
 // ─── process_control_frame ────────────────────────────────────────────────────
 
 std::expected<void, Error>
-Session::process_control_frame(const culpeo::frame::ParsedHeadersView& f) noexcept {
-    if (f.frame_type != culpeo::frame::FrameType::control) {
+Session::process_control_frame(const culpeo::message::ParsedHeadersView& f) noexcept {
+    if (f.frame_type != culpeo::message::FrameType::control) {
         return std::unexpected(Error::protocol_error);
     }
 
@@ -852,8 +875,8 @@ Session::process_control_frame(const culpeo::frame::ParsedHeadersView& f) noexce
 // ─── process_media_frame ──────────────────────────────────────────────────────
 
 std::expected<void, Error>
-Session::process_media_frame(const culpeo::frame::ParsedHeadersView& f) noexcept {
-    if (f.frame_type != culpeo::frame::FrameType::media) {
+Session::process_media_frame(const culpeo::message::ParsedHeadersView& f) noexcept {
+    if (f.frame_type != culpeo::message::FrameType::media) {
         return std::unexpected(Error::protocol_error);
     }
 
@@ -1019,16 +1042,16 @@ Session::send_media(std::string_view stream_id,
 
     // Serialize frame: headers + binary payload
     const std::string off_str = std::to_string(frame_offset);
-    std::vector<culpeo::frame::HeaderFieldView> headers{
+    std::vector<culpeo::message::HeaderFieldView> headers{
         {"Stream-Id", sid_str},
         {"Offset", off_str},
         {"Content-Type", ct_str},
         {"Timestamp", ts_str},
     };
 
-    auto frame = culpeo::frame::serialize_frame(
-        culpeo::frame::FrameType::media,
-        std::span<const culpeo::frame::HeaderFieldView>(headers),
+    auto frame = culpeo::message::serialize_frame(
+        culpeo::message::FrameType::media,
+        std::span<const culpeo::message::HeaderFieldView>(headers),
         payload);
     if (!frame) {
         return std::unexpected(Error::transport_error);

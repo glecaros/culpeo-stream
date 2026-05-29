@@ -34,7 +34,7 @@ async function tick(n = 10): Promise<void> {
 function makeStreams(
   type: ResumeStreamDeclaration["type"] = "input",
 ): ResumeStreamDeclaration[] {
-  return [{ type, content_type: "audio/opus", purpose: "voice" }];
+  return [{ type, content_type: "audio/opus", offset_type: "message", purpose: "voice" }];
 }
 
 /** Build default ConnectOptions. */
@@ -54,7 +54,7 @@ function makeOpts(
 function makeInitAckText(
   sessionId = "session-abc",
   streams: ConfirmedStreamDeclaration[] = [
-    { id: "stream-1", type: "input", content_type: "audio/opus", purpose: "voice" },
+    { id: "stream-1", type: "input", content_type: "audio/opus", offset_type: "message", purpose: "voice" },
   ],
 ): string {
   const frame: InitAckFrame = {
@@ -416,7 +416,7 @@ describe("CulpeoStreamClient — media", () => {
     await tick();
     instances[0]!.simulateMessage(
       makeInitAckText("sess", [
-        { id: "s1", type: "output", content_type: "audio/opus", purpose: "voice" },
+        { id: "s1", type: "output", content_type: "audio/opus", offset_type: "message", purpose: "voice" },
       ]),
     );
     await tick();
@@ -451,7 +451,7 @@ describe("CulpeoStreamClient — media", () => {
     await tick();
     instances[0]!.simulateMessage(
       makeInitAckText("sess", [
-        { id: "s1", type: "input", content_type: "audio/opus", purpose: "voice" },
+        { id: "s1", type: "input", content_type: "audio/opus", offset_type: "message", purpose: "voice" },
       ]),
     );
     await tick();
@@ -570,7 +570,7 @@ describe("CulpeoStreamClient — reconnection", () => {
     await tick();
     instances[0]!.simulateMessage(
       makeInitAckText("original-session-id", [
-        { id: "s1", type: "input", content_type: "audio/opus", purpose: "voice" },
+        { id: "s1", type: "input", content_type: "audio/opus", offset_type: "message", purpose: "voice" },
       ]),
     );
     await tick();
@@ -747,7 +747,7 @@ describe("CulpeoStreamClient — confirmedStreams", () => {
     await tick();
     instances[0]!.simulateMessage(
       makeInitAckText("sess", [
-        { id: "s1", type: "input", content_type: "audio/opus", purpose: "voice" },
+        { id: "s1", type: "input", content_type: "audio/opus", offset_type: "message", purpose: "voice" },
       ]),
     );
     await tick();

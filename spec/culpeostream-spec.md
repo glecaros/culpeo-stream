@@ -201,8 +201,8 @@ A server receiving an `init` frame that violates these rules MUST respond with `
 {
   "version": "0.3",
   "streams": [
-    {"content_type": "audio/pcm;rate=16000;channels=1;bits=16", "type": "input"},
-    {"content_type": "audio/opus", "type": "output"}
+    {"content_type": "audio/pcm;rate=16000;channels=1;bits=16", "type": "input", "offset_type": "time"},
+    {"content_type": "audio/opus", "type": "output", "offset_type": "message"}
   ]
 }
 ```
@@ -212,10 +212,10 @@ A server receiving an `init` frame that violates these rules MUST respond with `
 {
   "version": "0.3",
   "streams": [
-    {"content_type": "audio/pcm;rate=16000;channels=1;bits=16", "type": "input", "purpose": "user-voice"},
-    {"content_type": "audio/pcm;rate=44100;channels=2;bits=16", "type": "input", "purpose": "background-music"},
-    {"content_type": "audio/opus", "type": "output", "purpose": "assistant-voice"},
-    {"content_type": "application/json", "type": "duplex", "purpose": "events"}
+    {"content_type": "audio/pcm;rate=16000;channels=1;bits=16", "type": "input", "purpose": "user-voice", "offset_type": "time"},
+    {"content_type": "audio/pcm;rate=44100;channels=2;bits=16", "type": "input", "purpose": "background-music", "offset_type": "time"},
+    {"content_type": "audio/opus", "type": "output", "purpose": "assistant-voice", "offset_type": "message"},
+    {"content_type": "application/json", "type": "duplex", "purpose": "events", "offset_type": "message"}
   ]
 }
 ```
@@ -225,23 +225,38 @@ A server receiving an `init` frame that violates these rules MUST respond with `
 {
   "version": "0.3",
   "streams": [
-    {"content_type": "audio/pcm;rate=16000;channels=1;bits=16", "type": "input", "purpose": "user-voice"},
-    {"content_type": "audio/pcm;rate=44100;channels=2;bits=16", "type": "input", "purpose": "user-voice"}
+    {"content_type": "audio/pcm;rate=16000;channels=1;bits=16", "type": "input", "purpose": "user-voice", "offset_type": "time"},
+    {"content_type": "audio/pcm;rate=44100;channels=2;bits=16", "type": "input", "purpose": "user-voice", "offset_type": "time"}
   ]
 }
 ```
 
-### 5.5 Stream Validation
+### 5.5 Offset Types
+
+Each stream carries an `offset_type` field that declares how `Offset` values on media frames advance. This field is REQUIRED in stream declarations.
+
+| Value | Offset unit | Typical use |
+|---|---|---|
+| `time` | Samples per channel (for PCM) or other time-unit defined by the content type | Raw PCM audio — provides a time-aligned cursor stable across reconnections regardless of frame sizing |
+| `byte` | Bytes — the raw byte length of the media payload | Opaque binary streams where byte position is the natural cursor |
+| `message` | 1 per delivered media frame | Encoded audio (Opus, AAC), JSON event payloads, or any stream where per-message count is the natural unit |
+
+> **Note:** The value `message` (rather than `frame`) is used because this unit applies equally to protocol frames and higher-level application messages such as JSON payloads, where "frame" would be ambiguous.
+
+The `offset_type` determines the increment applied after each media frame is delivered (see §8.2). Implementations MUST reject a stream declaration with an unrecognised `offset_type` as `invalid-streams`.
+
+### 5.6 Stream Validation
 
 A server receiving a `culpeo.init` frame MUST validate the following. Violations MUST produce `culpeo.init-error` with code `invalid-streams`:
 
 1. At least one stream MUST be declared.
-2. Each stream MUST include `content_type` and `type`.
+2. Each stream MUST include `content_type`, `type`, and `offset_type`.
 3. `type` MUST be one of `input`, `output`, `duplex`.
-4. When two or more streams share the same `type`, all streams of that `type` MUST declare a `purpose`.
-5. `purpose` values MUST be unique within a `type`.
+4. `offset_type` MUST be one of `time`, `byte`, `message`.
+5. When two or more streams share the same `type`, all streams of that `type` MUST declare a `purpose`.
+6. `purpose` values MUST be unique within a `type`.
 
-### 5.6 Stream Count Limits
+### 5.7 Stream Count Limits
 
 Implementations MUST enforce a maximum number of streams per session. The default maximum MUST NOT exceed **16** streams. Implementations MAY allow operators to configure a higher limit.
 
@@ -289,9 +304,9 @@ Buffer-Window: <requested-ms>
 {
   "version": "0.3",
   "streams": [
-    {"id": "s1", "content_type": "audio/pcm;rate=16000;channels=1;bits=16", "type": "input", "purpose": "user-voice", "resume_offset": 2048},
-    {"id": "s2", "content_type": "audio/opus", "type": "output", "purpose": "assistant-voice", "resume_offset": 312},
-    {"id": "s3", "content_type": "application/json", "type": "duplex", "purpose": "events", "resume_offset": 45}
+    {"id": "s1", "content_type": "audio/pcm;rate=16000;channels=1;bits=16", "type": "input", "purpose": "user-voice", "offset_type": "time", "resume_offset": 2048},
+    {"id": "s2", "content_type": "audio/opus", "type": "output", "purpose": "assistant-voice", "offset_type": "message", "resume_offset": 312},
+    {"id": "s3", "content_type": "application/json", "type": "duplex", "purpose": "events", "offset_type": "message", "resume_offset": 45}
   ]
 }
 ```
@@ -312,9 +327,9 @@ Content-Type: application/json
 {
   "version": "0.3",
   "streams": [
-    {"id": "s1", "content_type": "audio/pcm;rate=16000;channels=1;bits=16", "type": "input", "purpose": "user-voice"},
-    {"id": "s2", "content_type": "audio/opus", "type": "output", "purpose": "assistant-voice"},
-    {"id": "s3", "content_type": "application/json", "type": "duplex", "purpose": "events"}
+    {"id": "s1", "content_type": "audio/pcm;rate=16000;channels=1;bits=16", "type": "input", "purpose": "user-voice", "offset_type": "time"},
+    {"id": "s2", "content_type": "audio/opus", "type": "output", "purpose": "assistant-voice", "offset_type": "message"},
+    {"id": "s3", "content_type": "application/json", "type": "duplex", "purpose": "events", "offset_type": "message"}
   ]
 }
 ```
@@ -330,9 +345,9 @@ Content-Type: application/json
 {
   "version": "0.3",
   "streams": [
-    {"id": "s1", "content_type": "audio/pcm;rate=16000;channels=1;bits=16", "type": "input", "purpose": "user-voice", "resume_offset": 2048},
-    {"id": "s2", "content_type": "audio/opus", "type": "output", "purpose": "assistant-voice", "resume_offset": 298},
-    {"id": "s3", "content_type": "application/json", "type": "duplex", "purpose": "events", "resume_offset": 45}
+    {"id": "s1", "content_type": "audio/pcm;rate=16000;channels=1;bits=16", "type": "input", "purpose": "user-voice", "offset_type": "time", "resume_offset": 2048},
+    {"id": "s2", "content_type": "audio/opus", "type": "output", "purpose": "assistant-voice", "offset_type": "message", "resume_offset": 298},
+    {"id": "s3", "content_type": "application/json", "type": "duplex", "purpose": "events", "offset_type": "message", "resume_offset": 45}
   ]
 }
 ```
@@ -586,15 +601,25 @@ A media frame sent in the wrong direction MUST cause the receiving party to clos
 
 ### 8.2 Offsets
 
-Each media frame carries an `Offset` header. Offsets are per-stream, monotonically increasing integers assigned by the server.
+Each media frame carries an `Offset` header. Offsets are per-stream, monotonically increasing integers assigned by the sender. The increment applied after each frame is determined by the stream's `offset_type` (declared in `culpeo.init`):
 
-For **raw PCM** streams, the offset increments by the number of samples in the frame, providing a time-aligned cursor that is stable across reconnections regardless of frame sizing:
+**`time`** — The offset increments by the number of samples per channel in the frame, providing a time-aligned cursor that is stable across reconnections regardless of frame sizing. For `audio/pcm` streams:
 
 ```
 offset(n+1) = offset(n) + (frame_bytes / (channels * bits_per_sample / 8))
 ```
 
-For **encoded streams** (Opus, AAC), the offset increments by 1 per encoded frame.
+**`byte`** — The offset increments by the byte length of the raw media payload in the frame:
+
+```
+offset(n+1) = offset(n) + frame_payload_bytes
+```
+
+**`message`** — The offset increments by 1 per delivered media frame, regardless of payload size. This is the natural unit for encoded audio (Opus, AAC), JSON event payloads, or any stream where per-message count is the meaningful cursor:
+
+```
+offset(n+1) = offset(n) + 1
+```
 
 Clients MUST track the highest `Offset` received per stream and include it as `resume_offset` for that stream in any subsequent resumption `culpeo.init`.
 

@@ -1,6 +1,6 @@
 #include "stream_registry.hpp"
 
-#include "culpeo/frame.hpp"
+#include "culpeo/message.hpp"
 
 #include <algorithm>
 #include <array>
@@ -28,15 +28,31 @@ namespace culpeo::session::internal {
     return "unknown";
 }
 
+[[nodiscard]] std::optional<OffsetType> parse_offset_type(std::string_view s) noexcept {
+    if (s == "time")    return OffsetType::time;
+    if (s == "byte")    return OffsetType::byte;
+    if (s == "message") return OffsetType::message;
+    return std::nullopt;
+}
+
+[[nodiscard]] std::string_view offset_type_to_string(OffsetType ot) noexcept {
+    switch (ot) {
+    case OffsetType::time:    return "time";
+    case OffsetType::byte:    return "byte";
+    case OffsetType::message: return "message";
+    }
+    return "message";  // Defensive fallback (should not be reached)
+}
+
 [[nodiscard]] StreamCodec codec_from_content_type(std::string_view ct) noexcept {
-    auto parsed = culpeo::frame::parse_content_type(ct);
+    auto parsed = culpeo::message::parse_content_type(ct);
     if (!parsed) return StreamCodec::other;
 
     return std::visit([](const auto& v) -> StreamCodec {
         using T = std::decay_t<decltype(v)>;
-        if constexpr (std::is_same_v<T, culpeo::frame::AudioPcmContentType>)  return StreamCodec::pcm;
-        if constexpr (std::is_same_v<T, culpeo::frame::AudioOpusContentType>) return StreamCodec::opus;
-        if constexpr (std::is_same_v<T, culpeo::frame::AudioAacContentType>)  return StreamCodec::aac;
+        if constexpr (std::is_same_v<T, culpeo::message::AudioPcmContentType>)  return StreamCodec::pcm;
+        if constexpr (std::is_same_v<T, culpeo::message::AudioOpusContentType>) return StreamCodec::opus;
+        if constexpr (std::is_same_v<T, culpeo::message::AudioAacContentType>)  return StreamCodec::aac;
         return StreamCodec::other;
     }, *parsed);
 }
@@ -85,6 +101,10 @@ validate_declarations(const std::vector<StreamDeclaration>& decls, uint32_t max_
     for (const auto& decl : decls) {
         // Rule 2: content_type and type are required (empty strings → invalid)
         if (decl.content_type.empty()) {
+            return std::unexpected(Error::invalid_streams);
+        }
+        // Rule 4 (spec §5.6): offset_type is REQUIRED; absent or unrecognised → invalid_streams
+        if (!decl.offset_type.has_value()) {
             return std::unexpected(Error::invalid_streams);
         }
         // Rule 3: direction must be a valid value (always true for typed enum,
@@ -146,12 +166,14 @@ StreamRegistry::register_from_declarations(const std::vector<StreamDeclaration>&
         info.purpose = decl.purpose;
         info.offset = 0;
         info.codec = codec_from_content_type(decl.content_type);
+        // offset_type is validated as present by validate_declarations; safe to dereference
+        info.offset_type = decl.offset_type.value_or(OffsetType::message);
 
         // Extract PCM params if applicable
-        auto ct_parsed = culpeo::frame::parse_content_type(decl.content_type);
+        auto ct_parsed = culpeo::message::parse_content_type(decl.content_type);
         if (ct_parsed) {
             if (const auto* pcm =
-                    std::get_if<culpeo::frame::AudioPcmContentType>(&*ct_parsed)) {
+                    std::get_if<culpeo::message::AudioPcmContentType>(&*ct_parsed)) {
                 info.pcm_params = PcmParams{.rate = pcm->rate,
                                             .channels = pcm->channels,
                                             .bits = pcm->bits};

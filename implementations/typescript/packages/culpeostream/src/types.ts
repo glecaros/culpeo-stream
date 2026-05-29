@@ -12,6 +12,7 @@ export type SessionState =
   | "established"
   | "closed";
 export type StreamDirection = "input" | "output" | "duplex";
+export type OffsetType = "time" | "byte" | "message";
 export type ControlFrameType = "text";
 export type MediaFrameType = "binary";
 export type TransportFrameType = ControlFrameType | MediaFrameType;
@@ -47,6 +48,7 @@ export type KnownProtocolEvent =
 export interface StreamDeclaration {
   content_type: string;
   type: StreamDirection;
+  offset_type: OffsetType;
   purpose?: string;
 }
 

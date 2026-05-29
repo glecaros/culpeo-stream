@@ -1,7 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "culpeo/session.hpp"
-#include "culpeo/frame.hpp"
+#include "culpeo/message.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -14,9 +14,9 @@
 #include <vector>
 
 using namespace culpeo::session;
-namespace frame = culpeo::frame;
+namespace frame = culpeo::message;
 
-// Disambiguate: both culpeo::session and culpeo::frame define Error
+// Disambiguate: both culpeo::session and culpeo::message define Error
 using Error = culpeo::session::Error;
 
 // ─── Test infrastructure ─────────────────────────────────────────────────────
@@ -111,7 +111,7 @@ feed_binary(Session& session, const std::string& raw) {
 
 // A valid culpeo.init body with one input stream (fresh session)
 static std::string basic_init_body(std::string_view version = "0.3") {
-    return std::string(R"({"version":")") + std::string(version) + R"(","streams":[{"content_type":"audio/pcm;rate=16000;channels=1;bits=16","type":"input"}]})";
+    return std::string(R"({"version":")") + std::string(version) + R"(","streams":[{"content_type":"audio/pcm;rate=16000;channels=1;bits=16","type":"input","offset_type":"time"}]})";
 }
 
 // ─── State machine: basic lifecycle ──────────────────────────────────────────
@@ -202,7 +202,7 @@ TEST_CASE("Fresh session: unsupported version → init-error with supported_vers
         {{"Event", "culpeo.init"},
          {"Authorization", "Bearer token"},
          {"Content-Type", "application/json"}},
-        R"({"version":"0.2","streams":[{"content_type":"audio/opus","type":"input"}]})");
+        R"({"version":"0.2","streams":[{"content_type":"audio/opus","type":"input","offset_type":"message"}]})");
 
     auto result = feed_text(session, raw);
     REQUIRE_FALSE(result.has_value());
@@ -222,8 +222,8 @@ TEST_CASE("Fresh session: invalid stream declarations → init-error", "[session
          {"Authorization", "Bearer token"},
          {"Content-Type", "application/json"}},
         R"({"version":"0.3","streams":[
-            {"content_type":"audio/pcm;rate=16000;channels=1;bits=16","type":"input"},
-            {"content_type":"audio/pcm;rate=44100;channels=2;bits=16","type":"input"}
+            {"content_type":"audio/pcm;rate=16000;channels=1;bits=16","type":"input","offset_type":"time"},
+            {"content_type":"audio/pcm;rate=44100;channels=2;bits=16","type":"input","offset_type":"time"}
         ]})");
 
     auto result = feed_text(session, raw);
@@ -264,9 +264,9 @@ TEST_CASE("Too many streams → max_streams_exceeded", "[session]") {
          {"Authorization", "Bearer token"},
          {"Content-Type", "application/json"}},
         R"({"version":"0.3","streams":[
-            {"content_type":"audio/pcm;rate=16000;channels=1;bits=16","type":"input","purpose":"a"},
-            {"content_type":"audio/opus","type":"output","purpose":"b"},
-            {"content_type":"application/json","type":"duplex","purpose":"c"}
+            {"content_type":"audio/pcm;rate=16000;channels=1;bits=16","type":"input","purpose":"a","offset_type":"time"},
+            {"content_type":"audio/opus","type":"output","purpose":"b","offset_type":"message"},
+            {"content_type":"application/json","type":"duplex","purpose":"c","offset_type":"message"}
         ]})");
 
     auto result = feed_text(session, raw);
@@ -391,7 +391,7 @@ TEST_CASE("Media frame on output stream from client → direction error", "[sess
         {{"Event", "culpeo.init"},
          {"Authorization", "Bearer token"},
          {"Content-Type", "application/json"}},
-        R"({"version":"0.3","streams":[{"content_type":"audio/opus","type":"output"}]})");
+        R"({"version":"0.3","streams":[{"content_type":"audio/opus","type":"output","offset_type":"message"}]})");
 
     feed_text(session, init_raw);
     REQUIRE(session.state() == SessionState::established);
@@ -441,7 +441,7 @@ TEST_CASE("send_media: server sends on output stream", "[session]") {
         {{"Event", "culpeo.init"},
          {"Authorization", "Bearer token"},
          {"Content-Type", "application/json"}},
-        R"({"version":"0.3","streams":[{"content_type":"audio/opus","type":"output"}]})"));
+        R"({"version":"0.3","streams":[{"content_type":"audio/opus","type":"output","offset_type":"message"}]})"));
 
     REQUIRE(session.state() == SessionState::established);
     auto streams = session.streams();
@@ -449,7 +449,7 @@ TEST_CASE("send_media: server sends on output stream", "[session]") {
 
     const std::string payload(120, '\x42');
     auto result = session.send_media(sid,
-        culpeo::frame::as_bytes(payload), 50000);
+        culpeo::message::as_bytes(payload), 50000);
     REQUIRE(result.has_value());
 
     // One binary frame should have been sent
@@ -470,15 +470,15 @@ TEST_CASE("send_media: offset in binary frame matches stream offset before advan
         {{"Event", "culpeo.init"},
          {"Authorization", "Bearer token"},
          {"Content-Type", "application/json"}},
-        R"({"version":"0.3","streams":[{"content_type":"audio/opus","type":"output"}]})"));
+        R"({"version":"0.3","streams":[{"content_type":"audio/opus","type":"output","offset_type":"message"}]})"));
 
     auto streams = session.streams();
     const std::string sid = streams[0].id;
 
     // First send: offset 0
-    session.send_media(sid, culpeo::frame::as_bytes(std::string(50, '\0')), 0);
+    session.send_media(sid, culpeo::message::as_bytes(std::string(50, '\0')), 0);
     // Second send: offset 1
-    session.send_media(sid, culpeo::frame::as_bytes(std::string(50, '\0')), 0);
+    session.send_media(sid, culpeo::message::as_bytes(std::string(50, '\0')), 0);
 
     // Verify binary frames contain correct offsets
     REQUIRE(transport.binary_count() == 2);
@@ -511,7 +511,7 @@ TEST_CASE("send_media: rejects send on input stream", "[session]") {
     const std::string sid = streams[0].id;  // input stream
 
     auto result = session.send_media(sid,
-        culpeo::frame::as_bytes(std::string(16, '\0')), 0);
+        culpeo::message::as_bytes(std::string(16, '\0')), 0);
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error() == Error::invalid_direction);
 }
@@ -521,7 +521,7 @@ TEST_CASE("send_media: rejects send when not established", "[session]") {
     Session session(transport);
 
     auto result = session.send_media("s1",
-        culpeo::frame::as_bytes(std::string(16, '\0')), 0);
+        culpeo::message::as_bytes(std::string(16, '\0')), 0);
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error() == Error::wrong_state);
 }
@@ -874,7 +874,7 @@ TEST_CASE("Resumption: client reconnects with valid session-id and offsets", "[s
         {{"Event", "culpeo.init"}, {"Authorization", "Bearer token"},
          {"Content-Type", "application/json"}},
         R"({"version":"0.3","streams":[
-            {"content_type":"audio/pcm;rate=16000;channels=1;bits=16","type":"input","purpose":"voice"}
+            {"content_type":"audio/pcm;rate=16000;channels=1;bits=16","type":"input","purpose":"voice","offset_type":"time"}
         ]})"));
 
     REQUIRE(session1.state() == SessionState::established);
@@ -907,7 +907,7 @@ TEST_CASE("Resumption: client reconnects with valid session-id and offsets", "[s
     Session session2(transport2, std::move(cbs2), {}, std::move(saved));
 
     std::string resume_body = R"({"version":"0.3","streams":[
-        {"content_type":"audio/pcm;rate=16000;channels=1;bits=16","type":"input","purpose":"voice",
+        {"content_type":"audio/pcm;rate=16000;channels=1;bits=16","type":"input","purpose":"voice","offset_type":"time",
          "id":")" + sid + R"(","resume_offset":320}
     ]})";
 
@@ -940,7 +940,7 @@ TEST_CASE("Resumption: resume_offset > server offset → invalid-streams", "[ses
     feed_text(session1, make_ctrl_frame(
         {{"Event", "culpeo.init"}, {"Authorization", "Bearer token"},
          {"Content-Type", "application/json"}},
-        R"({"version":"0.3","streams":[{"content_type":"audio/opus","type":"input","purpose":"audio"}]})"));
+        R"({"version":"0.3","streams":[{"content_type":"audio/opus","type":"input","purpose":"audio","offset_type":"message"}]})"));
 
     const std::string session_id = *session1.session_id();
     auto saved = session1.export_state();
@@ -954,7 +954,7 @@ TEST_CASE("Resumption: resume_offset > server offset → invalid-streams", "[ses
 
     // Request resume_offset=999 but server only has 0
     std::string resume_body = R"({"version":"0.3","streams":[
-        {"content_type":"audio/opus","type":"input","purpose":"audio","resume_offset":999}
+        {"content_type":"audio/opus","type":"input","purpose":"audio","offset_type":"message","resume_offset":999}
     ]})";
 
     auto result = feed_text(session2, make_ctrl_frame(
@@ -984,6 +984,155 @@ TEST_CASE("Resumption: unknown session-id → invalid-session", "[session]") {
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error() == Error::session_expired);
     CHECK(transport.any_text_contains("invalid-session"));
+}
+
+// ─── offset_type enforcement ──────────────────────────────────────────────────
+
+TEST_CASE("Missing offset_type → invalid-streams error", "[session][offset_type]") {
+    MockTransport transport;
+    Session session(transport);
+
+    auto raw = make_ctrl_frame(
+        {{"Event", "culpeo.init"},
+         {"Authorization", "Bearer token"},
+         {"Content-Type", "application/json"}},
+        // PCM stream without offset_type field
+        R"({"version":"0.3","streams":[{"content_type":"audio/pcm;rate=16000;channels=1;bits=16","type":"input"}]})");
+
+    auto result = feed_text(session, raw);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == Error::invalid_streams);
+    CHECK(transport.any_text_contains("culpeo.init-error"));
+    CHECK(transport.any_text_contains("invalid-streams"));
+    CHECK(session.state() == SessionState::closed);
+}
+
+TEST_CASE("Unknown offset_type value → invalid-streams error", "[session][offset_type]") {
+    MockTransport transport;
+    Session session(transport);
+
+    auto raw = make_ctrl_frame(
+        {{"Event", "culpeo.init"},
+         {"Authorization", "Bearer token"},
+         {"Content-Type", "application/json"}},
+        R"({"version":"0.3","streams":[{"content_type":"audio/opus","type":"input","offset_type":"samples"}]})");
+
+    auto result = feed_text(session, raw);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == Error::invalid_streams);
+    CHECK(transport.any_text_contains("culpeo.init-error"));
+    CHECK(session.state() == SessionState::closed);
+}
+
+TEST_CASE("offset_type=byte: offset increments by payload byte length", "[session][offset_type]") {
+    MockTransport transport;
+    SessionCallbacks cbs;
+    cbs.on_auth_validate = [](std::string_view) { return true; };
+    cbs.on_media_received = [](const StreamInfo&, uint64_t, std::span<const std::byte>) {};
+    Session session(transport, std::move(cbs));
+
+    feed_text(session, make_ctrl_frame(
+        {{"Event", "culpeo.init"}, {"Authorization", "Bearer token"},
+         {"Content-Type", "application/json"}},
+        R"({"version":"0.3","streams":[{"content_type":"audio/opus","type":"input","offset_type":"byte"}]})"));
+
+    REQUIRE(session.state() == SessionState::established);
+    auto streams = session.streams();
+    const std::string sid = streams[0].id;
+
+    // First frame: 100 bytes → offset should advance to 100
+    auto raw1 = make_media_frame(
+        {{"Stream-Id", sid}, {"Offset", "0"},
+         {"Content-Type", "audio/opus"}, {"Timestamp", "0"}},
+        std::string(100, '\x42'));
+    auto r1 = feed_binary(session, raw1);
+    REQUIRE(r1.has_value());
+    CHECK(session.streams()[0].offset == 100);
+
+    // Second frame: 200 bytes → offset should advance to 300
+    auto raw2 = make_media_frame(
+        {{"Stream-Id", sid}, {"Offset", "100"},
+         {"Content-Type", "audio/opus"}, {"Timestamp", "100"}},
+        std::string(200, '\xAB'));
+    auto r2 = feed_binary(session, raw2);
+    REQUIRE(r2.has_value());
+    CHECK(session.streams()[0].offset == 300);
+}
+
+TEST_CASE("offset_type=message: offset increments by 1 per frame", "[session][offset_type]") {
+    MockTransport transport;
+    SessionCallbacks cbs;
+    cbs.on_auth_validate = [](std::string_view) { return true; };
+    cbs.on_media_received = [](const StreamInfo&, uint64_t, std::span<const std::byte>) {};
+    Session session(transport, std::move(cbs));
+
+    feed_text(session, make_ctrl_frame(
+        {{"Event", "culpeo.init"}, {"Authorization", "Bearer token"},
+         {"Content-Type", "application/json"}},
+        R"({"version":"0.3","streams":[{"content_type":"audio/opus","type":"input","offset_type":"message"}]})"));
+
+    REQUIRE(session.state() == SessionState::established);
+    auto streams = session.streams();
+    const std::string sid = streams[0].id;
+
+    // Three frames of varying sizes; each should increment offset by 1
+    for (int i = 0; i < 3; ++i) {
+        auto raw = make_media_frame(
+            {{"Stream-Id", sid}, {"Offset", std::to_string(i)},
+             {"Content-Type", "audio/opus"}, {"Timestamp", "0"}},
+            std::string(50 + i * 10, '\x00'));
+        auto r = feed_binary(session, raw);
+        REQUIRE(r.has_value());
+    }
+    CHECK(session.streams()[0].offset == 3);
+}
+
+TEST_CASE("offset_type=time: offset increments by sample count (PCM formula)", "[session][offset_type]") {
+    MockTransport transport;
+    SessionCallbacks cbs;
+    cbs.on_auth_validate = [](std::string_view) { return true; };
+    cbs.on_media_received = [](const StreamInfo&, uint64_t, std::span<const std::byte>) {};
+    Session session(transport, std::move(cbs));
+
+    // 16-bit mono at 16 kHz: 2 bytes per sample
+    feed_text(session, make_ctrl_frame(
+        {{"Event", "culpeo.init"}, {"Authorization", "Bearer token"},
+         {"Content-Type", "application/json"}},
+        R"({"version":"0.3","streams":[{"content_type":"audio/pcm;rate=16000;channels=1;bits=16","type":"input","offset_type":"time"}]})"));
+
+    REQUIRE(session.state() == SessionState::established);
+    auto streams = session.streams();
+    const std::string sid = streams[0].id;
+
+    // 320 bytes / 2 bytes_per_sample = 160 samples
+    auto raw = make_media_frame(
+        {{"Stream-Id", sid}, {"Offset", "0"},
+         {"Content-Type", "audio/pcm;rate=16000;channels=1;bits=16"},
+         {"Timestamp", "0"}},
+        std::string(320, '\x00'));
+    auto r = feed_binary(session, raw);
+    REQUIRE(r.has_value());
+    CHECK(session.streams()[0].offset == 160);
+}
+
+TEST_CASE("init-ack includes offset_type in stream list", "[session][offset_type]") {
+    MockTransport transport;
+    SessionCallbacks cbs;
+    cbs.on_auth_validate = [](std::string_view) { return true; };
+    Session session(transport, std::move(cbs));
+
+    feed_text(session, make_ctrl_frame(
+        {{"Event", "culpeo.init"}, {"Authorization", "Bearer token"},
+         {"Content-Type", "application/json"}},
+        R"({"version":"0.3","streams":[{"content_type":"audio/pcm;rate=16000;channels=1;bits=16","type":"input","offset_type":"time"}]})"));
+
+    REQUIRE(session.state() == SessionState::established);
+    REQUIRE(transport.text_count() >= 1);
+
+    // The init-ack body should contain "offset_type":"time"
+    const auto init_ack = transport.text_frame_str(0);
+    CHECK(init_ack.find("offset_type") != std::string::npos);
+    CHECK(init_ack.find("time") != std::string::npos);
 }
 
 // ─── Event name validation (§9.5) ────────────────────────────────────────────
@@ -1039,7 +1188,7 @@ TEST_CASE("Concurrent send_media from multiple threads is safe", "[session][thre
     feed_text(session, make_ctrl_frame(
         {{"Event", "culpeo.init"}, {"Authorization", "Bearer token"},
          {"Content-Type", "application/json"}},
-        R"({"version":"0.3","streams":[{"content_type":"audio/opus","type":"duplex"}]})"));
+        R"({"version":"0.3","streams":[{"content_type":"audio/opus","type":"duplex","offset_type":"message"}]})"));
 
     REQUIRE(session.state() == SessionState::established);
     const std::string sid = session.streams()[0].id;
@@ -1054,7 +1203,7 @@ TEST_CASE("Concurrent send_media from multiple threads is safe", "[session][thre
             const std::string payload(120, '\x42');
             for (int i = 0; i < kSendsPerThread; ++i) {
                 auto result = session.send_media(sid,
-                    culpeo::frame::as_bytes(payload), 0);
+                    culpeo::message::as_bytes(payload), 0);
                 if (result.has_value()) {
                     ++success_count;
                 }
@@ -1081,8 +1230,8 @@ TEST_CASE("Concurrent process and send from different threads is safe", "[sessio
         {{"Event", "culpeo.init"}, {"Authorization", "Bearer token"},
          {"Content-Type", "application/json"}},
         R"({"version":"0.3","streams":[
-            {"content_type":"audio/pcm;rate=16000;channels=1;bits=16","type":"input","purpose":"in"},
-            {"content_type":"audio/opus","type":"output","purpose":"out"}
+            {"content_type":"audio/pcm;rate=16000;channels=1;bits=16","type":"input","purpose":"in","offset_type":"time"},
+            {"content_type":"audio/opus","type":"output","purpose":"out","offset_type":"message"}
         ]})"));
 
     REQUIRE(session.state() == SessionState::established);
@@ -1116,7 +1265,7 @@ TEST_CASE("Concurrent process and send from different threads is safe", "[sessio
     std::thread sender([&] {
         const std::string payload(120, '\x42');
         for (int i = 0; i < kFrames; ++i) {
-            session.send_media(output_sid, culpeo::frame::as_bytes(payload), 0);
+            session.send_media(output_sid, culpeo::message::as_bytes(payload), 0);
         }
         done = true;
     });

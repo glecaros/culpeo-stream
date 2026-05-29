@@ -170,6 +170,38 @@ Section 3.1, Section B.5, Section A.5
 
 ---
 
+## Explicit `offset_type` field replacing content-type inference
+**Date:** 2026-05-28
+**Phase:** Phase 1 — Core Library
+**Status:** Decided
+
+### Context
+Prior to this change, the offset-increment behaviour was implicitly inferred from `content_type`: `audio/pcm` triggered the PCM sample-count formula; everything else incremented by 1 per frame. The spec (v0.3.0, §5.5 and §8.2) now mandates an explicit `offset_type` field on every stream declaration, removing the inference and adding a third value (`byte`) that was previously unrepresentable.
+
+Options considered:
+1. Keep content-type inference for `time` and add `offset_type` only for `byte` (opt-in) — rejected because it would leave `message` streams ambiguous and deviate from the REQUIRED spec requirement.
+2. Make `offset_type` optional and infer when absent — rejected because §5.5 says REQUIRED and §5.6 says `invalid-streams` for missing values.
+3. Require `offset_type` on all streams, remove all inference — chosen.
+
+### Decision
+Added a public `OffsetType` enum (`Time`, `Byte`, `Message`) to the Core library. `StreamDeclaration` and `StreamState` both carry an `OffsetType` property. `ParseInitBody` now reads the `offset_type` JSON field and throws `invalid-streams` if it is absent or unrecognised. `StreamState.AdvanceOffset` dispatches on `OffsetType`:
+
+- `Time` → PCM sample-count formula; `audio/pcm` content type and valid `channels`/`bits`/`rate` params are still required at construction time, throwing `protocol-error` if invalid (same as before).
+- `Byte` → increment by raw payload byte length (new).
+- `Message` → increment by 1 (unchanged behaviour, now explicit).
+
+`MatchesStream` (used for resumption stream-matching) was updated to compare `OffsetType` in addition to `ContentType`, `Type`, and `Purpose`. `CreateInitAckFrame` now serialises `offset_type` in each confirmed stream object.
+
+### Tradeoffs
+- Existing sessions that relied on implicit `audio/pcm → time` behaviour must now declare `"offset_type":"time"` explicitly. This is a breaking wire-format change — any client or test that omits `offset_type` will receive `invalid-streams`.
+- Non-PCM streams that formerly defaulted to `message` behaviour must now declare `"offset_type":"message"` explicitly. This is intentional per the spec.
+- The `byte` offset type is only meaningful for opaque binary streams where callers want byte-position semantics. It is not valid for PCM (use `time`) or structured messages (use `message`). No additional validation preventing `byte` on PCM was added, as the spec does not prohibit the combination.
+
+### Spec Reference
+Section 5.5 (offset types), Section 5.6 (stream validation rule 2 and 4), Section 8.2 (offset increment formulas)
+
+---
+
 ## Middleware pipeline position and ordering
 **Date:** 2026-05-28
 **Phase:** Phase 2 — ASP.NET Core Integration

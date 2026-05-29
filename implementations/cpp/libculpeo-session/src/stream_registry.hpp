@@ -23,7 +23,14 @@ validate_declarations(const std::vector<StreamDeclaration>& decls, uint32_t max_
 // Return the canonical string for a StreamDirection.
 [[nodiscard]] std::string_view stream_direction_to_string(StreamDirection dir) noexcept;
 
-// Determine codec from content_type string (uses culpeo::frame::parse_content_type).
+// Parse OffsetType from the "offset_type" field string.
+// Returns std::nullopt for unrecognised values (caller must reject as invalid-streams).
+[[nodiscard]] std::optional<OffsetType> parse_offset_type(std::string_view s) noexcept;
+
+// Return the canonical wire string for an OffsetType (for serialisation in culpeo.init-ack).
+[[nodiscard]] std::string_view offset_type_to_string(OffsetType ot) noexcept;
+
+// Determine codec from content_type string (uses culpeo::message::parse_content_type).
 [[nodiscard]] StreamCodec codec_from_content_type(std::string_view ct) noexcept;
 
 // Generate a CSPRNG-backed opaque identifier, hex-encoded.

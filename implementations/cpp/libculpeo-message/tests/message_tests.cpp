@@ -1,6 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 
-#include "culpeo/frame.hpp"
+#include "culpeo/message.hpp"
 
 #include <array>
 #include <cstddef>
@@ -10,7 +10,7 @@
 #include <variant>
 #include <vector>
 
-using namespace culpeo::frame;
+using namespace culpeo::message;
 
 namespace {
 

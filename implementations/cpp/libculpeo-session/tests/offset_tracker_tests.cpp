@@ -71,9 +71,9 @@ TEST_CASE("PCM increment: zero frame_bytes → 0 increment", "[offset_tracker]")
 
 // ─── advance_offset ───────────────────────────────────────────────────────────
 
-TEST_CASE("advance_offset: PCM stream advances by sample count", "[offset_tracker]") {
+TEST_CASE("advance_offset: PCM stream (time) advances by sample count", "[offset_tracker]") {
     StreamInfo stream{};
-    stream.codec = StreamCodec::pcm;
+    stream.offset_type = OffsetType::time;
     stream.pcm_params = PcmParams{.rate = 16000, .channels = 1, .bits = 16};
     stream.offset = 0;
 
@@ -82,9 +82,9 @@ TEST_CASE("advance_offset: PCM stream advances by sample count", "[offset_tracke
     CHECK(stream.offset == 160u);
 }
 
-TEST_CASE("advance_offset: PCM stream cumulative", "[offset_tracker]") {
+TEST_CASE("advance_offset: PCM stream (time) cumulative", "[offset_tracker]") {
     StreamInfo stream{};
-    stream.codec = StreamCodec::pcm;
+    stream.offset_type = OffsetType::time;
     stream.pcm_params = PcmParams{.rate = 16000, .channels = 1, .bits = 16};
     stream.offset = 0;
 
@@ -94,9 +94,9 @@ TEST_CASE("advance_offset: PCM stream cumulative", "[offset_tracker]") {
     CHECK(stream.offset == 560u);
 }
 
-TEST_CASE("advance_offset: Opus stream increments by 1", "[offset_tracker]") {
+TEST_CASE("advance_offset: message stream increments by 1", "[offset_tracker]") {
     StreamInfo stream{};
-    stream.codec = StreamCodec::opus;
+    stream.offset_type = OffsetType::message;
     stream.offset = 42;
 
     auto result = advance_offset(stream, 1234);
@@ -104,9 +104,10 @@ TEST_CASE("advance_offset: Opus stream increments by 1", "[offset_tracker]") {
     CHECK(stream.offset == 43u);
 }
 
-TEST_CASE("advance_offset: AAC stream increments by 1", "[offset_tracker]") {
+TEST_CASE("advance_offset: message stream (Opus-like) increments by 1", "[offset_tracker]") {
     StreamInfo stream{};
-    stream.codec = StreamCodec::aac;
+    stream.offset_type = OffsetType::message;
+    stream.codec = StreamCodec::opus;
     stream.offset = 100;
 
     auto result = advance_offset(stream, 512);
@@ -114,19 +115,40 @@ TEST_CASE("advance_offset: AAC stream increments by 1", "[offset_tracker]") {
     CHECK(stream.offset == 101u);
 }
 
-TEST_CASE("advance_offset: unknown codec increments by 1", "[offset_tracker]") {
+TEST_CASE("advance_offset: byte stream increments by payload byte length", "[offset_tracker]") {
     StreamInfo stream{};
-    stream.codec = StreamCodec::other;
-    stream.offset = 7;
+    stream.offset_type = OffsetType::byte;
+    stream.offset = 0;
 
-    auto result = advance_offset(stream, 64);
+    auto result = advance_offset(stream, 4096);
     REQUIRE(result.has_value());
-    CHECK(stream.offset == 8u);
+    CHECK(stream.offset == 4096u);
 }
 
-TEST_CASE("advance_offset: PCM missing pcm_params → error", "[offset_tracker]") {
+TEST_CASE("advance_offset: byte stream cumulative", "[offset_tracker]") {
     StreamInfo stream{};
-    stream.codec = StreamCodec::pcm;
+    stream.offset_type = OffsetType::byte;
+    stream.offset = 0;
+
+    advance_offset(stream, 100);
+    advance_offset(stream, 200);
+    advance_offset(stream, 50);
+    CHECK(stream.offset == 350u);
+}
+
+TEST_CASE("advance_offset: byte stream zero payload → no change", "[offset_tracker]") {
+    StreamInfo stream{};
+    stream.offset_type = OffsetType::byte;
+    stream.offset = 999;
+
+    auto result = advance_offset(stream, 0);
+    REQUIRE(result.has_value());
+    CHECK(stream.offset == 999u);
+}
+
+TEST_CASE("advance_offset: time type missing pcm_params → error", "[offset_tracker]") {
+    StreamInfo stream{};
+    stream.offset_type = OffsetType::time;
     stream.pcm_params = std::nullopt;
     stream.offset = 0;
 
@@ -135,12 +157,22 @@ TEST_CASE("advance_offset: PCM missing pcm_params → error", "[offset_tracker]"
     CHECK(result.error() == Error::offset_overflow);
 }
 
-TEST_CASE("advance_offset: overflow protection on offset addition", "[offset_tracker]") {
+TEST_CASE("advance_offset: overflow protection on offset addition (message)", "[offset_tracker]") {
     StreamInfo stream{};
-    stream.codec = StreamCodec::opus;
+    stream.offset_type = OffsetType::message;
     stream.offset = std::numeric_limits<uint64_t>::max();
 
     auto result = advance_offset(stream, 1);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == Error::offset_overflow);
+}
+
+TEST_CASE("advance_offset: overflow protection on offset addition (byte)", "[offset_tracker]") {
+    StreamInfo stream{};
+    stream.offset_type = OffsetType::byte;
+    stream.offset = std::numeric_limits<uint64_t>::max() - 10;
+
+    auto result = advance_offset(stream, 100);  // would overflow
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error() == Error::offset_overflow);
 }

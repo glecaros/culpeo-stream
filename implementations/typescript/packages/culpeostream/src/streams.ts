@@ -3,6 +3,7 @@ import { computeOffsetIncrement, OffsetTracker } from "./offsets.js";
 import type {
   ConfirmedStreamDeclaration,
   EndpointRole,
+  OffsetType,
   ResumeStreamDeclaration,
   SessionSnapshot,
   StreamDeclaration,
@@ -18,7 +19,7 @@ function normalizeContentType(contentType: string): string {
 }
 
 function logicalKey(stream: StreamDeclaration): string {
-  return `${stream.type}:${stream.purpose ?? ""}:${stream.content_type}`;
+  return `${stream.type}:${stream.purpose ?? ""}:${stream.content_type}:${stream.offset_type}`;
 }
 
 function assertValidDirection(type: string): asserts type is StreamDirection {
@@ -56,6 +57,16 @@ export function validateStreamDeclarations(
       );
     }
     assertValidDirection(stream.type);
+    if (
+      stream.offset_type !== "time" &&
+      stream.offset_type !== "byte" &&
+      stream.offset_type !== "message"
+    ) {
+      throw new CulpeoError(
+        "invalid-streams",
+        `Invalid or missing offset_type '${stream.offset_type}'. Must be 'time', 'byte', or 'message'.`,
+      );
+    }
     const group = streamsByType.get(stream.type) ?? [];
     group.push(stream);
     streamsByType.set(stream.type, group);
@@ -166,8 +177,9 @@ export class StreamRegistry {
       contentType: stream.content_type,
       offset: this.offsets.allocate(
         streamId,
-        stream.content_type,
+        stream.offset_type,
         payloadLength,
+        stream.content_type,
       ),
     };
   }
@@ -199,7 +211,7 @@ export class StreamRegistry {
     this.offsets.recordReceived(
       streamId,
       offset,
-      computeOffsetIncrement(stream.content_type, payloadLength),
+      computeOffsetIncrement(stream.offset_type, payloadLength, stream.content_type),
     );
   }
 
@@ -220,6 +232,7 @@ export class StreamRegistry {
         id: stream.id,
         type: stream.type,
         content_type: stream.content_type,
+        offset_type: stream.offset_type,
         ...(stream.purpose !== undefined ? { purpose: stream.purpose } : {}),
         resume_offset: this.offsets.getResumeOffset(stream.id),
       })),
@@ -235,6 +248,7 @@ export class StreamRegistry {
       id: stream.id,
       type: stream.type,
       content_type: stream.content_type,
+      offset_type: stream.offset_type,
       ...(stream.purpose !== undefined ? { purpose: stream.purpose } : {}),
       resume_offset: this.offsets.getResumeOffset(stream.id),
     }));

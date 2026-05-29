@@ -265,9 +265,9 @@ public sealed class CulpeoCoreTests
             CulpeoFrameKind.Control,
             Encoding.UTF8.GetBytes("""
             {"version":"0.3","streams":[
-              {"content_type":"audio/pcm;channels=1;bits=16","type":"input","purpose":"user-voice"},
-              {"content_type":"audio/opus","type":"output","purpose":"assistant-voice"},
-              {"content_type":"application/json","type":"duplex","purpose":"events"}
+              {"content_type":"audio/pcm;channels=1;bits=16","type":"input","purpose":"user-voice","offset_type":"time"},
+              {"content_type":"audio/opus","type":"output","purpose":"assistant-voice","offset_type":"message"},
+              {"content_type":"application/json","type":"duplex","purpose":"events","offset_type":"message"}
             ]}
             """),
             @event: "culpeo.init",
@@ -291,9 +291,9 @@ public sealed class CulpeoCoreTests
             CulpeoFrameKind.Control,
             Encoding.UTF8.GetBytes("""
             {"version":"0.3","streams":[
-              {"content_type":"audio/pcm;rate=16000;channels=1;bits=12","type":"input","purpose":"user-voice"},
-              {"content_type":"audio/opus","type":"output","purpose":"assistant-voice"},
-              {"content_type":"application/json","type":"duplex","purpose":"events"}
+              {"content_type":"audio/pcm;rate=16000;channels=1;bits=12","type":"input","purpose":"user-voice","offset_type":"time"},
+              {"content_type":"audio/opus","type":"output","purpose":"assistant-voice","offset_type":"message"},
+              {"content_type":"application/json","type":"duplex","purpose":"events","offset_type":"message"}
             ]}
             """),
             @event: "culpeo.init",
@@ -306,6 +306,142 @@ public sealed class CulpeoCoreTests
         Assert.True(result.ShouldClose);
         Assert.Equal("protocol-error", result.CloseCode);
         Assert.Equal("culpeo.init-error", Assert.Single(result.OutboundFrames).Event);
+    }
+
+    [Fact]
+    public async Task Session_RejectsMissingOffsetType()
+    {
+        var server = new CulpeoSessionServer();
+        var connection = await server.CreateConnectionAsync();
+        var init = new CulpeoFrame(
+            CulpeoFrameKind.Control,
+            Encoding.UTF8.GetBytes("""
+            {"version":"0.3","streams":[
+              {"content_type":"audio/pcm;rate=16000;channels=1;bits=16","type":"input","purpose":"user-voice"},
+              {"content_type":"audio/opus","type":"output","purpose":"assistant-voice","offset_type":"message"},
+              {"content_type":"application/json","type":"duplex","purpose":"events","offset_type":"message"}
+            ]}
+            """),
+            @event: "culpeo.init",
+            contentType: "application/json",
+            authorization: "Bearer token",
+            bufferWindow: 1000);
+
+        var result = await connection.ReceiveAsync(init);
+
+        Assert.True(result.ShouldClose);
+        Assert.Equal("invalid-streams", result.CloseCode);
+        Assert.Equal("culpeo.init-error", Assert.Single(result.OutboundFrames).Event);
+    }
+
+    [Fact]
+    public async Task Session_RejectsUnrecognisedOffsetType()
+    {
+        var server = new CulpeoSessionServer();
+        var connection = await server.CreateConnectionAsync();
+        var init = new CulpeoFrame(
+            CulpeoFrameKind.Control,
+            Encoding.UTF8.GetBytes("""
+            {"version":"0.3","streams":[
+              {"content_type":"audio/pcm;rate=16000;channels=1;bits=16","type":"input","purpose":"user-voice","offset_type":"frames"},
+              {"content_type":"audio/opus","type":"output","purpose":"assistant-voice","offset_type":"message"},
+              {"content_type":"application/json","type":"duplex","purpose":"events","offset_type":"message"}
+            ]}
+            """),
+            @event: "culpeo.init",
+            contentType: "application/json",
+            authorization: "Bearer token",
+            bufferWindow: 1000);
+
+        var result = await connection.ReceiveAsync(init);
+
+        Assert.True(result.ShouldClose);
+        Assert.Equal("invalid-streams", result.CloseCode);
+        Assert.Equal("culpeo.init-error", Assert.Single(result.OutboundFrames).Event);
+    }
+
+    [Fact]
+    public async Task Session_RejectsTimeOffsetType_OnNonPcmStream()
+    {
+        var server = new CulpeoSessionServer();
+        var connection = await server.CreateConnectionAsync();
+        var init = new CulpeoFrame(
+            CulpeoFrameKind.Control,
+            Encoding.UTF8.GetBytes("""
+            {"version":"0.3","streams":[
+              {"content_type":"audio/opus","type":"input","purpose":"user-voice","offset_type":"time"},
+              {"content_type":"audio/opus","type":"output","purpose":"assistant-voice","offset_type":"message"},
+              {"content_type":"application/json","type":"duplex","purpose":"events","offset_type":"message"}
+            ]}
+            """),
+            @event: "culpeo.init",
+            contentType: "application/json",
+            authorization: "Bearer token",
+            bufferWindow: 1000);
+
+        var result = await connection.ReceiveAsync(init);
+
+        Assert.True(result.ShouldClose);
+        Assert.Equal("protocol-error", result.CloseCode);
+    }
+
+    [Fact]
+    public async Task OffsetTracking_ByteOffsetType_IncrementsByPayloadByteLength()
+    {
+        var server = new CulpeoSessionServer();
+        var connection = await server.CreateConnectionAsync();
+        var init = new CulpeoFrame(
+            CulpeoFrameKind.Control,
+            Encoding.UTF8.GetBytes("""
+            {"version":"0.3","streams":[
+              {"content_type":"application/octet-stream","type":"input","purpose":"data","offset_type":"byte"},
+              {"content_type":"application/octet-stream","type":"output","purpose":"reply","offset_type":"byte"},
+              {"content_type":"application/json","type":"duplex","purpose":"events","offset_type":"message"}
+            ]}
+            """),
+            @event: "culpeo.init",
+            contentType: "application/json",
+            authorization: "Bearer token",
+            bufferWindow: 1000);
+
+        var initResult = await connection.ReceiveAsync(init);
+        Assert.False(initResult.ShouldClose);
+        Assert.Equal(CulpeoSessionState.Established, connection.State);
+
+        var ack = Assert.Single(initResult.OutboundFrames);
+        using var ackDoc = JsonDocument.Parse(ack.Body);
+        var inputStream = ackDoc.RootElement.GetProperty("streams").EnumerateArray()
+            .Single(s => s.GetProperty("type").GetString() == "input");
+        Assert.Equal("byte", inputStream.GetProperty("offset_type").GetString());
+
+        var inputId = GetStreamId(connection, CulpeoStreamType.Input, "data");
+        var outputId = GetStreamId(connection, CulpeoStreamType.Output, "reply");
+
+        // Send two frames — offsets should increment by byte length
+        var frame1 = new CulpeoFrame(CulpeoFrameKind.Media, new byte[100], contentType: "application/octet-stream", streamId: inputId, offset: 0, timestamp: 0);
+        var frame2 = new CulpeoFrame(CulpeoFrameKind.Media, new byte[200], contentType: "application/octet-stream", streamId: inputId, offset: 100, timestamp: 1);
+
+        Assert.False((await connection.ReceiveAsync(frame1)).ShouldClose);
+        Assert.False((await connection.ReceiveAsync(frame2)).ShouldClose);
+        Assert.Equal(300, connection.Streams.Single(s => s.Id == inputId).CurrentOffset);
+
+        // Server sends on the output stream — offsets also increment by byte length
+        var serverFrame1 = await connection.SendMediaAsync(outputId, new byte[50], 0);
+        var serverFrame2 = await connection.SendMediaAsync(outputId, new byte[75], 1);
+        Assert.Equal(0, serverFrame1.Offset);
+        Assert.Equal(50, serverFrame2.Offset);
+    }
+
+    [Fact]
+    public async Task InitAck_IncludesOffsetType_ForEachStream()
+    {
+        var server = new CulpeoSessionServer();
+        var connection = await EstablishSessionAsync(server);
+
+        var ack = connection.Streams;
+        Assert.Equal(OffsetType.Time, ack.Single(s => s.Type == CulpeoStreamType.Input).OffsetType);
+        Assert.Equal(OffsetType.Message, ack.Single(s => s.Type == CulpeoStreamType.Output).OffsetType);
+        Assert.Equal(OffsetType.Message, ack.Single(s => s.Type == CulpeoStreamType.Duplex).OffsetType);
     }
 
     [Fact]
@@ -358,9 +494,9 @@ public sealed class CulpeoCoreTests
             CulpeoFrameKind.Control,
             Encoding.UTF8.GetBytes("""
             {"version":"0.3","streams":[
-              {"content_type":"application/x-test;Mode=Fast","type":"input","purpose":"user-voice"},
-              {"content_type":"audio/opus","type":"output","purpose":"assistant-voice"},
-              {"content_type":"application/json","type":"duplex","purpose":"events"}
+              {"content_type":"application/x-test;Mode=Fast","type":"input","purpose":"user-voice","offset_type":"message"},
+              {"content_type":"audio/opus","type":"output","purpose":"assistant-voice","offset_type":"message"},
+              {"content_type":"application/json","type":"duplex","purpose":"events","offset_type":"message"}
             ]}
             """),
             @event: "culpeo.init",
@@ -553,9 +689,9 @@ public sealed class CulpeoCoreTests
         {
           "version":"{{version}}",
           "streams":[
-            {"content_type":"audio/pcm;rate=16000;channels=1;bits=16","type":"input","purpose":"user-voice"},
-            {"content_type":"audio/opus","type":"output","purpose":"assistant-voice"},
-            {"content_type":"application/json","type":"duplex","purpose":"events"}
+            {"content_type":"audio/pcm;rate=16000;channels=1;bits=16","type":"input","purpose":"user-voice","offset_type":"time"},
+            {"content_type":"audio/opus","type":"output","purpose":"assistant-voice","offset_type":"message"},
+            {"content_type":"application/json","type":"duplex","purpose":"events","offset_type":"message"}
           ]
         }
         """;
@@ -579,9 +715,9 @@ public sealed class CulpeoCoreTests
         {
           "version":"0.3",
           "streams":[
-            {"id":"{{inputId}}","content_type":"audio/pcm;rate=16000;channels=1;bits=16","type":"input","purpose":"user-voice","resume_offset":{{requestedInputResumeOffset}}},
-            {"id":"{{outputId}}","content_type":"audio/opus","type":"output","purpose":"assistant-voice","resume_offset":0},
-            {"id":"{{duplexId}}","content_type":"application/json","type":"duplex","purpose":"events","resume_offset":0}
+            {"id":"{{inputId}}","content_type":"audio/pcm;rate=16000;channels=1;bits=16","type":"input","purpose":"user-voice","offset_type":"time","resume_offset":{{requestedInputResumeOffset}}},
+            {"id":"{{outputId}}","content_type":"audio/opus","type":"output","purpose":"assistant-voice","offset_type":"message","resume_offset":0},
+            {"id":"{{duplexId}}","content_type":"application/json","type":"duplex","purpose":"events","offset_type":"message","resume_offset":0}
           ]
         }
         """;

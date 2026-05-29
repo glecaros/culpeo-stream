@@ -9,7 +9,7 @@ import type {
 
 describe("frame parser and serializer", () => {
   const initBody =
-    '{"version":"0.3","streams":[{"content_type":"audio/opus","type":"output"}]}';
+    '{"version":"0.3","streams":[{"content_type":"audio/opus","type":"output","offset_type":"message"}]}';
 
   it("round-trips control frames and ignores unknown headers", () => {
     const frame: InitFrame = {
@@ -23,7 +23,7 @@ describe("frame parser and serializer", () => {
       },
       body: {
         version: "0.3",
-        streams: [{ content_type: "audio/opus", type: "output" }],
+        streams: [{ content_type: "audio/opus", type: "output", offset_type: "message" }],
       },
     };
 

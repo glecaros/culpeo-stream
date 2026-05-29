@@ -25,7 +25,7 @@ culpeo-stream/
       examples/
       DECISIONS.md
     cpp/                          ← C++ core library + Python bindings
-      libculpeo-frame/
+      libculpeo-message/
       libculpeo-session/
       bindings/
       samples/

@@ -451,6 +451,7 @@ function buildServerConfirmedStreams(
       id: generateId(),
       type: stream.type,
       content_type: stream.content_type,
+      offset_type: stream.offset_type,
       ...(stream.purpose !== undefined ? { purpose: stream.purpose } : {}),
     }));
   }
@@ -468,6 +469,7 @@ function buildServerConfirmedStreams(
       (candidate) =>
         candidate.type === stream.type &&
         candidate.content_type === stream.content_type &&
+        candidate.offset_type === stream.offset_type &&
         candidate.purpose === stream.purpose,
     );
     const matched = index >= 0 ? remaining.splice(index, 1)[0] : undefined;
@@ -489,6 +491,7 @@ function buildServerConfirmedStreams(
       id: matched.id,
       type: matched.type,
       content_type: matched.content_type,
+      offset_type: matched.offset_type,
       ...(matched.purpose !== undefined ? { purpose: matched.purpose } : {}),
       resume_offset: requestedOffset,
     };

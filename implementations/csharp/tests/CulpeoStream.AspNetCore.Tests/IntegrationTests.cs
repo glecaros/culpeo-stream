@@ -74,7 +74,7 @@ public sealed class IntegrationTests
         using var ws = await ConnectAsync(server);
 
         var bodyBytes = Encoding.UTF8.GetBytes(
-            """{"version":"9.9","streams":[{"content_type":"audio/opus","type":"input"}]}""");
+            """{"version":"9.9","streams":[{"content_type":"audio/opus","type":"input","offset_type":"message"}]}""");
 
         var initFrame = new CulpeoFrame(
             CulpeoFrameKind.Control,
@@ -101,7 +101,7 @@ public sealed class IntegrationTests
         using var ws = await ConnectAsync(server);
 
         var bodyBytes = Encoding.UTF8.GetBytes(
-            """{"version":"0.3","streams":[{"content_type":"audio/opus","type":"input"}]}""");
+            """{"version":"0.3","streams":[{"content_type":"audio/opus","type":"input","offset_type":"message"}]}""");
 
         var initFrame = new CulpeoFrame(
             CulpeoFrameKind.Control,
@@ -297,7 +297,7 @@ public sealed class IntegrationTests
 
         // Declare an output stream
         var bodyBytes = Encoding.UTF8.GetBytes(
-            """{"version":"0.3","streams":[{"content_type":"audio/opus","type":"output"}]}""");
+            """{"version":"0.3","streams":[{"content_type":"audio/opus","type":"output","offset_type":"message"}]}""");
 
         var initFrame = new CulpeoFrame(
             CulpeoFrameKind.Control,
@@ -360,9 +360,9 @@ public sealed class IntegrationTests
         var bodyBytes = Encoding.UTF8.GetBytes(
             """
             {"version":"0.3","streams":[
-              {"content_type":"audio/opus","type":"input","purpose":"a"},
-              {"content_type":"audio/opus","type":"input","purpose":"b"},
-              {"content_type":"audio/opus","type":"input","purpose":"c"}
+              {"content_type":"audio/opus","type":"input","purpose":"a","offset_type":"message"},
+              {"content_type":"audio/opus","type":"input","purpose":"b","offset_type":"message"},
+              {"content_type":"audio/opus","type":"input","purpose":"c","offset_type":"message"}
             ]}
             """);
 

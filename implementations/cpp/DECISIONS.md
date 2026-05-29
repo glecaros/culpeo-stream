@@ -7,7 +7,7 @@
 Phase 1 requires a parser that can inspect control and media frames without copying header values or the body. The transport layer already owns the receive buffer, so copying header strings into parser-owned storage would add avoidable latency and allocations.
 
 ### Decision
-`libculpeo-frame` returns `ParsedHeadersView`, which stores `std::string_view` slices into the caller-owned frame buffer for the header block, reserved header values, and body. The public header documents this through the view-based API surface rather than owning strings.
+`libculpeo-message` returns `ParsedHeadersView`, which stores `std::string_view` slices into the caller-owned frame buffer for the header block, reserved header values, and body. The public header documents this through the view-based API surface rather than owning strings.
 
 ### Tradeoffs
 Callers must keep the underlying frame buffer alive while using parsed views. This pushes a lifetime requirement onto users of the API, but it removes heap traffic from the parser hot path and keeps binary payload access zero-copy.
@@ -24,7 +24,7 @@ Section 4, Section 4.1, C++ agent instructions Phase 1
 The frame parser must be usable in performance-sensitive paths and the agent instructions explicitly prohibit exceptions in the parser. The library still needs precise failure reporting for malformed headers and content types.
 
 ### Decision
-The parser and content-type helpers return `std::expected<T, culpeo::frame::Error>`. `Error` is a compact enum that covers malformed header lines, invalid names or values, size-limit violations, duplicate reserved headers, invalid content types, and serialization buffer exhaustion.
+The parser and content-type helpers return `std::expected<T, culpeo::message::Error>`. `Error` is a compact enum that covers malformed header lines, invalid names or values, size-limit violations, duplicate reserved headers, invalid content types, and serialization buffer exhaustion.
 
 ### Tradeoffs
 An enum error type keeps the ABI and code path simple, but it does not capture source offsets or rich diagnostics. Higher layers can map these stable error codes to transport-specific logging or protocol close reasons.
@@ -58,7 +58,7 @@ Section 4, Section 4.1, C++ agent instructions Security Requirements
 The agent instructions say a header-only option is acceptable if feasible. The initial implementation includes parsing helpers, serialization logic, and a fuzz target, all of which benefit from a single compiled translation unit.
 
 ### Decision
-Phase 1 ships `libculpeo-frame` as a normal compiled CMake target instead of a header-only library.
+Phase 1 ships `libculpeo-message` as a normal compiled CMake target instead of a header-only library.
 
 ### Tradeoffs
 Consumers pay one extra library build step, but compile times stay lower, internal helpers remain private, and sanitizer/fuzzer builds have a cleaner single-entry implementation file.
@@ -92,7 +92,7 @@ C++ agent instructions Technical Requirements
 The original build used a single monolithic `CMakeLists.txt` at the `implementations/cpp/` root that defined the library, test, and fuzz targets together. As more libraries are added in later phases (e.g., `libculpeo-session`), a flat file would become unwieldy.
 
 ### Decision
-Split into a top-level `CMakeLists.txt` that sets project-wide settings and calls `add_subdirectory()`, and a per-library `libculpeo-frame/CMakeLists.txt` that owns its own targets, dependencies, and tests. Include paths use generator expressions (`$<BUILD_INTERFACE:...>`) to support both in-tree and installed usage.
+Split into a top-level `CMakeLists.txt` that sets project-wide settings and calls `add_subdirectory()`, and a per-library `libculpeo-message/CMakeLists.txt` that owns its own targets, dependencies, and tests. Include paths use generator expressions (`$<BUILD_INTERFACE:...>`) to support both in-tree and installed usage.
 
 ### Tradeoffs
 Adds one more CMake file per library, but each library is self-contained and can be built independently. New Phase 2+ libraries slot in with a single `add_subdirectory()` line.
@@ -244,7 +244,7 @@ Section 5.3, Section A.5, agent instructions Security Requirements
 The session implementation includes nlohmann/json and OpenSSL headers. Exposing these in the public header would force all consumers to depend on them at compile time.
 
 ### Decision
-`Session` uses the Pimpl idiom (`std::unique_ptr<Impl>`). All implementation details, internal helpers, and dependencies are in `session.cpp`. The public header only depends on `culpeo/frame.hpp` and the C++ standard library.
+`Session` uses the Pimpl idiom (`std::unique_ptr<Impl>`). All implementation details, internal helpers, and dependencies are in `session.cpp`. The public header only depends on `culpeo/message.hpp` and the C++ standard library.
 
 ### Tradeoffs
 One extra heap allocation per session for the Impl struct. This is negligible compared to session-level overhead. In exchange, the public header is clean and ABI-stable: changing implementation details (e.g., upgrading JSON library version) doesn't require recompiling consumers.
@@ -295,7 +295,7 @@ Section 4.1
 The Security Agent Phase 1 review (finding: cpp-no-fuzzer-corpus, severity Medium) identified that the fuzzer had no corpus directory. LibFuzzer with no corpus starts from scratch and takes much longer to find interesting paths.
 
 ### Decision
-Created `libculpeo-frame/fuzz/corpus/` with 10 seed files covering all required adversarial inputs: valid frame, truncated (no terminator), CRLF injection in value, overlength block, NUL in name, NUL in value, binary with no terminator, too many headers (>64), empty frame, and only-terminator.
+Created `libculpeo-message/fuzz/corpus/` with 10 seed files covering all required adversarial inputs: valid frame, truncated (no terminator), CRLF injection in value, overlength block, NUL in name, NUL in value, binary with no terminator, too many headers (>64), empty frame, and only-terminator.
 
 ### Tradeoffs
 Seed files make the fuzzer immediately effective at the boundaries the Security Agent identified. The corpus should be expanded over time as the fuzzer finds new interesting inputs.
@@ -334,3 +334,37 @@ Introduced `libculpeo-session/src/crypto.hpp`, a thin internal wrapper providing
 
 ### Spec Reference
 Section A.4, A.5, agent instructions Security Requirements
+
+## OffsetType replaces StreamCodec for offset increment behaviour
+**Date:** 2026-05-27
+**Phase:** Phase 2 — Session Layer
+**Status:** Decided
+
+### Context
+The original offset_tracker used `StreamCodec` (inferred from content_type) to determine how a stream's offset advances after each media frame:
+- `StreamCodec::pcm` → PCM sample-count formula
+- Everything else → increment by 1
+
+The spec §5.5 was updated to require an explicit `offset_type` field on every stream declaration. Three values are defined: `time` (PCM formula), `byte` (raw byte length of the payload), and `message` (always 1). The `byte` type is entirely new — no codec inference could have produced it. Missing or unrecognised values must be rejected as `invalid-streams` (spec §5.6 rule 4).
+
+Options considered:
+1. Keep `StreamCodec` inference as the default and allow `offset_type` to override it
+2. Make `offset_type` mandatory and drive all offset logic from it, keeping `StreamCodec` only for content-type introspection (PCM param extraction)
+3. Remove `StreamCodec` entirely
+
+### Decision
+Option 2. `OffsetType` is now the sole driver of offset increment behaviour in `advance_offset`. `StreamCodec` is retained on `StreamInfo` for a different purpose: identifying whether to populate `pcm_params` (needed by `OffsetType::time`). The `advance_offset` implementation switches on `stream.offset_type` exclusively:
+- `time`    → `compute_pcm_increment(frame_bytes, *stream.pcm_params)`
+- `byte`    → `increment = frame_bytes`
+- `message` → `increment = 1`
+
+`OffsetType` is declared as `std::optional<OffsetType>` in `StreamDeclaration` (absent = not provided in JSON) and as a non-optional `OffsetType` in `StreamInfo` (always set once validated). The JSON parsing in `handle_init` rejects missing or unrecognised `offset_type` strings before they ever reach `validate_declarations`, and `validate_declarations` also guards against the `std::nullopt` case should a caller bypass JSON parsing.
+
+### Tradeoffs
+- Removing `StreamCodec` as the source of truth for offset behaviour eliminates an implicit coupling between MIME type and offset semantics. Streams can now declare `byte` offsets on Opus payloads (valid for some transport use cases) or `message` offsets on PCM streams.
+- The `StreamCodec` field is now slightly redundant for the common case but still useful for content-type introspection and for code paths that need to know whether PCM params are applicable. A future cleanup could remove it if those paths migrate to checking `pcm_params.has_value()` directly.
+- The `byte` offset type interacts with the overflow guard in `advance_offset` in the same way as `time` offsets: the guard is `increment > UINT64_MAX - stream.offset`. For `byte`, `increment = frame_bytes` which can legally be 0 (no-op advance) or very large. A single frame of `UINT64_MAX - current_offset + 1` bytes would overflow; the guard returns `Error::offset_overflow` and closes the session, consistent with the behaviour for PCM overflow.
+- Zero-byte payloads with `offset_type=byte` produce zero increment (no advance), which is correct per spec §8.2: "the increment applied after each media frame is delivered".
+
+### Spec Reference
+Section 5.5, 5.6 (rule 4), 8.2

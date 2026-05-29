@@ -44,7 +44,18 @@ public sealed class CulpeoProcessResult
     public CulpeoSessionState State { get; }
 }
 
-public sealed class CulpeoStreamInfo(string id, string contentType, CulpeoStreamType type, string? purpose, long currentOffset)
+/// <summary>Declares how the <c>Offset</c> value on media frames advances for a stream.</summary>
+public enum OffsetType
+{
+    /// <summary>Offset increments by sample count per channel (PCM formula). Requires <c>audio/pcm</c> content type.</summary>
+    Time,
+    /// <summary>Offset increments by the raw byte length of the media payload.</summary>
+    Byte,
+    /// <summary>Offset increments by 1 per delivered media frame.</summary>
+    Message,
+}
+
+public sealed class CulpeoStreamInfo(string id, string contentType, CulpeoStreamType type, string? purpose, long currentOffset, OffsetType offsetType)
 {
     public string Id { get; } = id;
 
@@ -55,6 +66,8 @@ public sealed class CulpeoStreamInfo(string id, string contentType, CulpeoStream
     public string? Purpose { get; } = purpose;
 
     public long CurrentOffset { get; } = currentOffset;
+
+    public OffsetType OffsetType { get; } = offsetType;
 }
 
 public sealed class CulpeoSessionServer(CulpeoSessionOptions? options = null)
@@ -122,7 +135,7 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
     public IReadOnlyList<CulpeoStreamInfo> Streams => snapshot is null
         ? []
         : new ReadOnlyCollection<CulpeoStreamInfo>(snapshot.Streams.Values
-            .Select(stream => new CulpeoStreamInfo(stream.Id, stream.ContentType, stream.Type, stream.Purpose, stream.CurrentOffset))
+            .Select(stream => new CulpeoStreamInfo(stream.Id, stream.ContentType, stream.Type, stream.Purpose, stream.CurrentOffset, stream.OffsetType))
             .ToList());
 
     public ValueTask<CulpeoProcessResult> ReceiveAsync(CulpeoFrame frame, CancellationToken cancellationToken = default)
@@ -399,7 +412,7 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         ValidateStreamDeclarations(init.Streams, server.Options.MaxStreamCount);
         var sessionId = GenerateOpaqueId(server.Options.SessionIdByteLength);
         var streams = init.Streams
-            .Select(stream => new StreamState(GenerateOpaqueId(8), stream.ContentType, stream.Type, stream.Purpose, 0))
+            .Select(stream => new StreamState(GenerateOpaqueId(8), stream.ContentType, stream.Type, stream.Purpose, 0, stream.OffsetType))
             .ToDictionary(stream => stream.Id, StringComparer.Ordinal);
 
         return new SessionSnapshot(sessionId, bufferWindow, streams);
@@ -505,6 +518,7 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
 
     private static bool MatchesStream(StreamState stream, StreamDeclaration declaration)
         => stream.Type == declaration.Type
+           && stream.OffsetType == declaration.OffsetType
            && ContentTypeUtilities.ContentTypesMatch(stream.ContentType, declaration.ContentType)
            && string.Equals(stream.Purpose, declaration.Purpose, StringComparison.Ordinal);
 
@@ -522,6 +536,7 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
                     writer.WriteString("id", stream.Id);
                     writer.WriteString("content_type", stream.ContentType);
                     writer.WriteString("type", StreamTypeToString(stream.Type));
+                    writer.WriteString("offset_type", OffsetTypeToString(stream.OffsetType));
                     if (!string.IsNullOrWhiteSpace(stream.Purpose))
                     {
                         writer.WriteString("purpose", stream.Purpose);
@@ -639,6 +654,12 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
                 throw new ProtocolValidationException("invalid-streams", "Each stream must declare content_type and a valid type.");
             }
 
+            var offsetTypeValue = item.TryGetProperty("offset_type", out var offsetTypeProperty) ? offsetTypeProperty.GetString() : null;
+            if (string.IsNullOrWhiteSpace(offsetTypeValue) || !TryParseOffsetType(offsetTypeValue, out var offsetType))
+            {
+                throw new ProtocolValidationException("invalid-streams", "Each stream must declare a valid offset_type (one of: time, byte, message).");
+            }
+
             long? resumeOffset = null;
             if (item.TryGetProperty("resume_offset", out var resumeOffsetProperty))
             {
@@ -650,7 +671,8 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
                 streamType,
                 item.TryGetProperty("purpose", out var purposeProperty) ? purposeProperty.GetString() : null,
                 item.TryGetProperty("id", out var idProperty) ? idProperty.GetString() : null,
-                resumeOffset));
+                resumeOffset,
+                offsetType));
         }
 
         return new InitRequest(versionProperty.GetString()!, streams);
@@ -714,6 +736,33 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         CulpeoStreamType.Output => "output",
         CulpeoStreamType.Duplex => "duplex",
         _ => throw new ArgumentOutOfRangeException(nameof(type))
+    };
+
+    private static bool TryParseOffsetType(string value, out OffsetType offsetType)
+    {
+        switch (value)
+        {
+            case "time":
+                offsetType = OffsetType.Time;
+                return true;
+            case "byte":
+                offsetType = OffsetType.Byte;
+                return true;
+            case "message":
+                offsetType = OffsetType.Message;
+                return true;
+            default:
+                offsetType = default;
+                return false;
+        }
+    }
+
+    private static string OffsetTypeToString(OffsetType offsetType) => offsetType switch
+    {
+        OffsetType.Time => "time",
+        OffsetType.Byte => "byte",
+        OffsetType.Message => "message",
+        _ => throw new ArgumentOutOfRangeException(nameof(offsetType))
     };
 }
 
@@ -782,10 +831,10 @@ internal sealed class SessionSnapshot(string sessionId, int bufferWindowMs, Dict
     public DateTimeOffset? DisconnectedAt { get; set; }
 }
 
-internal sealed class StreamState(string id, string contentType, CulpeoStreamType type, string? purpose, long currentOffset)
+internal sealed class StreamState(string id, string contentType, CulpeoStreamType type, string? purpose, long currentOffset, OffsetType offsetType)
 {
     private readonly List<OffsetCheckpoint> checkpoints = [];
-    private readonly int? pcmStride = TryGetPcmStride(contentType, out var stride) ? stride : null;
+    private readonly int? pcmStride = offsetType == OffsetType.Time ? GetRequiredPcmStride(contentType) : null;
 
     public string Id { get; } = id;
 
@@ -794,6 +843,8 @@ internal sealed class StreamState(string id, string contentType, CulpeoStreamTyp
     public CulpeoStreamType Type { get; } = type;
 
     public string? Purpose { get; } = purpose;
+
+    public OffsetType OffsetType { get; } = offsetType;
 
     public long CurrentOffset { get; private set; } = currentOffset;
 
@@ -813,29 +864,27 @@ internal sealed class StreamState(string id, string contentType, CulpeoStreamTyp
 
     public void AdvanceOffset(int payloadLength)
     {
-        CurrentOffset += pcmStride.HasValue ? GetPcmIncrement(payloadLength, pcmStride.Value) : 1;
+        CurrentOffset += offsetType switch
+        {
+            OffsetType.Time => GetPcmIncrement(payloadLength, pcmStride!.Value),
+            OffsetType.Byte => payloadLength,
+            OffsetType.Message => 1,
+            _ => throw new ArgumentOutOfRangeException(nameof(offsetType), $"Unknown offset type: {offsetType}")
+        };
     }
 
-    private static bool TryGetPcmStride(string contentType, out int stride)
+    private static int GetRequiredPcmStride(string contentType)
     {
-        if (!contentType.StartsWith("audio/pcm", StringComparison.OrdinalIgnoreCase))
+        if (!ContentTypeUtilities.TryParseContentType(contentType, out var parsed)
+            || !string.Equals(parsed.MediaType, "audio/pcm", StringComparison.OrdinalIgnoreCase))
         {
-            stride = 0;
-            return false;
+            throw new ProtocolValidationException("protocol-error", "Offset type 'time' requires an audio/pcm content type with valid rate, channels, and bits parameters.");
         }
 
-        if (!ContentTypeUtilities.TryParseContentType(contentType, out var parsed) || !string.Equals(parsed.MediaType, "audio/pcm", StringComparison.OrdinalIgnoreCase))
-        {
-            throw new ProtocolValidationException("protocol-error", "PCM streams must declare valid rate, channels, and bits parameters.");
-        }
-
-        var rate = RequirePcmParam(parsed, "rate", v => v > 0);
         var channels = RequirePcmParam(parsed, "channels", v => v >= 1);
         var bits = RequirePcmParam(parsed, "bits", v => v > 0 && v % 8 == 0);
-
-        _ = rate; // validated for presence; not used in stride calculation
-        stride = checked(channels * (bits / 8));
-        return true;
+        _ = RequirePcmParam(parsed, "rate", v => v > 0); // validated for presence; not used in stride calculation
+        return checked(channels * (bits / 8));
     }
 
     private static int RequirePcmParam(ParsedContentType parsed, string name, Func<int, bool> predicate)
@@ -863,7 +912,7 @@ internal sealed class StreamState(string id, string contentType, CulpeoStreamTyp
 
 internal readonly record struct OffsetCheckpoint(long Offset, DateTimeOffset RecordedAt);
 
-internal sealed record StreamDeclaration(string ContentType, CulpeoStreamType Type, string? Purpose, string? IdHint, long? ResumeOffset);
+internal sealed record StreamDeclaration(string ContentType, CulpeoStreamType Type, string? Purpose, string? IdHint, long? ResumeOffset, OffsetType OffsetType);
 
 internal sealed record InitRequest(string Version, IReadOnlyList<StreamDeclaration> Streams)
 {

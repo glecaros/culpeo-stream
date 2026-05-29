@@ -1,11 +1,11 @@
-#include "culpeo/frame.hpp"
+#include "culpeo/message.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cstring>
 #include <limits>
 
-namespace culpeo::frame {
+namespace culpeo::message {
 namespace {
 
 constexpr std::array<std::string_view, 10> kReservedHeaderNames{
@@ -415,4 +415,4 @@ std::expected<std::vector<std::byte>, Error> serialize_frame(
     return output;
 }
 
-}  // namespace culpeo::frame
+}  // namespace culpeo::message

@@ -218,3 +218,28 @@ A synchronous throw would be simpler, but rejected Promises are more consistent 
 ### Spec Reference
 TypeScript agent security requirements — wss:// enforcement
 
+
+## Explicit `offset_type` Field Replacing Content-Type Inference
+**Date:** 2026-05-29
+**Phase:** Phase 1 (revision)
+**Status:** Decided
+
+### Context
+Prior to spec v0.3.0, offset increment behaviour was inferred from `content_type`: streams with `content_type` starting with `audio/pcm` used the PCM sample-count formula, and all other streams used a per-message counter of 1. This inference was implicit and fragile — it meant that encoding-agnostic or binary stream types had no way to express a byte-offset cursor, and PCM detection relied on content-type sniffing rather than explicit declaration.
+
+The spec now requires an explicit `offset_type` field on every stream declaration, taking one of three values:
+- `time` — PCM sample-count formula (previously inferred for `audio/pcm` content types)
+- `byte` — raw payload byte length per frame (new capability; useful for raw binary or chunked transfer)
+- `message` — 1 per delivered frame (previously the fallback for all non-PCM streams)
+
+### Decision
+Added `OffsetType = 'time' | 'byte' | 'message'` to `types.ts` and made `offset_type: OffsetType` a required field on `StreamDeclaration`. Changed `computeOffsetIncrement` signature from `(contentType, payloadLength)` to `(offsetType, payloadLength, contentType?)`, where `contentType` is only required for `offset_type: 'time'`. Removed the implicit content-type sniffing fallback entirely. `validateStreamDeclarations` now rejects missing or unrecognised `offset_type` values with `invalid-streams`. `offset_type` is propagated through the stream registry, snapshots, confirmed stream declarations, and session resumption matching (both logical-key construction and server-side stream matching include `offset_type`).
+
+### Tradeoffs
+- **Breaking change** to `StreamDeclaration`: all callers (tests, client code, external users) must now supply `offset_type`. This is intentional and required by the spec.
+- The `contentType` parameter on `computeOffsetIncrement` is now optional and only validated when `offset_type === 'time'`. This is slightly looser than requiring it unconditionally, but is correct — `byte` and `message` offsets have no dependency on content type.
+- Removing implicit PCM detection eliminates a whole class of silent misconfiguration: a stream with `content_type: 'audio/pcm...'` but `offset_type: 'message'` is now valid and intentional rather than impossible.
+- The `logicalKey` function in `streams.ts` includes `offset_type` so that a resumed session stream must match on all declared fields including offset semantics.
+
+### Spec Reference
+Section 5.5 (offset types), Section 5.6 (stream validation), Section 8.2 (offset increment formulas)

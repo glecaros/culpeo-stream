@@ -34,15 +34,29 @@ std::expected<void, Error>
 advance_offset(StreamInfo& stream, uint64_t frame_bytes) noexcept {
     uint64_t increment = 1;
 
-    if (stream.codec == StreamCodec::pcm) {
+    switch (stream.offset_type) {
+    case OffsetType::time:
+        // PCM: increment = samples per channel = frame_bytes / (channels * bytes_per_sample)
         if (!stream.pcm_params.has_value()) {
             return std::unexpected(Error::offset_overflow);  // Missing PCM metadata
         }
-        auto inc = compute_pcm_increment(frame_bytes, *stream.pcm_params);
-        if (!inc) return std::unexpected(inc.error());
-        increment = *inc;
+        {
+            auto inc = compute_pcm_increment(frame_bytes, *stream.pcm_params);
+            if (!inc) return std::unexpected(inc.error());
+            increment = *inc;
+        }
+        break;
+
+    case OffsetType::byte:
+        // increment = raw byte length of the media payload (spec §8.2)
+        increment = frame_bytes;
+        break;
+
+    case OffsetType::message:
+        // increment = 1 per delivered frame (spec §8.2)
+        increment = 1;
+        break;
     }
-    // For encoded streams (opus, aac, other): increment by 1 per frame (spec §8.2)
 
     // Overflow check on offset addition
     if (increment > std::numeric_limits<uint64_t>::max() - stream.offset) {

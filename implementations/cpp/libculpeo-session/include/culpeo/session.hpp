@@ -9,7 +9,7 @@
 // The session holds a single std::mutex that is acquired for the duration of each call,
 // released before any transport I/O. Callbacks are invoked WITHOUT the mutex held.
 
-#include "culpeo/frame.hpp"
+#include "culpeo/message.hpp"
 
 #include <array>
 #include <chrono>
@@ -50,6 +50,15 @@ enum class StreamCodec : uint8_t {
     other,
 };
 
+// Offset increment behaviour for a stream, declared explicitly in culpeo.init (spec §5.5).
+// REQUIRED: stream declarations without a recognised offset_type are rejected as
+// invalid-streams (spec §5.6 rule 4).
+enum class OffsetType : uint8_t {
+    time,     // Increment by sample count per channel (PCM formula). Requires audio/pcm.
+    byte,     // Increment by raw byte length of the media payload. New in spec §5.5.
+    message,  // Increment by 1 per delivered frame.
+};
+
 struct PcmParams {
     uint32_t rate{};      // Samples per second
     uint16_t channels{};  // Channel count (≥ 1)
@@ -64,6 +73,9 @@ struct StreamDeclaration {
     std::string hint_id;          // Client hint for resumption (ignored on fresh sessions)
     uint64_t resume_offset{0};
     bool has_resume_offset{false};
+    // offset_type is REQUIRED (spec §5.6 rule 4). std::nullopt means absent from the
+    // declaration JSON — validate_declarations will reject it as invalid_streams.
+    std::optional<OffsetType> offset_type;
 };
 
 // A confirmed stream — after culpeo.init-ack is sent
@@ -75,6 +87,7 @@ struct StreamInfo {
     uint64_t offset{0};       // Next expected offset (send or receive)
     StreamCodec codec{StreamCodec::other};
     std::optional<PcmParams> pcm_params;
+    OffsetType offset_type{OffsetType::message};  // Explicit offset increment behaviour
 };
 
 // ─── Session resumption ───────────────────────────────────────────────────────
@@ -207,11 +220,11 @@ public:
 
     // Feed a parsed control (text) frame. Thread-safe.
     [[nodiscard]] std::expected<void, Error>
-    process_control_frame(const culpeo::frame::ParsedHeadersView& frame) noexcept;
+    process_control_frame(const culpeo::message::ParsedHeadersView& frame) noexcept;
 
     // Feed a parsed media (binary) frame. Thread-safe.
     [[nodiscard]] std::expected<void, Error>
-    process_media_frame(const culpeo::frame::ParsedHeadersView& frame) noexcept;
+    process_media_frame(const culpeo::message::ParsedHeadersView& frame) noexcept;
 
     // ── Server-initiated sends ────────────────────────────────────────────────
 

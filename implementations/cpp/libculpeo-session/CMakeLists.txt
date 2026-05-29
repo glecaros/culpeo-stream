@@ -32,7 +32,7 @@ target_include_directories(culpeo_session
 )
 
 target_link_libraries(culpeo_session
-    PUBLIC  culpeo::frame
+    PUBLIC  culpeo::message
     PRIVATE nlohmann_json::nlohmann_json
 )
 
@@ -45,7 +45,7 @@ target_compile_options(culpeo_session
 
 # ─── Tests ────────────────────────────────────────────────────────────────────
 if(CULPEO_BUILD_TESTS)
-    # Catch2 is already fetched by libculpeo-frame; FetchContent_MakeAvailable is idempotent.
+    # Catch2 is already fetched by libculpeo-message; FetchContent_MakeAvailable is idempotent.
     FetchContent_Declare(
         Catch2
         GIT_REPOSITORY https://github.com/catchorg/Catch2.git
@@ -78,7 +78,7 @@ if(CULPEO_BUILD_TESTS)
         src/stream_registry.cpp
     )
     target_link_libraries(stream_registry_tests
-        PRIVATE culpeo::frame Catch2::Catch2WithMain
+        PRIVATE culpeo::message Catch2::Catch2WithMain
     )
     target_include_directories(stream_registry_tests
         PRIVATE
@@ -98,7 +98,7 @@ if(CULPEO_BUILD_TESTS)
         src/offset_tracker.cpp
     )
     target_link_libraries(offset_tracker_tests
-        PRIVATE culpeo::frame Catch2::Catch2WithMain
+        PRIVATE culpeo::message Catch2::Catch2WithMain
     )
     target_include_directories(offset_tracker_tests
         PRIVATE

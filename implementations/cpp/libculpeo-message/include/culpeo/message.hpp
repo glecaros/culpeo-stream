@@ -9,7 +9,7 @@
 #include <variant>
 #include <vector>
 
-namespace culpeo::frame {
+namespace culpeo::message {
 
 enum class FrameType {
     control,
@@ -142,4 +142,4 @@ parse_content_type(std::string_view value) noexcept;
     std::span<const HeaderFieldView> headers,
     std::span<const std::byte> body) noexcept;
 
-}  // namespace culpeo::frame
+}  // namespace culpeo::message
