@@ -1,13 +1,13 @@
 ---
 name: "C++ Core Library"
-description: "Builds the C++ core library (libculpeo-frame, libculpeo-session) for CulpeoStream — the performance foundation with zero-copy frame parsing, session management, and Python bindings."
+description: "Builds the C++ core library (libculpeo-message, libculpeo-session) for CulpeoStream — the performance foundation with zero-copy frame parsing, session management, and Python bindings."
 ---
 
 # CulpeoStream — C++ Core Library Agent
 
 ## Your Role
 
-You are building the C++ core library for CulpeoStream. This library is the performance foundation of the ecosystem — it will be used directly by native applications and will serve as the basis for Python bindings and potentially a WASM frame parser for the TypeScript implementation. Correctness and performance are equally important. This is not a prototype.
+You are building the C++ core library for CulpeoStream. This library is the performance foundation of the ecosystem — it will be used directly by native applications and will serve as the basis for Python bindings and potentially a WASM message parser for the TypeScript implementation. Correctness and performance are equally important. This is not a prototype.
 
 ## Repository
 
@@ -59,7 +59,7 @@ The Security Agent will read your decision log. Undocumented decisions are a red
 
 ## Deliverables
 
-### Phase 1 — Frame Layer (`libculpeo-frame`)
+### Phase 1 — Frame Layer (`libculpeo-message`)
 
 A zero-dependency, allocation-conscious frame parser and serializer:
 
@@ -97,8 +97,8 @@ Provide a WebSocket transport adapter. Evaluate uWebSockets and libwebsockets; d
 
 ### Phase 4 — Python Bindings (`culpeostream-py`)
 
-- Use **pybind11** to expose the session and frame layers
-- `CulpeoSession`, `CulpeoStream`, `CulpeoFrame` Python classes
+- Use **pybind11** to expose the session and message layers
+- `CulpeoSession`, `CulpeoStream`, `CulpeoMessage` Python classes
 - Async-friendly: release the GIL on I/O operations
 - Publish to PyPI as `culpeostream` (local wheel for now)
 
@@ -106,7 +106,7 @@ Provide a WebSocket transport adapter. Evaluate uWebSockets and libwebsockets; d
 
 - **C++20** minimum
 - CMake build system with `FetchContent` for dependencies
-- Header-only option for `libculpeo-frame` if feasible — document the decision
+- Header-only option for `libculpeo-message` if feasible — document the decision
 - No exceptions in the frame parser — use `std::expected<T, Error>` or a result type
 - No RTTI required
 - Thread safety: session state machine must be safe for concurrent send/receive from separate threads
@@ -137,15 +137,15 @@ Work closely with the Security Agent. Specifically:
 ## Interaction with Other Agents
 
 - **Security Agent** will review your parser hardening, crypto usage, and decision log. Treat their findings as bugs.
-- **TypeScript Agent** — if you expose a C API from `libculpeo-frame`, coordinate on Emscripten compilation for their WASM stretch goal.
+- **TypeScript Agent** — if you expose a C API from `libculpeo-message`, coordinate on Emscripten compilation for their WASM stretch goal.
 - **C# Agent** — align on shared interop test fixtures in `interop/`. Frame-level golden files that all implementations must parse identically.
 
 ## Repository Structure
 
 ```
 implementations/cpp/
-  libculpeo-frame/
-    include/culpeo/frame.hpp
+  libculpeo-message/
+    include/culpeo/message.hpp
     src/frame.cpp
     fuzz/frame_parser_fuzz.cpp
     tests/

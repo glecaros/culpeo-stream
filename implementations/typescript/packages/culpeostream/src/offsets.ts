@@ -1,4 +1,5 @@
 import { CulpeoError } from "./errors.js";
+import type { OffsetType } from "./types.js";
 
 interface OffsetState {
   nextSendOffset: number;
@@ -48,22 +49,32 @@ function parsePcmStepBytes(contentType: string): number | undefined {
 }
 
 export function computeOffsetIncrement(
-  contentType: string,
+  offsetType: OffsetType,
   payloadLength: number,
+  contentType?: string,
 ): number {
-  const pcmStepBytes = parsePcmStepBytes(contentType);
-  if (pcmStepBytes === undefined) {
-    return 1;
+  switch (offsetType) {
+    case "byte":
+      return payloadLength;
+    case "message":
+      return 1;
+    case "time": {
+      const pcmStepBytes = parsePcmStepBytes(contentType ?? "");
+      if (pcmStepBytes === undefined) {
+        throw new CulpeoError(
+          "protocol-error",
+          "offset_type 'time' requires a PCM content type with rate, channels, and bits parameters.",
+        );
+      }
+      if (pcmStepBytes <= 0 || payloadLength % pcmStepBytes !== 0) {
+        throw new CulpeoError(
+          "protocol-error",
+          "PCM payload length must align to complete samples.",
+        );
+      }
+      return payloadLength / pcmStepBytes;
+    }
   }
-
-  if (pcmStepBytes <= 0 || payloadLength % pcmStepBytes !== 0) {
-    throw new CulpeoError(
-      "protocol-error",
-      "PCM payload length must align to complete samples.",
-    );
-  }
-
-  return payloadLength / pcmStepBytes;
 }
 
 export class OffsetTracker {
@@ -80,13 +91,14 @@ export class OffsetTracker {
 
   public allocate(
     streamId: string,
-    contentType: string,
+    offsetType: OffsetType,
     payloadLength: number,
+    contentType?: string,
   ): number {
     const state = this.mustGet(streamId);
     const offset = state.nextSendOffset;
     state.lastSentOffset = offset;
-    state.nextSendOffset += computeOffsetIncrement(contentType, payloadLength);
+    state.nextSendOffset += computeOffsetIncrement(offsetType, payloadLength, contentType);
     return offset;
   }
 

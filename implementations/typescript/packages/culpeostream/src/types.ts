@@ -12,9 +12,10 @@ export type SessionState =
   | "established"
   | "closed";
 export type StreamDirection = "input" | "output" | "duplex";
+export type OffsetType = "time" | "byte" | "message";
 export type ControlFrameType = "text";
 export type MediaFrameType = "binary";
-export type TransportFrameType = ControlFrameType | MediaFrameType;
+export type TransportMessageType = ControlFrameType | MediaFrameType;
 export type ProtocolVersion = "0.3" | (string & {});
 
 export type InitErrorCode =
@@ -47,6 +48,7 @@ export type KnownProtocolEvent =
 export interface StreamDeclaration {
   content_type: string;
   type: StreamDirection;
+  offset_type: OffsetType;
   purpose?: string;
 }
 
@@ -212,20 +214,20 @@ export interface CloseFrame {
   body: EmptyBody;
 }
 
-export interface ApplicationEventFrame {
+export interface ApplicationEventMessage {
   kind: "control";
   event: string;
   headers: ApplicationEventHeaders;
   body: JsonObject;
 }
 
-export interface MediaFrame {
+export interface MediaMessage {
   kind: "media";
   headers: MediaHeaders;
   body: Uint8Array;
 }
 
-export type ControlFrame =
+export type ControlMessage =
   | InitFrame
   | InitAckFrame
   | InitErrorFrame
@@ -234,9 +236,9 @@ export type ControlFrame =
   | AuthRefreshFrame
   | AuthResponseFrame
   | CloseFrame
-  | ApplicationEventFrame;
+  | ApplicationEventMessage;
 
-export type CulpeoFrame = ControlFrame | MediaFrame;
+export type CulpeoMessage = ControlMessage | MediaMessage;
 
 export interface SerializedTextFrame {
   frameType: "text";
@@ -267,16 +269,16 @@ export interface RttMeasurement {
 export type SessionNotification =
   | { type: "init-ack"; frame: InitAckFrame }
   | { type: "init-error"; frame: InitErrorFrame }
-  | { type: "media"; frame: MediaFrame }
-  | { type: "application-event"; frame: ApplicationEventFrame }
+  | { type: "media"; frame: MediaMessage }
+  | { type: "application-event"; frame: ApplicationEventMessage }
   | { type: "close"; frame: CloseFrame };
 
-export type SendFrame = (frame: CulpeoFrame) => void | Promise<void>;
+export type SendMessage = (frame: CulpeoMessage) => void | Promise<void>;
 
 export interface ClientSessionOptions {
   streams: ResumeStreamDeclaration[];
   version?: ProtocolVersion;
-  sendFrame?: SendFrame;
+  sendFrame?: SendMessage;
   nowMicros?: () => number;
   onRtt?: (measurement: RttMeasurement) => void;
   onNotification?: (notification: SessionNotification) => void;
@@ -285,7 +287,7 @@ export interface ClientSessionOptions {
 
 export interface ServerSessionOptions {
   supportedVersions?: ProtocolVersion[];
-  sendFrame?: SendFrame;
+  sendFrame?: SendMessage;
   nowMicros?: () => number;
   onRtt?: (measurement: RttMeasurement) => void;
   onNotification?: (notification: SessionNotification) => void;

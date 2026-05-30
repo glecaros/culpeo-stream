@@ -1,6 +1,6 @@
 export * from "./errors.js";
-export { defaultParseLimits, parseFrame, serializeFrame } from "./frame.js";
-export type { ParseLimits } from "./frame.js";
+export { defaultParseLimits, parseFrame, serializeFrame } from "./message.js";
+export type { ParseLimits } from "./message.js";
 export * from "./offsets.js";
 export * from "./random.js";
 export * from "./session.js";

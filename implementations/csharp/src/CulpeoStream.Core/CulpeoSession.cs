@@ -20,14 +20,24 @@ public sealed class CulpeoSessionOptions
 
     public int SessionIdByteLength { get; init; } = 16;
 
-    public int NonceByteLength { get; init; } = 16;
+    /// <summary>
+    /// Byte length of auth-refresh nonces. Default is 32 (256 bits).
+    /// Must be at least 16 (128 bits).
+    /// </summary>
+    public int NonceByteLength { get; init; } = 32;
+
+    /// <summary>
+    /// Minimum seconds between successive auth-refresh challenges on a single
+    /// session. Default is 30 s.
+    /// </summary>
+    public int MinAuthRefreshIntervalSeconds { get; init; } = 30;
 }
 
 public sealed class CulpeoProcessResult
 {
     public static CulpeoProcessResult Empty(CulpeoSessionState state) => new([], false, null, state);
 
-    public CulpeoProcessResult(IReadOnlyList<CulpeoFrame> outboundFrames, bool shouldClose, string? closeCode, CulpeoSessionState state)
+    public CulpeoProcessResult(IReadOnlyList<CulpeoMessage> outboundFrames, bool shouldClose, string? closeCode, CulpeoSessionState state)
     {
         OutboundFrames = outboundFrames;
         ShouldClose = shouldClose;
@@ -35,7 +45,7 @@ public sealed class CulpeoProcessResult
         State = state;
     }
 
-    public IReadOnlyList<CulpeoFrame> OutboundFrames { get; }
+    public IReadOnlyList<CulpeoMessage> OutboundFrames { get; }
 
     public bool ShouldClose { get; }
 
@@ -44,7 +54,18 @@ public sealed class CulpeoProcessResult
     public CulpeoSessionState State { get; }
 }
 
-public sealed class CulpeoStreamInfo(string id, string contentType, CulpeoStreamType type, string? purpose, long currentOffset)
+/// <summary>Declares how the <c>Offset</c> value on media frames advances for a stream.</summary>
+public enum OffsetType
+{
+    /// <summary>Offset increments by sample count per channel (PCM formula). Requires <c>audio/pcm</c> content type.</summary>
+    Time,
+    /// <summary>Offset increments by the raw byte length of the media payload.</summary>
+    Byte,
+    /// <summary>Offset increments by 1 per delivered media frame.</summary>
+    Message,
+}
+
+public sealed class CulpeoStreamInfo(string id, string contentType, CulpeoStreamType type, string? purpose, long currentOffset, OffsetType offsetType)
 {
     public string Id { get; } = id;
 
@@ -55,6 +76,8 @@ public sealed class CulpeoStreamInfo(string id, string contentType, CulpeoStream
     public string? Purpose { get; } = purpose;
 
     public long CurrentOffset { get; } = currentOffset;
+
+    public OffsetType OffsetType { get; } = offsetType;
 }
 
 public sealed class CulpeoSessionServer(CulpeoSessionOptions? options = null)
@@ -109,23 +132,30 @@ public sealed class CulpeoSessionServer(CulpeoSessionOptions? options = null)
 
 public sealed class CulpeoConnection(CulpeoSessionServer server)
 {
-    private readonly HashSet<string> issuedNonces = new(StringComparer.Ordinal);
     private readonly Queue<DateTimeOffset> pingTimestamps = new();
     private SessionSnapshot? snapshot;
     private string? pendingNonce;
     private DateTimeOffset? authChallengeIssuedAt;
+    private DateTimeOffset? lastAuthRefreshIssuedAt;
 
     public CulpeoSessionState State { get; private set; } = CulpeoSessionState.Uninitialized;
 
     public string? SessionId => snapshot?.SessionId;
 
+    /// <summary>
+    /// The UTC time at which this session was first established. Preserved across
+    /// resumptions so timestamps remain continuous. <see langword="null"/> before
+    /// the session is established.
+    /// </summary>
+    public DateTimeOffset? SessionStartedAt => snapshot?.SessionStartedAt;
+
     public IReadOnlyList<CulpeoStreamInfo> Streams => snapshot is null
         ? []
         : new ReadOnlyCollection<CulpeoStreamInfo>(snapshot.Streams.Values
-            .Select(stream => new CulpeoStreamInfo(stream.Id, stream.ContentType, stream.Type, stream.Purpose, stream.CurrentOffset))
+            .Select(stream => new CulpeoStreamInfo(stream.Id, stream.ContentType, stream.Type, stream.Purpose, stream.CurrentOffset, stream.OffsetType))
             .ToList());
 
-    public ValueTask<CulpeoProcessResult> ReceiveAsync(CulpeoFrame frame, CancellationToken cancellationToken = default)
+    public ValueTask<CulpeoProcessResult> ReceiveAsync(CulpeoMessage frame, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
@@ -144,7 +174,7 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         };
     }
 
-    public ValueTask<CulpeoFrame> SendMediaAsync(string streamId, ReadOnlyMemory<byte> payload, long timestamp, CancellationToken cancellationToken = default)
+    public ValueTask<CulpeoMessage> SendMediaAsync(string streamId, ReadOnlyMemory<byte> payload, long timestamp, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         EnsureEstablished();
@@ -159,8 +189,8 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         stream.RecordFrame(offset, server.Options.TimeProvider.GetUtcNow());
         stream.AdvanceOffset(payload.Length);
 
-        return ValueTask.FromResult(new CulpeoFrame(
-            CulpeoFrameKind.Media,
+        return ValueTask.FromResult(new CulpeoMessage(
+            CulpeoMessageKind.Media,
             payload,
             contentType: stream.ContentType,
             streamId: stream.Id,
@@ -168,18 +198,30 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
             timestamp: timestamp));
     }
 
-    public ValueTask<CulpeoFrame> IssueAuthRefreshAsync(CancellationToken cancellationToken = default)
+    public ValueTask<CulpeoMessage> IssueAuthRefreshAsync(CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         EnsureEstablished();
 
-        var nonce = GenerateOpaqueId(server.Options.NonceByteLength);
-        issuedNonces.Add(nonce);
-        pendingNonce = nonce;
-        authChallengeIssuedAt = server.Options.TimeProvider.GetUtcNow();
+        if (pendingNonce is not null)
+        {
+            throw new InvalidOperationException("Auth refresh already pending.");
+        }
 
-        return ValueTask.FromResult(new CulpeoFrame(
-            CulpeoFrameKind.Control,
+        var now = server.Options.TimeProvider.GetUtcNow();
+        if (lastAuthRefreshIssuedAt is not null
+            && (now - lastAuthRefreshIssuedAt.Value).TotalSeconds < server.Options.MinAuthRefreshIntervalSeconds)
+        {
+            throw new InvalidOperationException("Auth refresh issued too recently.");
+        }
+
+        var nonce = GenerateOpaqueId(server.Options.NonceByteLength);
+        pendingNonce = nonce;
+        authChallengeIssuedAt = now;
+        lastAuthRefreshIssuedAt = now;
+
+        return ValueTask.FromResult(new CulpeoMessage(
+            CulpeoMessageKind.Control,
             SerializeJsonBody(writer => writer.WriteString("nonce", nonce)),
             @event: "culpeo.auth-refresh",
             contentType: "application/json"));
@@ -204,9 +246,9 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         return ValueTask.CompletedTask;
     }
 
-    private CulpeoProcessResult HandleInitialFrame(CulpeoFrame frame)
+    private CulpeoProcessResult HandleInitialFrame(CulpeoMessage frame)
     {
-        if (frame.Kind != CulpeoFrameKind.Control || !string.Equals(frame.Event, "culpeo.init", StringComparison.Ordinal))
+        if (frame.Kind != CulpeoMessageKind.Control || !string.Equals(frame.Event, "culpeo.init", StringComparison.Ordinal))
         {
             return CloseWithCloseFrame("protocol-error", "The first frame must be culpeo.init.");
         }
@@ -254,9 +296,9 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         }
     }
 
-    private CulpeoProcessResult HandleEstablishedFrame(CulpeoFrame frame)
+    private CulpeoProcessResult HandleEstablishedFrame(CulpeoMessage frame)
     {
-        if (frame.Kind == CulpeoFrameKind.Media)
+        if (frame.Kind == CulpeoMessageKind.Media)
         {
             return HandleIncomingMedia(frame);
         }
@@ -282,7 +324,7 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         }
     }
 
-    private CulpeoProcessResult HandlePing(CulpeoFrame frame)
+    private CulpeoProcessResult HandlePing(CulpeoMessage frame)
     {
         using var document = JsonDocument.Parse(frame.Body.IsEmpty ? "{}"u8.ToArray() : frame.Body.ToArray());
         if (!document.RootElement.TryGetProperty("ts", out var tsProperty) || !tsProperty.TryGetInt64(out var ts))
@@ -297,8 +339,8 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         }
 
         var serverTs = now.ToUnixTimeMilliseconds() * 1000;
-        var pong = new CulpeoFrame(
-            CulpeoFrameKind.Control,
+        var pong = new CulpeoMessage(
+            CulpeoMessageKind.Control,
             SerializeJsonBody(writer =>
             {
                 writer.WriteNumber("ts", ts);
@@ -310,7 +352,7 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         return new CulpeoProcessResult([pong], false, null, State);
     }
 
-    private CulpeoProcessResult HandleAuthResponse(CulpeoFrame frame)
+    private CulpeoProcessResult HandleAuthResponse(CulpeoMessage frame)
     {
         if (string.IsNullOrWhiteSpace(frame.Authorization))
         {
@@ -324,7 +366,17 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         }
 
         var nonce = nonceProperty.GetString();
-        if (string.IsNullOrWhiteSpace(nonce) || pendingNonce is null || !issuedNonces.Remove(nonce) || !string.Equals(nonce, pendingNonce, StringComparison.Ordinal))
+        if (string.IsNullOrWhiteSpace(nonce) || pendingNonce is null)
+        {
+            throw new ProtocolValidationException("unauthorized", "Invalid auth refresh nonce.");
+        }
+
+        // Constant-time comparison to prevent timing oracle attacks (SEC-011).
+        bool equal = CryptographicOperations.FixedTimeEquals(
+            System.Text.Encoding.ASCII.GetBytes(nonce),
+            System.Text.Encoding.ASCII.GetBytes(pendingNonce));
+
+        if (!equal)
         {
             throw new ProtocolValidationException("unauthorized", "Invalid auth refresh nonce.");
         }
@@ -334,7 +386,7 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         return CulpeoProcessResult.Empty(State);
     }
 
-    private CulpeoProcessResult HandleClose(CulpeoFrame frame)
+    private CulpeoProcessResult HandleClose(CulpeoMessage frame)
     {
         State = CulpeoSessionState.Closed;
         if (snapshot is not null)
@@ -343,8 +395,8 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
             server.SaveSession(snapshot);
         }
 
-        var close = new CulpeoFrame(
-            CulpeoFrameKind.Control,
+        var close = new CulpeoMessage(
+            CulpeoMessageKind.Control,
             SerializeJsonBody(_ => { }),
             @event: "culpeo.close",
             contentType: "application/json",
@@ -354,7 +406,7 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         return new CulpeoProcessResult([close], true, frame.Code ?? "normal-closure", State);
     }
 
-    private CulpeoProcessResult HandleIncomingMedia(CulpeoFrame frame)
+    private CulpeoProcessResult HandleIncomingMedia(CulpeoMessage frame)
     {
         try
         {
@@ -399,10 +451,10 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         ValidateStreamDeclarations(init.Streams, server.Options.MaxStreamCount);
         var sessionId = GenerateOpaqueId(server.Options.SessionIdByteLength);
         var streams = init.Streams
-            .Select(stream => new StreamState(GenerateOpaqueId(8), stream.ContentType, stream.Type, stream.Purpose, 0))
+            .Select(stream => new StreamState(GenerateOpaqueId(8), stream.ContentType, stream.Type, stream.Purpose, 0, stream.OffsetType))
             .ToDictionary(stream => stream.Id, StringComparer.Ordinal);
 
-        return new SessionSnapshot(sessionId, bufferWindow, streams);
+        return new SessionSnapshot(sessionId, bufferWindow, streams, server.Options.TimeProvider.GetUtcNow());
     }
 
     private SessionSnapshot ResumeSession(string sessionId, InitRequest init, int bufferWindow)
@@ -505,13 +557,14 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
 
     private static bool MatchesStream(StreamState stream, StreamDeclaration declaration)
         => stream.Type == declaration.Type
+           && stream.OffsetType == declaration.OffsetType
            && ContentTypeUtilities.ContentTypesMatch(stream.ContentType, declaration.ContentType)
            && string.Equals(stream.Purpose, declaration.Purpose, StringComparison.Ordinal);
 
-    private CulpeoFrame CreateInitAckFrame(SessionSnapshot currentSnapshot, string version, int bufferWindow, bool resumption)
+    private CulpeoMessage CreateInitAckFrame(SessionSnapshot currentSnapshot, string version, int bufferWindow, bool resumption)
     {
-        return new CulpeoFrame(
-            CulpeoFrameKind.Control,
+        return new CulpeoMessage(
+            CulpeoMessageKind.Control,
             SerializeJsonBody(writer =>
             {
                 writer.WriteString("version", version);
@@ -522,6 +575,7 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
                     writer.WriteString("id", stream.Id);
                     writer.WriteString("content_type", stream.ContentType);
                     writer.WriteString("type", StreamTypeToString(stream.Type));
+                    writer.WriteString("offset_type", OffsetTypeToString(stream.OffsetType));
                     if (!string.IsNullOrWhiteSpace(stream.Purpose))
                     {
                         writer.WriteString("purpose", stream.Purpose);
@@ -559,8 +613,8 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         State = CulpeoSessionState.Closed;
         return new CulpeoProcessResult(
             [
-                new CulpeoFrame(
-                    CulpeoFrameKind.Control,
+                new CulpeoMessage(
+                    CulpeoMessageKind.Control,
                     SerializeJsonBody(_ => { }),
                     @event: "culpeo.close",
                     contentType: "application/json",
@@ -577,8 +631,8 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         State = CulpeoSessionState.Closed;
         return new CulpeoProcessResult(
             [
-                new CulpeoFrame(
-                    CulpeoFrameKind.Control,
+                new CulpeoMessage(
+                    CulpeoMessageKind.Control,
                     body ?? SerializeJsonBody(_ => { }),
                     @event: "culpeo.init-error",
                     contentType: "application/json",
@@ -601,8 +655,8 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
 
         return new CulpeoProcessResult(
             [
-                new CulpeoFrame(
-                    CulpeoFrameKind.Control,
+                new CulpeoMessage(
+                    CulpeoMessageKind.Control,
                     SerializeJsonBody(_ => { }),
                     @event: "culpeo.close",
                     contentType: "application/json",
@@ -639,6 +693,12 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
                 throw new ProtocolValidationException("invalid-streams", "Each stream must declare content_type and a valid type.");
             }
 
+            var offsetTypeValue = item.TryGetProperty("offset_type", out var offsetTypeProperty) ? offsetTypeProperty.GetString() : null;
+            if (string.IsNullOrWhiteSpace(offsetTypeValue) || !TryParseOffsetType(offsetTypeValue, out var offsetType))
+            {
+                throw new ProtocolValidationException("invalid-streams", "Each stream must declare a valid offset_type (one of: time, byte, message).");
+            }
+
             long? resumeOffset = null;
             if (item.TryGetProperty("resume_offset", out var resumeOffsetProperty))
             {
@@ -650,7 +710,8 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
                 streamType,
                 item.TryGetProperty("purpose", out var purposeProperty) ? purposeProperty.GetString() : null,
                 item.TryGetProperty("id", out var idProperty) ? idProperty.GetString() : null,
-                resumeOffset));
+                resumeOffset,
+                offsetType));
         }
 
         return new InitRequest(versionProperty.GetString()!, streams);
@@ -715,6 +776,33 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         CulpeoStreamType.Duplex => "duplex",
         _ => throw new ArgumentOutOfRangeException(nameof(type))
     };
+
+    private static bool TryParseOffsetType(string value, out OffsetType offsetType)
+    {
+        switch (value)
+        {
+            case "time":
+                offsetType = OffsetType.Time;
+                return true;
+            case "byte":
+                offsetType = OffsetType.Byte;
+                return true;
+            case "message":
+                offsetType = OffsetType.Message;
+                return true;
+            default:
+                offsetType = default;
+                return false;
+        }
+    }
+
+    private static string OffsetTypeToString(OffsetType offsetType) => offsetType switch
+    {
+        OffsetType.Time => "time",
+        OffsetType.Byte => "byte",
+        OffsetType.Message => "message",
+        _ => throw new ArgumentOutOfRangeException(nameof(offsetType))
+    };
 }
 
 internal readonly record struct ParsedContentType(string MediaType, IReadOnlyDictionary<string, string> Parameters);
@@ -771,7 +859,7 @@ internal static class ContentTypeUtilities
     }
 }
 
-internal sealed class SessionSnapshot(string sessionId, int bufferWindowMs, Dictionary<string, StreamState> streams)
+internal sealed class SessionSnapshot(string sessionId, int bufferWindowMs, Dictionary<string, StreamState> streams, DateTimeOffset sessionStartedAt)
 {
     public string SessionId { get; } = sessionId;
 
@@ -780,12 +868,19 @@ internal sealed class SessionSnapshot(string sessionId, int bufferWindowMs, Dict
     public Dictionary<string, StreamState> Streams { get; } = streams;
 
     public DateTimeOffset? DisconnectedAt { get; set; }
+
+    /// <summary>
+    /// UTC time at which the session was originally established.
+    /// Preserved across resumptions so session-relative timestamps remain
+    /// continuous.
+    /// </summary>
+    public DateTimeOffset SessionStartedAt { get; } = sessionStartedAt;
 }
 
-internal sealed class StreamState(string id, string contentType, CulpeoStreamType type, string? purpose, long currentOffset)
+internal sealed class StreamState(string id, string contentType, CulpeoStreamType type, string? purpose, long currentOffset, OffsetType offsetType)
 {
     private readonly List<OffsetCheckpoint> checkpoints = [];
-    private readonly int? pcmStride = TryGetPcmStride(contentType, out var stride) ? stride : null;
+    private readonly int? pcmStride = offsetType == OffsetType.Time ? GetRequiredPcmStride(contentType) : null;
 
     public string Id { get; } = id;
 
@@ -794,6 +889,8 @@ internal sealed class StreamState(string id, string contentType, CulpeoStreamTyp
     public CulpeoStreamType Type { get; } = type;
 
     public string? Purpose { get; } = purpose;
+
+    public OffsetType OffsetType { get; } = offsetType;
 
     public long CurrentOffset { get; private set; } = currentOffset;
 
@@ -813,29 +910,27 @@ internal sealed class StreamState(string id, string contentType, CulpeoStreamTyp
 
     public void AdvanceOffset(int payloadLength)
     {
-        CurrentOffset += pcmStride.HasValue ? GetPcmIncrement(payloadLength, pcmStride.Value) : 1;
+        CurrentOffset += offsetType switch
+        {
+            OffsetType.Time => GetPcmIncrement(payloadLength, pcmStride!.Value),
+            OffsetType.Byte => payloadLength,
+            OffsetType.Message => 1,
+            _ => throw new ArgumentOutOfRangeException(nameof(offsetType), $"Unknown offset type: {offsetType}")
+        };
     }
 
-    private static bool TryGetPcmStride(string contentType, out int stride)
+    private static int GetRequiredPcmStride(string contentType)
     {
-        if (!contentType.StartsWith("audio/pcm", StringComparison.OrdinalIgnoreCase))
+        if (!ContentTypeUtilities.TryParseContentType(contentType, out var parsed)
+            || !string.Equals(parsed.MediaType, "audio/pcm", StringComparison.OrdinalIgnoreCase))
         {
-            stride = 0;
-            return false;
+            throw new ProtocolValidationException("protocol-error", "Offset type 'time' requires an audio/pcm content type with valid rate, channels, and bits parameters.");
         }
 
-        if (!ContentTypeUtilities.TryParseContentType(contentType, out var parsed) || !string.Equals(parsed.MediaType, "audio/pcm", StringComparison.OrdinalIgnoreCase))
-        {
-            throw new ProtocolValidationException("protocol-error", "PCM streams must declare valid rate, channels, and bits parameters.");
-        }
-
-        var rate = RequirePcmParam(parsed, "rate", v => v > 0);
         var channels = RequirePcmParam(parsed, "channels", v => v >= 1);
         var bits = RequirePcmParam(parsed, "bits", v => v > 0 && v % 8 == 0);
-
-        _ = rate; // validated for presence; not used in stride calculation
-        stride = checked(channels * (bits / 8));
-        return true;
+        _ = RequirePcmParam(parsed, "rate", v => v > 0); // validated for presence; not used in stride calculation
+        return checked(channels * (bits / 8));
     }
 
     private static int RequirePcmParam(ParsedContentType parsed, string name, Func<int, bool> predicate)
@@ -863,7 +958,7 @@ internal sealed class StreamState(string id, string contentType, CulpeoStreamTyp
 
 internal readonly record struct OffsetCheckpoint(long Offset, DateTimeOffset RecordedAt);
 
-internal sealed record StreamDeclaration(string ContentType, CulpeoStreamType Type, string? Purpose, string? IdHint, long? ResumeOffset);
+internal sealed record StreamDeclaration(string ContentType, CulpeoStreamType Type, string? Purpose, string? IdHint, long? ResumeOffset, OffsetType OffsetType);
 
 internal sealed record InitRequest(string Version, IReadOnlyList<StreamDeclaration> Streams)
 {
@@ -877,4 +972,14 @@ internal sealed class ProtocolValidationException(string code, string reason, Re
     public string Reason { get; } = reason;
 
     public ReadOnlyMemory<byte>? Body { get; } = body;
+}
+
+/// <summary>
+/// Thrown when a CulpeoStream protocol constraint is violated in a way that
+/// requires closing the connection (e.g., maximum message size exceeded).
+/// </summary>
+public sealed class CulpeoProtocolException(string code, string reason) : Exception(reason)
+{
+    /// <summary>CulpeoStream close/error code, e.g. <c>"protocol-error"</c>.</summary>
+    public string Code { get; } = code;
 }

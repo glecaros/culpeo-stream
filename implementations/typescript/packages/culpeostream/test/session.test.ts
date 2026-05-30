@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import { CulpeoClientSession, CulpeoServerSession } from "../src/session.js";
-import type { CulpeoFrame } from "../src/types.js";
+import type { CulpeoMessage } from "../src/types.js";
 
 async function establishServer(
   server: CulpeoServerSession,
-  outbound: CulpeoFrame[],
+  outbound: CulpeoMessage[],
 ): Promise<void> {
   await server.receive({
     kind: "control",
@@ -18,7 +18,7 @@ async function establishServer(
     },
     body: {
       version: "0.3",
-      streams: [{ content_type: "audio/opus", type: "output" }],
+      streams: [{ content_type: "audio/opus", type: "output", offset_type: "message" }],
     },
   });
   expect(outbound[0]).toMatchObject({ event: "culpeo.init-ack" });
@@ -26,7 +26,7 @@ async function establishServer(
 
 describe("session state machine", () => {
   it("rejects frames before init on the server", async () => {
-    const outbound: CulpeoFrame[] = [];
+    const outbound: CulpeoMessage[] = [];
     const server = new CulpeoServerSession({
       sendFrame: (frame) => {
         outbound.push(frame);
@@ -47,17 +47,18 @@ describe("session state machine", () => {
   });
 
   it("establishes a client/server session and snapshots offsets for resumption", async () => {
-    const clientOutbound: CulpeoFrame[] = [];
-    const serverOutbound: CulpeoFrame[] = [];
+    const clientOutbound: CulpeoMessage[] = [];
+    const serverOutbound: CulpeoMessage[] = [];
 
     const client = new CulpeoClientSession({
       streams: [
         {
           content_type: "audio/pcm;rate=16000;channels=1;bits=16",
           type: "input",
+          offset_type: "time",
           purpose: "voice",
         },
-        { content_type: "audio/opus", type: "output", purpose: "assistant" },
+        { content_type: "audio/opus", type: "output", offset_type: "message", purpose: "assistant" },
       ],
       sendFrame: (frame) => {
         clientOutbound.push(frame);
@@ -96,6 +97,7 @@ describe("session state machine", () => {
         id: "stream-1",
         content_type: "audio/pcm;rate=16000;channels=1;bits=16",
         type: "input",
+        offset_type: "time",
         purpose: "voice",
         resume_offset: 0,
       },
@@ -103,21 +105,23 @@ describe("session state machine", () => {
         id: "stream-2",
         content_type: "audio/opus",
         type: "output",
+        offset_type: "message",
         purpose: "assistant",
         resume_offset: 0,
       },
     ]);
 
-    const resumeClientOutbound: CulpeoFrame[] = [];
-    const resumeServerOutbound: CulpeoFrame[] = [];
+    const resumeClientOutbound: CulpeoMessage[] = [];
+    const resumeServerOutbound: CulpeoMessage[] = [];
     const resumeClient = new CulpeoClientSession({
       streams: [
         {
           content_type: "audio/pcm;rate=16000;channels=1;bits=16",
           type: "input",
+          offset_type: "time",
           purpose: "voice",
         },
-        { content_type: "audio/opus", type: "output", purpose: "assistant" },
+        { content_type: "audio/opus", type: "output", offset_type: "message", purpose: "assistant" },
       ],
       sendFrame: (frame) => {
         resumeClientOutbound.push(frame);
@@ -166,15 +170,15 @@ describe("session state machine", () => {
   });
 
   it("surfaces unsupported versions from init-error", async () => {
-    const outbound: CulpeoFrame[] = [];
+    const outbound: CulpeoMessage[] = [];
     const client = new CulpeoClientSession({
-      streams: [{ content_type: "audio/opus", type: "output" }],
+      streams: [{ content_type: "audio/opus", type: "output", offset_type: "message" }],
       sendFrame: (frame) => {
         outbound.push(frame);
       },
       version: "9.9",
     });
-    const serverOutbound: CulpeoFrame[] = [];
+    const serverOutbound: CulpeoMessage[] = [];
     const server = new CulpeoServerSession({
       sendFrame: (frame) => {
         serverOutbound.push(frame);
@@ -195,10 +199,10 @@ describe("session state machine", () => {
 
   it("responds to ping with pong and reports RTT", async () => {
     const measurements: number[] = [];
-    const outbound: CulpeoFrame[] = [];
+    const outbound: CulpeoMessage[] = [];
     let now = 100;
     const client = new CulpeoClientSession({
-      streams: [{ content_type: "audio/opus", type: "output" }],
+      streams: [{ content_type: "audio/opus", type: "output", offset_type: "message" }],
       sendFrame: (frame) => {
         outbound.push(frame);
       },
@@ -224,7 +228,7 @@ describe("session state machine", () => {
       body: {
         version: "0.3",
         streams: [
-          { id: "stream-1", content_type: "audio/opus", type: "output" },
+          { id: "stream-1", content_type: "audio/opus", type: "output", offset_type: "message" },
         ],
       },
     });
@@ -242,9 +246,9 @@ describe("session state machine", () => {
   });
 
   it("handles auth refresh without leaking tokens in errors", async () => {
-    const outbound: CulpeoFrame[] = [];
+    const outbound: CulpeoMessage[] = [];
     const client = new CulpeoClientSession({
-      streams: [{ content_type: "audio/opus", type: "output" }],
+      streams: [{ content_type: "audio/opus", type: "output", offset_type: "message" }],
       sendFrame: (frame) => {
         outbound.push(frame);
       },
@@ -267,7 +271,7 @@ describe("session state machine", () => {
       body: {
         version: "0.3",
         streams: [
-          { id: "stream-1", content_type: "audio/opus", type: "output" },
+          { id: "stream-1", content_type: "audio/opus", type: "output", offset_type: "message" },
         ],
       },
     });
@@ -288,9 +292,9 @@ describe("session state machine", () => {
       body: { nonce: "nonce-123" },
     });
 
-    const failingOutbound: CulpeoFrame[] = [];
+    const failingOutbound: CulpeoMessage[] = [];
     const failingClient = new CulpeoClientSession({
-      streams: [{ content_type: "audio/opus", type: "output" }],
+      streams: [{ content_type: "audio/opus", type: "output", offset_type: "message" }],
       sendFrame: (frame) => {
         failingOutbound.push(frame);
       },
@@ -315,7 +319,7 @@ describe("session state machine", () => {
       body: {
         version: "0.3",
         streams: [
-          { id: "stream-2", content_type: "audio/opus", type: "output" },
+          { id: "stream-2", content_type: "audio/opus", type: "output", offset_type: "message" },
         ],
       },
     });
@@ -339,7 +343,7 @@ describe("session state machine", () => {
   });
 
   it("validates auth-response nonce on the server", async () => {
-    const outbound: CulpeoFrame[] = [];
+    const outbound: CulpeoMessage[] = [];
     const server = new CulpeoServerSession({
       sendFrame: (frame) => {
         outbound.push(frame);
@@ -361,7 +365,7 @@ describe("session state machine", () => {
       },
       body: {
         version: "0.3",
-        streams: [{ content_type: "audio/opus", type: "output" }],
+        streams: [{ content_type: "audio/opus", type: "output", offset_type: "message" }],
       },
     });
 
@@ -381,7 +385,7 @@ describe("session state machine", () => {
   });
 
   it("drops excess pings without closing the server session", async () => {
-    const outbound: CulpeoFrame[] = [];
+    const outbound: CulpeoMessage[] = [];
     let now = 0;
     const server = new CulpeoServerSession({
       sendFrame: (frame) => {
@@ -430,9 +434,9 @@ describe("session state machine", () => {
   });
 
   it("rejects media frames whose content type does not match the stream", async () => {
-    const notifications: CulpeoFrame[] = [];
+    const notifications: CulpeoMessage[] = [];
     const client = new CulpeoClientSession({
-      streams: [{ content_type: "audio/opus", type: "output" }],
+      streams: [{ content_type: "audio/opus", type: "output", offset_type: "message" }],
       onNotification: (notification) => {
         if (notification.type === "media") {
           notifications.push(notification.frame);
@@ -455,7 +459,7 @@ describe("session state machine", () => {
       body: {
         version: "0.3",
         streams: [
-          { id: "stream-1", content_type: "audio/opus", type: "output" },
+          { id: "stream-1", content_type: "audio/opus", type: "output", offset_type: "message" },
         ],
       },
     });
@@ -479,7 +483,7 @@ describe("session state machine", () => {
 
   it("rejects media frames with offset gaps", async () => {
     const client = new CulpeoClientSession({
-      streams: [{ content_type: "audio/opus", type: "output" }],
+      streams: [{ content_type: "audio/opus", type: "output", offset_type: "message" }],
     });
 
     await client.start({
@@ -497,7 +501,7 @@ describe("session state machine", () => {
       body: {
         version: "0.3",
         streams: [
-          { id: "stream-1", content_type: "audio/opus", type: "output" },
+          { id: "stream-1", content_type: "audio/opus", type: "output", offset_type: "message" },
         ],
       },
     });
@@ -526,7 +530,7 @@ describe("session state machine", () => {
   });
 
   it("clamps the negotiated buffer window to the server maximum", async () => {
-    const outbound: CulpeoFrame[] = [];
+    const outbound: CulpeoMessage[] = [];
     const server = new CulpeoServerSession({
       maxBufferWindowMs: 500,
       sendFrame: (frame) => {
@@ -548,7 +552,7 @@ describe("session state machine", () => {
   });
 
   it("rejects expired session resumptions based on disconnect time", async () => {
-    const outbound: CulpeoFrame[] = [];
+    const outbound: CulpeoMessage[] = [];
     let now = 10_000_000;
     const server = new CulpeoServerSession({
       nowMicros: () => now,
@@ -559,7 +563,7 @@ describe("session state machine", () => {
         bufferWindowMs: 1_000,
         disconnectedAtMs: 1_000,
         streams: [
-          { id: "stream-1", content_type: "audio/opus", type: "output" },
+          { id: "stream-1", content_type: "audio/opus", type: "output", offset_type: "message" },
         ],
       },
       sendFrame: (frame) => {
@@ -580,7 +584,7 @@ describe("session state machine", () => {
       body: {
         version: "0.3",
         streams: [
-          { id: "stream-1", content_type: "audio/opus", type: "output" },
+          { id: "stream-1", content_type: "audio/opus", type: "output", offset_type: "message" },
         ],
       },
     });
@@ -593,7 +597,7 @@ describe("session state machine", () => {
   });
 
   it("rejects resume declarations that do not exactly match the session", async () => {
-    const outbound: CulpeoFrame[] = [];
+    const outbound: CulpeoMessage[] = [];
     const server = new CulpeoServerSession({
       resumeSnapshot: {
         sessionId: "session-1",
@@ -604,6 +608,7 @@ describe("session state machine", () => {
             id: "stream-1",
             content_type: "audio/opus",
             type: "output",
+            offset_type: "message",
             purpose: "assistant",
             resume_offset: 1,
           },
@@ -631,6 +636,7 @@ describe("session state machine", () => {
             id: "stream-1",
             content_type: "audio/opus",
             type: "output",
+            offset_type: "message",
             purpose: "assistant",
             resume_offset: 2,
           },
@@ -646,7 +652,7 @@ describe("session state machine", () => {
   });
 
   it("expires auth challenges after the configured timeout", async () => {
-    const outbound: CulpeoFrame[] = [];
+    const outbound: CulpeoMessage[] = [];
     let now = 0;
     const server = new CulpeoServerSession({
       authChallengeTimeoutMs: 10,
@@ -674,7 +680,7 @@ describe("session state machine", () => {
   });
 
   it("allows pings within the configured rate limit window", async () => {
-    const outbound: CulpeoFrame[] = [];
+    const outbound: CulpeoMessage[] = [];
     let now = 0;
     const server = new CulpeoServerSession({
       sendFrame: (frame) => {
