@@ -762,6 +762,7 @@ export class CulpeoServerSession extends SessionBase {
         "unauthorized",
         "Authentication challenge failed.",
       );
+      return;
     }
     if (
       frame.body.nonce !== this.pendingAuthNonce ||
@@ -771,6 +772,7 @@ export class CulpeoServerSession extends SessionBase {
         "unauthorized",
         "Authentication challenge failed.",
       );
+      return;
     }
     this.pendingAuthNonce = undefined;
     this.authChallengeIssuedAt = undefined;

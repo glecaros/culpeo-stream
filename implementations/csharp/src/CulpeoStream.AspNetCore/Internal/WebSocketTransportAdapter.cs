@@ -180,6 +180,30 @@ internal sealed class WebSocketTransportAdapter : ICulpeoStreamSession
                     break;
                 }
 
+                // ── SEC-008: Handler authentication hook for culpeo.init ───
+                if (frame.Kind == CulpeoMessageKind.Control
+                    && string.Equals(frame.Event, "culpeo.init", StringComparison.Ordinal))
+                {
+                    bool authenticated = await _handler
+                        .AuthenticateAsync(frame.Authorization ?? string.Empty, cancellationToken)
+                        .ConfigureAwait(false);
+
+                    if (!authenticated)
+                    {
+                        _logger.LogWarning("Handler rejected authentication for session {SessionId}.", _connection.SessionId);
+                        var authErrorFrame = new CulpeoMessage(
+                            CulpeoMessageKind.Control,
+                            "{}"u8.ToArray(),
+                            @event: "culpeo.init-error",
+                            contentType: "application/json",
+                            code: "unauthorized",
+                            reason: "Authentication rejected by server.");
+                        await SendFrameAsync(authErrorFrame, cancellationToken).ConfigureAwait(false);
+                        closeCode = "unauthorized";
+                        break;
+                    }
+                }
+
                 // ── Process frame through Core state machine ───────────────
                 var result = await _connection.ReceiveAsync(frame, cancellationToken)
                     .ConfigureAwait(false);
@@ -194,7 +218,8 @@ internal sealed class WebSocketTransportAdapter : ICulpeoStreamSession
                 if (!handlerConnected && result.State == CulpeoSessionState.Established)
                 {
                     handlerConnected = true;
-                    _sessionStart = DateTimeOffset.UtcNow;
+                    // CS-001: preserve the original session start time across resumptions.
+                    _sessionStart = _connection.SessionStartedAt ?? DateTimeOffset.UtcNow;
                     await _handler.OnConnectedAsync(this, cancellationToken).ConfigureAwait(false);
                 }
 
@@ -252,6 +277,12 @@ internal sealed class WebSocketTransportAdapter : ICulpeoStreamSession
         {
             _logger.LogDebug("WebSocket exception for session {SessionId}: {Message}",
                 _connection.SessionId, ex.Message);
+        }
+        catch (CulpeoProtocolException ex)
+        {
+            // Protocol violation handled in-band (close frame already sent); just log and exit cleanly.
+            _logger.LogDebug("Protocol error closing session {SessionId}: [{Code}] {Message}",
+                _connection.SessionId, ex.Code, ex.Message);
         }
         catch (OperationCanceledException)
         {
@@ -323,6 +354,17 @@ internal sealed class WebSocketTransportAdapter : ICulpeoStreamSession
             if (result.MessageType == WebSocketMessageType.Close)
             {
                 return (WebSocketMessageType.Close, []);
+            }
+
+            // SEC-009: enforce maximum message size to prevent memory exhaustion DoS.
+            if (accumulator.Length + result.Count > _options.MaxMessageBytes)
+            {
+                _logger.LogWarning(
+                    "Session {SessionId} exceeded maximum message size ({Max} bytes). Closing.",
+                    _connection.SessionId, _options.MaxMessageBytes);
+                var sizeErrorClose = BuildCloseFrame("protocol-error", "Message exceeds maximum allowed size.");
+                await SendFrameAsync(sizeErrorClose, CancellationToken.None).ConfigureAwait(false);
+                throw new CulpeoProtocolException("protocol-error", "Message exceeds maximum allowed size.");
             }
 
             accumulator.Write(buffer, 0, result.Count);

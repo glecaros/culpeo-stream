@@ -368,3 +368,133 @@ Option 2. `OffsetType` is now the sole driver of offset increment behaviour in `
 
 ### Spec Reference
 Section 5.5, 5.6 (rule 4), 8.2
+
+## Content-Type comparison: case-insensitive for names, case-sensitive for values (CPP-001)
+**Date:** 2026-05-30
+**Phase:** Phase 2 — Session Layer
+**Status:** Decided
+
+### Context
+The original Content-Type comparison in `process_media_frame` lowercased the entire string before comparing, making parameter values case-insensitive. Spec §6.2 requires type/subtype and parameter *names* to be case-insensitive but parameter *values* to be case-sensitive.
+
+### Decision
+Implemented `content_type_matches(declared, received)` in the anonymous namespace of `session.cpp`. It:
+1. Splits each string at `;` into a type/subtype part and parameter key=value pairs.
+2. Compares type/subtype case-insensitively via `iequals_sv`.
+3. Builds two parameter arrays (capped at 16 entries each).
+4. For each declared parameter, finds a matching received parameter with case-insensitive name and case-sensitive value comparison.
+5. Requires equal parameter counts (neither side may have extra parameters).
+
+The function is allocation-free (uses `std::string_view` throughout and a fixed-size `std::array<CtParam, 16>`).
+
+### Tradeoffs
+- A cap of 16 parameters per Content-Type is more than sufficient for any audio/pcm or codec type, but would fail (return false) for pathological inputs with >16 params. This is acceptable behaviour — such inputs are already invalid per spec §6.2.
+- Parameter count equality is enforced: if the frame carries extra parameters not declared on the stream, it is rejected. This is the strictest possible interpretation of "must match stream declaration".
+
+### Spec Reference
+Section 6.2
+
+## Mandatory Content-Type on media frames (SEC-014)
+**Date:** 2026-05-30
+**Phase:** Phase 2 — Session Layer
+**Status:** Decided
+
+### Context
+The previous code only validated Content-Type when it was present, silently accepting media frames with no Content-Type header. Per spec §6.2 and the security review (SEC-014), Content-Type is mandatory on media frames.
+
+### Decision
+`process_media_frame` now returns `Error::protocol_error` and closes the session with `"protocol-error"` if `f.content_type` is absent. The check is placed immediately before the content-type match check (after offset validation succeeds).
+
+### Tradeoffs
+Any client implementation that omitted Content-Type on media frames will now be rejected. The spec is clear that Content-Type is required; this is a correctness fix.
+
+### Spec Reference
+Section 6.2, Security review SEC-014
+
+## Remove dead offset arithmetic (CPP-003)
+**Date:** 2026-05-30
+**Phase:** Phase 2 — Session Layer
+**Status:** Decided
+
+### Context
+In `process_media_frame`, lines 999–1002 performed the no-op `stream_snapshot.offset -= (stream->offset - stream_snapshot.offset)` then immediately re-assigned `stream_snapshot = *stream`. Both snapshots were identical (since the subtraction was zero), and the comment was misleading.
+
+### Decision
+Removed the dead line. The single `StreamInfo stream_snapshot = *stream` after `advance_offset` correctly captures the post-advance state.
+
+### Tradeoffs
+Pure cleanup — no behaviour change.
+
+## Replace std::random_device with OS CSPRNG primitives (SEC-013)
+**Date:** 2026-05-30
+**Phase:** Phase 2 — Session Layer
+**Status:** Decided
+
+### Context
+`crypto.hpp` used `thread_local std::random_device` as the entropy source. While libstdc++ on Linux backs `std::random_device` with `/dev/urandom`, this is an implementation detail — the standard does not guarantee it. The Security Agent (SEC-013) required explicit OS CSPRNG calls.
+
+### Decision
+Replaced the `std::random_device` fill loop with platform-specific CSPRNG calls:
+- **Linux/Android**: `getrandom(2)` via `<sys/random.h>` — blocks until entropy pool is seeded, then uses the ChaCha20-based kernel CSPRNG. Never uses a file descriptor. Retries on `EINTR`.
+- **macOS/iOS**: `arc4random_buf(3)` — ChaCha20-based, never fails, never returns partial data.
+- **Windows**: `BCryptGenRandom(NULL, ..., BCRYPT_USE_SYSTEM_PREFERRED_RNG)` — uses the system-preferred RNG without requiring an algorithm handle.
+- **Emscripten**: unchanged — `emscripten_get_entropy` delegates to `crypto.getRandomValues`.
+
+Removed `#include <random>` since `std::random_device` is no longer used.
+
+### Tradeoffs
+- `getrandom` on very early Linux (< 3.17) is absent; the code will fail to compile on those kernels. This is intentional — pre-3.17 kernels are end-of-life and lack modern security properties.
+- `arc4random_buf` was already available on macOS 10.7+ and all iOS versions, so no compatibility regression.
+
+### Spec Reference
+Agent instructions — Security Requirements (CSPRNG selection)
+
+## Cryptographically random ping nonce instead of timestamp (SEC-016)
+**Date:** 2026-05-30
+**Phase:** Phase 2 — Session Layer
+**Status:** Decided
+
+### Context
+`send_ping` used the Unix epoch microsecond timestamp as both the ping identifier and the RTT anchor. A predictable identifier is a security weakness — an attacker who can observe or influence the timestamp could forge a pong response. The Security Agent (SEC-016) required a CSPRNG-backed nonce.
+
+### Decision
+1. `pending_ping_ts` replaced by two fields in `Impl`:
+   - `pending_ping_nonce` (`std::optional<uint64_t>`) — CSPRNG-generated 64-bit nonce.
+   - `pending_ping_send_ts` (`std::optional<int64_t>`) — microsecond timestamp at send time (for RTT computation).
+2. `generate_u64_nonce()` helper fills a `uint64_t` via `culpeo::crypto::secure_random`; re-rolls on the astronomically unlikely all-zero result.
+3. Ping body changed to `{"nonce": <uint64>, "server_ts": <microseconds>}`.
+4. `handle_pong` reads `"nonce"` from the pong body (instead of `"ts"`), validates it against `pending_ping_nonce`, and computes RTT from `now_us() - pending_ping_send_ts`.
+5. The test `"Server-initiated ping → RTT callback on pong"` was updated to extract `nonce` from the ping body and echo it in the pong.
+
+### Tradeoffs
+- Pong body field change from `"ts"` → `"nonce"` is a breaking change for clients that only look at the `"ts"` field in server-initiated pongs. The spec did not prescribe a format for server-initiated ping bodies; this aligns with the new spec wording.
+- RTT is now computed entirely server-side from a stored send timestamp, not from a value echoed by the client. This removes the possibility of a client manipulating the RTT measurement by altering the echoed timestamp.
+
+### Spec Reference
+Agent instructions — Security Requirements (CSPRNG), Security review SEC-016
+
+## PCM parameter semantic validation: channels≥1 and bits%8==0 (CPP-002)
+**Date:** 2026-05-30
+**Phase:** Phase 1 — Frame Layer
+**Status:** Decided
+
+### Context
+The PCM content-type parser accepted `channels=0` (no channels) and `bits=7` (non-byte-aligned samples), which are nonsensical values. The Security Agent / code review (CPP-002) required these to be rejected.
+
+### Decision
+After successfully parsing all three PCM parameters, two additional guards are applied:
+```cpp
+if (*channels == 0) return std::unexpected(Error::invalid_content_type);
+if (*bits == 0 || *bits % 8 != 0) return std::unexpected(Error::invalid_content_type);
+```
+`parse_u32` also now rejects leading zeros (e.g. `"016000"` is not a valid decimal integer per spec §4.2). This was added as a single guard:
+```cpp
+if (value.size() > 1 && value[0] == '0') return std::unexpected(Error::invalid_content_type);
+```
+
+### Tradeoffs
+- `channels=0` and non-byte-aligned `bits` values are spec violations (there is no meaningful PCM stream with zero channels). Rejecting them at parse time prevents downstream arithmetic errors in `compute_pcm_increment`.
+- Leading-zero rejection aligns `parse_u32` with `parse_uint64` (which already rejected them) for consistency.
+
+### Spec Reference
+Section 6.1 (audio/pcm parameter semantics), CPP-002 review finding

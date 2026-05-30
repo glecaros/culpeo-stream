@@ -45,7 +45,8 @@ public static class ServiceCollectionExtensions
                 SupportedVersions = options.SupportedVersions,
                 MaxBufferWindowMs = options.MaxBufferWindowMs,
                 MaxStreamCount = options.MaxStreamsPerSession,
-                AuthChallengeTimeout = options.AuthChallengeTimeout
+                AuthChallengeTimeout = options.AuthChallengeTimeout,
+                MinAuthRefreshIntervalSeconds = options.MinAuthRefreshIntervalSeconds
             };
 
             return new CulpeoSessionServer(coreOptions);

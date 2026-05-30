@@ -56,4 +56,35 @@ public sealed class CulpeoStreamOptions
     /// terminates TLS in front of this server.
     /// </summary>
     public bool TrustForwardedProto { get; set; } = true;
+
+    /// <summary>
+    /// Number of trusted reverse-proxy hops between the Internet and this server.
+    /// When greater than zero and an <c>X-Forwarded-For</c> header is present, the
+    /// middleware extracts the real client IP by skipping this many entries from the
+    /// right of the header (those are the trusted proxy addresses), and uses the
+    /// next entry as the client IP for rate-limiting purposes.
+    ///
+    /// Security model: only set this to the exact number of proxies you control.
+    /// Setting it too high lets attackers spoof arbitrary IPs; setting it too low
+    /// (or leaving it at the default of 0) causes all clients behind a proxy to
+    /// share a single rate-limit bucket.
+    ///
+    /// Default is 0 (disabled; <c>RemoteIpAddress</c> is used as-is).
+    /// When <see cref="TrustForwardedProto"/> is <see langword="true"/>, consider
+    /// setting this to <c>1</c>.
+    /// </summary>
+    public int TrustedProxyCount { get; set; } = 0;
+
+    /// <summary>
+    /// Maximum permitted WebSocket message size in bytes. Fragments are accumulated
+    /// until this limit is reached; if a message would exceed it the connection is
+    /// closed with <c>protocol-error</c>. Default is 1 MiB.
+    /// </summary>
+    public int MaxMessageBytes { get; set; } = 1 * 1024 * 1024;
+
+    /// <summary>
+    /// Minimum number of seconds that must elapse between successive
+    /// <c>culpeo.auth-refresh</c> challenges on the same session. Default is 30 s.
+    /// </summary>
+    public int MinAuthRefreshIntervalSeconds { get; set; } = 30;
 }

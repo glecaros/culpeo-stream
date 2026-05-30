@@ -184,6 +184,17 @@ export class CulpeoStreamClient extends TypedEventEmitter<ClientEventMap> {
   private pendingConnect: PendingConnect | undefined;
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 
+  // Per-connection WebSocket event handlers; stored so they can be removed
+  // before a new connection is opened, preventing memory leaks on reconnect.
+  private wsHandlers:
+    | {
+        open: () => void;
+        message: (event: MessageEvent) => void;
+        close: () => void;
+        error: () => void;
+      }
+    | undefined;
+
   public constructor(options?: CulpeoStreamClientOptions) {
     super();
     this.WebSocketImpl =
@@ -335,7 +346,27 @@ export class CulpeoStreamClient extends TypedEventEmitter<ClientEventMap> {
   // Internal: connection lifecycle
   // ---------------------------------------------------------------------------
 
+  /**
+   * Remove all four WebSocket event listeners from `ws` using the stored
+   * handler references. Call this before overwriting `this.ws` to allow the
+   * old WebSocket object (and its closures) to be garbage collected.
+   */
+  private cleanupWebSocket(ws: WebSocket): void {
+    if (this.wsHandlers === undefined) return;
+    ws.removeEventListener("open", this.wsHandlers.open);
+    ws.removeEventListener("message", this.wsHandlers.message);
+    ws.removeEventListener("close", this.wsHandlers.close);
+    ws.removeEventListener("error", this.wsHandlers.error);
+    this.wsHandlers = undefined;
+  }
+
   private openConnection(): void {
+    // Remove listeners from the previous WebSocket before discarding it so
+    // that old closures (and the session they reference) can be GC'd.
+    if (this.ws !== undefined) {
+      this.cleanupWebSocket(this.ws);
+    }
+
     const url = this.connectUrl!;
     const options = this.connectOptions!;
     // Capture the snapshot for this attempt; may be undefined on first attempt.
@@ -364,7 +395,8 @@ export class CulpeoStreamClient extends TypedEventEmitter<ClientEventMap> {
     });
     this.session = session;
 
-    ws.addEventListener("open", () => {
+    // Define named handler variables so they can be stored and later removed.
+    const handleOpen = (): void => {
       void (async () => {
         // On reconnects, try to get a fresh token to avoid auth failures.
         // The original token is used as the fallback; it is NEVER logged.
@@ -383,9 +415,9 @@ export class CulpeoStreamClient extends TypedEventEmitter<ClientEventMap> {
           resumeFrom,
         });
       })();
-    });
+    };
 
-    ws.addEventListener("message", (event: MessageEvent) => {
+    const handleMessage = (event: MessageEvent): void => {
       try {
         const { data } = event;
         let frame;
@@ -399,14 +431,11 @@ export class CulpeoStreamClient extends TypedEventEmitter<ClientEventMap> {
         }
         void session.receive(frame);
       } catch (err) {
-        this.emit(
-          "error",
-          err instanceof Error ? err : new Error(String(err)),
-        );
+        this.emit("error", err instanceof Error ? err : new Error(String(err)));
       }
-    });
+    };
 
-    ws.addEventListener("close", () => {
+    const handleClose = (): void => {
       // Try to snapshot the session state for resumption on reconnect.
       if (session.state === "established") {
         try {
@@ -417,13 +446,26 @@ export class CulpeoStreamClient extends TypedEventEmitter<ClientEventMap> {
       }
       if (this.intentionalDisconnect) return;
       this.scheduleReconnect();
-    });
+    };
 
     // The `error` event is always followed by a `close` event on a WebSocket.
     // We handle reconnect logic in the close handler to avoid double-scheduling.
-    ws.addEventListener("error", () => {
+    const handleError = (): void => {
       /* handled in close */
-    });
+    };
+
+    // Store handler references so cleanupWebSocket() can remove them later.
+    this.wsHandlers = {
+      open: handleOpen,
+      message: handleMessage,
+      close: handleClose,
+      error: handleError,
+    };
+
+    ws.addEventListener("open", handleOpen);
+    ws.addEventListener("message", handleMessage);
+    ws.addEventListener("close", handleClose);
+    ws.addEventListener("error", handleError);
   }
 
   private handleNotification(notification: SessionNotification): void {

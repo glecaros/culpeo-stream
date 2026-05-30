@@ -1,6 +1,7 @@
 #include "culpeo/session.hpp"
 
 #include "auth_refresh.hpp"
+#include "crypto.hpp"
 #include "offset_tracker.hpp"
 #include "stream_registry.hpp"
 
@@ -178,6 +179,109 @@ int64_t now_us() noexcept {
         std::chrono::duration_cast<std::chrono::microseconds>(tp).count());
 }
 
+// ─── Content-Type comparison (spec §6.2) ─────────────────────────────────────
+// type/subtype and parameter names are compared case-insensitively;
+// parameter values are compared case-sensitively.
+// Parameter order is insignificant.
+
+[[nodiscard]] constexpr char to_lower_ascii_ct(char c) noexcept {
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+}
+
+[[nodiscard]] static bool iequals_sv(std::string_view a, std::string_view b) noexcept {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (to_lower_ascii_ct(a[i]) != to_lower_ascii_ct(b[i])) return false;
+    }
+    return true;
+}
+
+static std::string_view trim_sv(std::string_view sv) noexcept {
+    while (!sv.empty() && (sv.front() == ' ' || sv.front() == '\t')) sv.remove_prefix(1);
+    while (!sv.empty() && (sv.back()  == ' ' || sv.back()  == '\t')) sv.remove_suffix(1);
+    return sv;
+}
+
+// Parse a Content-Type string into {type/subtype, [{name, value}...]} without allocation.
+// Returns true on success; false on malformed input.
+struct CtParam { std::string_view name; std::string_view value; };
+
+static bool content_type_matches(std::string_view declared, std::string_view received) noexcept {
+    // Helper: parse "type/subtype[;param=value...]" into type/subtype and param list.
+    // Returns false on parse error.
+    const auto parse = [](std::string_view ct,
+                           std::string_view& type_subtype,
+                           std::array<CtParam, 16>& params,
+                           std::size_t& param_count) -> bool {
+        const auto semi = ct.find(';');
+        type_subtype = trim_sv(ct.substr(0, semi));
+        param_count = 0;
+        if (semi == std::string_view::npos) return true;
+
+        std::size_t cursor = semi + 1;
+        while (cursor < ct.size()) {
+            const auto next = ct.find(';', cursor);
+            const auto seg = trim_sv(ct.substr(cursor, next == std::string_view::npos
+                                                        ? ct.size() - cursor
+                                                        : next - cursor));
+            cursor = (next == std::string_view::npos) ? ct.size() : next + 1;
+            if (seg.empty()) return false;
+            const auto eq = seg.find('=');
+            if (eq == std::string_view::npos) return false;
+            if (param_count >= 16) return false;
+            params[param_count++] = {trim_sv(seg.substr(0, eq)),
+                                     trim_sv(seg.substr(eq + 1))};
+        }
+        return true;
+    };
+
+    std::string_view d_ts, r_ts;
+    std::array<CtParam, 16> d_params{}, r_params{};
+    std::size_t d_count = 0, r_count = 0;
+
+    if (!parse(declared, d_ts, d_params, d_count)) return false;
+    if (!parse(received, r_ts, r_params, r_count)) return false;
+
+    // Compare type/subtype case-insensitively
+    if (!iequals_sv(d_ts, r_ts)) return false;
+
+    // Both must have the same number of params
+    if (d_count != r_count) return false;
+
+    // For each param in declared, find a matching param in received:
+    //   name case-insensitive, value case-sensitive.
+    for (std::size_t i = 0; i < d_count; ++i) {
+        bool found = false;
+        for (std::size_t j = 0; j < r_count; ++j) {
+            if (iequals_sv(d_params[i].name, r_params[j].name) &&
+                d_params[i].value == r_params[j].value) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+// ─── Cryptographic helpers ────────────────────────────────────────────────────
+
+// Generate a cryptographically random 64-bit nonce via the OS CSPRNG.
+// Returns 0 only on failure (extremely rare); caller should treat 0 as error
+// or re-try, but in practice the CSPRNG never returns 0 for all 8 bytes.
+[[nodiscard]] static uint64_t generate_u64_nonce() noexcept {
+    uint64_t nonce = 0;
+    try {
+        culpeo::crypto::secure_random(
+            std::span<std::byte>(reinterpret_cast<std::byte*>(&nonce), sizeof(nonce)));
+    } catch (...) {
+        return 0;
+    }
+    // Avoid 0 (used as "no nonce") — re-roll if needed (probability 1/2^64)
+    if (nonce == 0) nonce = 1;
+    return nonce;
+}
+
 }  // namespace
 
 // ─── Session::Impl ────────────────────────────────────────────────────────────
@@ -208,7 +312,8 @@ struct Session::Impl {
     uint32_t pings_in_window{0};
 
     // ── Ping RTT tracking (for server-initiated pings) ────────────────────────
-    std::optional<int64_t> pending_ping_ts;
+    std::optional<uint64_t> pending_ping_nonce;   // Cryptographically random nonce
+    std::optional<int64_t>  pending_ping_send_ts; // Microsecond timestamp at send time (for RTT)
 
     // ── Constructor ───────────────────────────────────────────────────────────
     explicit Impl(ITransport& t, SessionCallbacks cb, SessionConfig cfg,
@@ -631,30 +736,34 @@ struct Session::Impl {
             return std::unexpected(Error::wrong_state);
         }
 
-        if (!pending_ping_ts.has_value()) {
+        if (!pending_ping_nonce.has_value()) {
             // Unsolicited pong — ignore
             return {};
         }
 
-        int64_t echoed_ts = 0;
+        uint64_t echoed_nonce = 0;
         try {
             auto body_json = nlohmann::json::parse(f.body);
-            echoed_ts = body_json.at("ts").get<int64_t>();
+            echoed_nonce = body_json.at("nonce").get<uint64_t>();
         } catch (...) {
-            pending_ping_ts.reset();
+            pending_ping_nonce.reset();
+            pending_ping_send_ts.reset();
             return {};
         }
 
-        if (echoed_ts == *pending_ping_ts) {
+        if (echoed_nonce == *pending_ping_nonce) {
             const int64_t now = now_us();
-            const auto rtt = std::chrono::microseconds(now - echoed_ts);
-            pending_ping_ts.reset();
+            const auto rtt = std::chrono::microseconds(
+                now - pending_ping_send_ts.value_or(now));
+            pending_ping_nonce.reset();
+            pending_ping_send_ts.reset();
 
             auto cb = callbacks.on_rtt;
             lock.unlock();
             if (cb) cb(rtt);
         } else {
-            pending_ping_ts.reset();
+            pending_ping_nonce.reset();
+            pending_ping_send_ts.reset();
         }
 
         return {};
@@ -947,27 +1056,26 @@ Session::process_media_frame(const culpeo::message::ParsedHeadersView& f) noexce
         return std::unexpected(Error::offset_mismatch);
     }
 
-    // Validate Content-Type matches stream declaration
-    if (f.content_type.has_value()) {
-        // Case-insensitive comparison for type/subtype, case-sensitive for params
-        // For simplicity: do case-insensitive full comparison
-        const auto& frame_ct = *f.content_type;
-        const auto& stream_ct = stream->content_type;
-        if (!std::equal(frame_ct.begin(), frame_ct.end(),
-                        stream_ct.begin(), stream_ct.end(),
-                        [](char a, char b) {
-                            auto lc = [](char c) {
-                                return (c >= 'A' && c <= 'Z')
-                                    ? static_cast<char>(c - 'A' + 'a') : c;
-                            };
-                            return lc(a) == lc(b);
-                        })) {
-            impl_->transition_to_closed_locked();
-            lock.unlock();
-            impl_->send_close_frame("protocol-error", "Content-Type mismatch");
-            try { impl_->transport.close(); } catch (...) {}
-            return std::unexpected(Error::content_type_mismatch);
-        }
+    // Validate Content-Type matches stream declaration (spec §6.2):
+    // - Mandatory: media frames MUST include Content-Type (SEC-014)
+    // - type/subtype compared case-insensitively
+    // - parameter names compared case-insensitively
+    // - parameter values compared case-sensitively
+    // - parameter order is insignificant
+    if (!f.content_type.has_value()) {
+        impl_->transition_to_closed_locked();
+        lock.unlock();
+        impl_->send_close_frame("protocol-error", "Media frame missing Content-Type");
+        try { impl_->transport.close(); } catch (...) {}
+        return std::unexpected(Error::protocol_error);
+    }
+
+    if (!content_type_matches(stream->content_type, *f.content_type)) {
+        impl_->transition_to_closed_locked();
+        lock.unlock();
+        impl_->send_close_frame("protocol-error", "Content-Type mismatch");
+        try { impl_->transport.close(); } catch (...) {}
+        return std::unexpected(Error::content_type_mismatch);
     }
 
     // Parse timestamp (optional but must be valid if present)
@@ -996,10 +1104,7 @@ Session::process_media_frame(const culpeo::message::ParsedHeadersView& f) noexce
     }
 
     // Capture callback and stream snapshot before releasing lock
-    StreamInfo stream_snapshot = *stream;
-    stream_snapshot.offset -= (stream->offset - stream_snapshot.offset);
-    // Re-capture after advance (stream->offset now points to NEXT expected)
-    stream_snapshot = *stream;  // This is post-advance; caller sees updated offset
+    StreamInfo stream_snapshot = *stream;  // Post-advance; caller sees updated offset
     auto cb = impl_->callbacks.on_media_received;
 
     lock.unlock();
@@ -1102,12 +1207,18 @@ std::expected<void, Error> Session::send_ping() noexcept {
         return std::unexpected(Error::wrong_state);
     }
 
-    const int64_t ts = now_us();
-    impl_->pending_ping_ts = ts;
+    // Generate a cryptographically random 64-bit nonce (SEC-016).
+    // Store the send timestamp separately for RTT computation.
+    const uint64_t nonce = generate_u64_nonce();
+    const int64_t send_ts = now_us();
+    impl_->pending_ping_nonce = nonce;
+    impl_->pending_ping_send_ts = send_ts;
 
     lock.unlock();
 
-    std::string body = R"({"ts":)" + std::to_string(ts) + '}';
+    // Ping body: {"nonce": <uint64>, "server_ts": <microseconds_since_epoch>}
+    std::string body = R"({"nonce":)" + std::to_string(nonce)
+                     + R"(,"server_ts":)" + std::to_string(send_ts) + '}';
     send_text_frame_noexcept(impl_->transport,
         {{"Event", "culpeo.ping"},
          {"Content-Type", "application/json"}},

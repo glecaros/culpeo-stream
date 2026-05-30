@@ -243,3 +243,54 @@ Added `OffsetType = 'time' | 'byte' | 'message'` to `types.ts` and made `offset_
 
 ### Spec Reference
 Section 5.5 (offset types), Section 5.6 (stream validation), Section 8.2 (offset increment formulas)
+
+## TS-001: Add return after failWithClose in handleAuthResponse
+**Date:** 2026-05-30
+**Phase:** Phase 1 (Security Fix)
+**Status:** Decided
+
+### Context
+Security review finding TS-001 identified that `handleAuthResponse` called `failWithClose` for two error conditions (missing nonce, nonce mismatch) but did not `return` after either call. Execution would continue past the error path, reaching `this.pendingAuthNonce = undefined` even after a failed/rejected auth attempt. This could mask protocol errors and leave the session in an inconsistent state.
+
+### Decision
+Added `return;` immediately after each `await this.failWithClose(...)` call in `handleAuthResponse`. Two return statements added: one for the "no pending nonce" path and one for the "nonce mismatch or empty authorization" path.
+
+### Tradeoffs
+No behaviour change for the happy path. The fix makes error paths terminal as intended. `failWithClose` already closes the session; the missing `return` only meant that further lines in the function could execute on an already-closed session.
+
+### Spec Reference
+Section 7.3 (auth-refresh challenge/response lifecycle)
+
+## TS-002: Clean up WebSocket event listeners on reconnect
+**Date:** 2026-05-30
+**Phase:** Phase 2 (Security/Memory Fix)
+**Status:** Decided
+
+### Context
+Security review finding TS-002 identified that `openConnection()` attached four inline arrow-function listeners (`open`, `message`, `close`, `error`) to each new WebSocket but never removed them. On reconnection, the old WebSocket and all closures it held (including references to `session`, `options`, and `this`) could not be garbage collected.
+
+### Decision
+Replaced the four inline `addEventListener` lambdas with named `const` variables (`handleOpen`, `handleMessage`, `handleClose`, `handleError`) defined within `openConnection()`. These are stored in a new instance field `this.wsHandlers` before being attached. A `cleanupWebSocket(ws)` helper method reads `this.wsHandlers` and calls `removeEventListener` for all four events, then clears `this.wsHandlers`. `cleanupWebSocket` is called at the top of `openConnection()` before the old `this.ws` is overwritten.
+
+### Tradeoffs
+The handlers are still per-connection closures (capturing the specific `ws` and `session` for that connection attempt), which is required for correctness. The stored references in `this.wsHandlers` are overwritten on each new connection, so only the most-recent set is tracked. This means `cleanupWebSocket` can only clean up the immediately previous connection, which is sufficient since each old WS is discarded one at a time during sequential reconnects.
+
+### Spec Reference
+Section 9 (reconnection and session resumption)
+
+## TS-003: PCM time-offset calculation verified correct
+**Date:** 2026-05-30
+**Phase:** Phase 1 (Review Finding)
+**Status:** Decided
+
+### Context
+Security review finding TS-003 flagged the PCM time-offset calculation in `offsets.ts` as potentially computing total samples across all channels rather than per-channel samples. The spec §5.5 defines time offsets as samples per channel.
+
+### Decision
+After code inspection and test verification, the existing implementation is **correct**. `parsePcmStepBytes` returns `channels * (bits / 8)`, which is the byte stride of one interleaved sample frame (all channels). Dividing `payloadLength` by this stride yields the number of sample frames, which equals samples per channel for interleaved PCM. Example: stereo 16-bit, 640 bytes → stride = 4 → 160 samples per channel. The existing test (`channels=1, bits=16, 640 bytes → 320`) also confirms correctness. No code change was made.
+
+### Tradeoffs
+No change. The finding was based on a hypothetical misreading of the formula; the actual code was already correct.
+
+### Spec Reference
+Section 5.5 (time offset type, PCM sample counting)

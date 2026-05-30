@@ -220,3 +220,122 @@ Automatic `UseWebSockets()` injection is convenient but could surprise operators
 
 ### Spec Reference
 ASP.NET Core WebSocket middleware documentation, Addendum B
+
+## SEC-008: AuthenticateAsync hook in ICulpeoStreamHandler
+**Date:** 2026-05-26
+**Phase:** Phase 2 — ASP.NET Core Integration (security review)
+**Status:** Decided
+
+### Context
+The original `ICulpeoStreamHandler` had no way to validate bearer tokens; any non-empty token would establish a session. Application code had no hook to reject unauthorised connections.
+
+### Decision
+Added `Task<bool> AuthenticateAsync(string authorization, CancellationToken)` to `ICulpeoStreamHandler`. In `WebSocketTransportAdapter.RunAsync`, the hook is called for every `culpeo.init` frame *before* calling `_connection.ReceiveAsync`. If it returns `false`, a `culpeo.init-error` frame with code `unauthorized` is sent and the loop exits. The Core `HandleInitialFrame` still validates that the authorization field is non-blank; the handler hook performs application-level token validation on top.
+
+### Tradeoffs
+The check is placed in the AspNetCore adapter rather than Core so that the Core library remains free of `ICulpeoStreamHandler` dependencies. Application code must now implement one more method; existing tests default to `return Task.FromResult(true)`.
+
+### Spec Reference
+§A.2 (authorization), §6.1 (init error codes)
+
+## SEC-009: MaxMessageBytes guard in ReceiveMessageAsync
+**Date:** 2026-05-26
+**Phase:** Phase 2 — ASP.NET Core Integration (security review)
+**Status:** Decided
+
+### Context
+`ReceiveMessageAsync` accumulated WebSocket fragments into a `MemoryStream` without any size cap, allowing a malicious client to exhaust server memory by sending an oversized message.
+
+### Decision
+Added `MaxMessageBytes` to `CulpeoStreamOptions` (default 1 MiB). The size check runs before each `accumulator.Write` call. On violation, a `protocol-error` close frame is sent and a `CulpeoProtocolException` is thrown. The new public `CulpeoProtocolException` class in `CulpeoStream.Core` is caught specifically in `RunAsync` and logged at Debug level (not Error) since it is an expected client-error path.
+
+### Tradeoffs
+1 MiB covers any realistic CulpeoStream control frame while rejecting obviously malicious payloads. Media frames are typically small; the limit can be raised per-deployment via options.
+
+### Spec Reference
+§A.5 (DoS hardening)
+
+## SEC-010: X-Forwarded-For support for per-IP rate limiting
+**Date:** 2026-05-26
+**Phase:** Phase 2 — ASP.NET Core Integration (security review)
+**Status:** Decided
+
+### Context
+`GetClientIp` always returned `context.Connection.RemoteIpAddress`, which collapses all clients behind a reverse proxy into a single rate-limit bucket.
+
+### Decision
+Added `TrustedProxyCount` to `CulpeoStreamOptions` (default: `0`). When `> 0`, `GetClientIp` parses the `X-Forwarded-For` header and returns the IP at index `(list.Count - TrustedProxyCount)` (rightmost client before trusted proxy hops). Falls back to `RemoteIpAddress` if parsing fails. An XML doc comment explains the security model: setting it too high allows IP spoofing; setting it too low gives all proxied clients one bucket.
+
+### Tradeoffs
+Zero by default is safe. Operators using a reverse proxy must opt in by setting `TrustedProxyCount = 1` (or the appropriate count). This is explicit and auditable. We deliberately do not enable it automatically when `TrustForwardedProto = true` to avoid surprising deployments.
+
+### Spec Reference
+§A.5
+
+## SEC-011: Constant-time nonce comparison
+**Date:** 2026-05-26
+**Phase:** Phase 1 — Core Library (security review)
+**Status:** Decided
+
+### Context
+`string.Equals(Ordinal)` short-circuits on the first differing character, enabling a timing oracle that allows brute-force guessing of the nonce.
+
+### Decision
+Replaced the equality check in `HandleAuthResponse` with `CryptographicOperations.FixedTimeEquals` over ASCII-encoded byte representations of both nonces. Also increased `NonceByteLength` default from 16 to 32 bytes (256 bits) to match the C++ implementation and provide a wider security margin.
+
+### Tradeoffs
+Converting strings to byte arrays allocates two small arrays per validation. This is negligible given that auth-responses are rare and infrequent. `FixedTimeEquals` requires both arrays to be the same length; a null/empty `pendingNonce` is now checked explicitly before the comparison.
+
+### Spec Reference
+§A.4 (auth-refresh), §A.6 (timing attacks)
+
+## SEC-012: Single-pending-nonce and minimum re-issue interval
+**Date:** 2026-05-26
+**Phase:** Phase 1 — Core Library (security review)
+**Status:** Decided
+
+### Context
+`IssueAuthRefreshAsync` could be called unconditionally, allowing callers to flood clients with challenges and overwrite a pending nonce (making the original challenge unverifiable).
+
+### Decision
+`IssueAuthRefreshAsync` now throws `InvalidOperationException("Auth refresh already pending")` if `pendingNonce is not null`. It also tracks `lastAuthRefreshIssuedAt` (distinct from `authChallengeIssuedAt` which is cleared on success/timeout) and throws `InvalidOperationException("Auth refresh issued too recently")` if the interval since the last issue is below `MinAuthRefreshIntervalSeconds` (default 30, forwarded from `CulpeoStreamOptions`). The `MinAuthRefreshIntervalSeconds` property was added to both `CulpeoStreamOptions` and `CulpeoSessionOptions`.
+
+### Tradeoffs
+The minimum interval persists across successful responses (i.e., a new challenge can only be issued 30 s after the *previous* challenge was issued, not 30 s after it was responded to). This is intentionally conservative to prevent rapid rotation attacks.
+
+### Spec Reference
+§A.4
+
+## CS-001: Preserve original session start time across resumptions
+**Date:** 2026-05-26
+**Phase:** Phase 2 — ASP.NET Core Integration (security review)
+**Status:** Decided
+
+### Context
+`_sessionStart` was reset to `DateTimeOffset.UtcNow` on every connection (including resumptions), causing media timestamps to restart from zero after a reconnect, breaking timestamp continuity.
+
+### Decision
+Added `DateTimeOffset SessionStartedAt { get; }` to `SessionSnapshot`, set to `TimeProvider.GetUtcNow()` in `CreateNewSession`. Resumption (`ResumeSession`) reuses the existing snapshot, so `SessionStartedAt` is naturally preserved. Added `CulpeoConnection.SessionStartedAt` as a public property exposing the snapshot value. `WebSocketTransportAdapter` now reads `_connection.SessionStartedAt ?? DateTimeOffset.UtcNow` when the session is established instead of using `DateTimeOffset.UtcNow` unconditionally.
+
+### Tradeoffs
+The change is backwards-compatible; the `??` fallback ensures correctness even if the snapshot is missing (cannot happen in practice, but provides a safe default).
+
+### Spec Reference
+§8.2 (media frame timestamp)
+
+## SEC-015: Removal of issuedNonces HashSet
+**Date:** 2026-05-26
+**Phase:** Phase 1 — Core Library (security review)
+**Status:** Decided
+
+### Context
+`issuedNonces` accumulated every nonce ever generated in an unbounded `HashSet`. Old nonces can never be validated once `pendingNonce` is updated or cleared, so the set only grew. The membership check in `HandleAuthResponse` was redundant with the `pendingNonce` equality check.
+
+### Decision
+Removed `issuedNonces` entirely. Auth-response validation now relies solely on `pendingNonce`; the constant-time comparison (SEC-011) ensures correctness. The `.Add()` call in `IssueAuthRefreshAsync` and the `.Remove()` call in `HandleAuthResponse` were deleted. The single-pending-nonce check introduced by SEC-012 further ensures there is never more than one active nonce to compare against.
+
+### Tradeoffs
+None. The removed code provided no security benefit and constituted an unbounded memory growth vector.
+
+### Spec Reference
+§A.4

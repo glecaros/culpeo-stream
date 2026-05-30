@@ -604,16 +604,15 @@ TEST_CASE("Server-initiated ping → RTT callback on pong", "[session]") {
     REQUIRE(ping_result.has_value());
     REQUIRE(transport.any_text_contains("culpeo.ping"));
 
-    // Extract the ts from the sent ping
+    // Extract the nonce from the sent ping body (SEC-016: ping uses random nonce)
     const auto ping_text = transport.text_frame_str(transport.text_count() - 1);
-    auto ts_pos = ping_text.find(R"("ts":)");
-    REQUIRE(ts_pos != std::string::npos);
-    const std::string ts_str = ping_text.substr(ts_pos + 5, 19);  // Up to 19 digits
-    const int64_t ts_val = std::stoll(ts_str);
+    auto nonce_pos = ping_text.find(R"("nonce":)");
+    REQUIRE(nonce_pos != std::string::npos);
+    const std::string nonce_str = ping_text.substr(nonce_pos + 8, 20);  // Up to 20 digits
+    const uint64_t nonce_val = std::stoull(nonce_str);
 
-    // Client responds with pong echoing ts
-    std::string pong_body = R"({"ts":)" + std::to_string(ts_val) +
-                             R"(,"server_ts":)" + std::to_string(ts_val + 1000) + '}';
+    // Client responds with pong echoing the nonce
+    std::string pong_body = R"({"nonce":)" + std::to_string(nonce_val) + '}';
     auto pong_raw = make_ctrl_frame(
         {{"Event", "culpeo.pong"}, {"Content-Type", "application/json"}},
         pong_body);

@@ -403,6 +403,21 @@ public sealed class IntegrationTests
         Assert.Contains("AuthChallengeTimeout", ex.Message);
     }
 
+    // ── SEC-008: AuthenticateAsync hook ────────────────────────────────────────
+
+    [Fact]
+    public async Task Init_HandlerRejectsAuthentication_Returns_InitError_Unauthorized()
+    {
+        // Handler returns false from AuthenticateAsync → session must NOT be established.
+        using var server = CreateServer(new RejectingAuthHandler());
+        using var ws = await ConnectAsync(server);
+
+        var response = await MessageHelper.InitSessionAsync(ws);
+
+        Assert.Equal("culpeo.init-error", response.Event);
+        Assert.Equal("unauthorized", response.Code);
+    }
+
     // ── Private helpers ────────────────────────────────────────────────────────
 
     private static string ExtractFirstStreamId(CulpeoMessage ack)
@@ -439,6 +454,8 @@ public sealed class IntegrationTests
         {
         }
 
+        public Task<bool> AuthenticateAsync(string authorization, CancellationToken ct) => Task.FromResult(true);
+
         public Task OnConnectedAsync(ICulpeoStreamSession session, CancellationToken ct)
             => _onConnected?.Invoke(session) ?? Task.CompletedTask;
 
@@ -463,6 +480,17 @@ public sealed class IntegrationTests
 
     private sealed class NoopHandler : ICulpeoStreamHandler
     {
+        public Task<bool> AuthenticateAsync(string authorization, CancellationToken ct) => Task.FromResult(true);
+        public Task OnConnectedAsync(ICulpeoStreamSession session, CancellationToken ct) => Task.CompletedTask;
+        public Task OnMediaFrameAsync(ICulpeoStreamSession session, CulpeoMediaFrameContext frame, CancellationToken ct) => Task.CompletedTask;
+        public Task OnEventAsync(ICulpeoStreamSession session, CulpeoEventContext @event, CancellationToken ct) => Task.CompletedTask;
+        public Task OnDisconnectedAsync(ICulpeoStreamSession session, string? closeCode, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    /// <summary>Handler that always rejects authentication. Used for SEC-008 test.</summary>
+    private sealed class RejectingAuthHandler : ICulpeoStreamHandler
+    {
+        public Task<bool> AuthenticateAsync(string authorization, CancellationToken ct) => Task.FromResult(false);
         public Task OnConnectedAsync(ICulpeoStreamSession session, CancellationToken ct) => Task.CompletedTask;
         public Task OnMediaFrameAsync(ICulpeoStreamSession session, CulpeoMediaFrameContext frame, CancellationToken ct) => Task.CompletedTask;
         public Task OnEventAsync(ICulpeoStreamSession session, CulpeoEventContext @event, CancellationToken ct) => Task.CompletedTask;

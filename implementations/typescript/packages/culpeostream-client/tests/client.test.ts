@@ -34,13 +34,18 @@ async function tick(n = 10): Promise<void> {
 function makeStreams(
   type: ResumeStreamDeclaration["type"] = "input",
 ): ResumeStreamDeclaration[] {
-  return [{ type, content_type: "audio/opus", offset_type: "message", purpose: "voice" }];
+  return [
+    {
+      type,
+      content_type: "audio/opus",
+      offset_type: "message",
+      purpose: "voice",
+    },
+  ];
 }
 
 /** Build default ConnectOptions. */
-function makeOpts(
-  overrides: Partial<ConnectOptions> = {},
-): ConnectOptions {
+function makeOpts(overrides: Partial<ConnectOptions> = {}): ConnectOptions {
   return {
     token: "test-token",
     streams: makeStreams(),
@@ -54,7 +59,13 @@ function makeOpts(
 function makeInitAckText(
   sessionId = "session-abc",
   streams: ConfirmedStreamDeclaration[] = [
-    { id: "stream-1", type: "input", content_type: "audio/opus", offset_type: "message", purpose: "voice" },
+    {
+      id: "stream-1",
+      type: "input",
+      content_type: "audio/opus",
+      offset_type: "message",
+      purpose: "voice",
+    },
   ],
 ): string {
   const frame: InitAckFrame = {
@@ -101,7 +112,8 @@ function makeMediaFrame(streamId: string): ArrayBuffer {
     body: new Uint8Array([1, 2, 3, 4]),
   };
   const serialized = serializeFrame(frame);
-  if (serialized.frameType !== "binary") throw new Error("Expected binary frame");
+  if (serialized.frameType !== "binary")
+    throw new Error("Expected binary frame");
   // .slice() on a Uint8Array always returns a new Uint8Array with a fresh ArrayBuffer.
   return serialized.data.slice().buffer;
 }
@@ -229,7 +241,10 @@ describe("CulpeoStreamClient — URL validation", () => {
     const { factory } = makeMockWsFactory();
     const client = new CulpeoStreamClient({ WebSocket: factory });
     await expect(
-      client.connect("ws://localhost:8080", { ...makeOpts(), allowInsecure: false }),
+      client.connect("ws://localhost:8080", {
+        ...makeOpts(),
+        allowInsecure: false,
+      }),
     ).rejects.toThrow(/insecure/i);
   });
 
@@ -317,7 +332,10 @@ describe("CulpeoStreamClient — basic connect/disconnect", () => {
   it("includes token in init Authorization header (without logging it)", async () => {
     const { factory, instances } = makeMockWsFactory();
     const client = new CulpeoStreamClient({ WebSocket: factory });
-    void client.connect("wss://localhost:8443", makeOpts({ token: "secret-tok" }));
+    void client.connect(
+      "wss://localhost:8443",
+      makeOpts({ token: "secret-tok" }),
+    );
     await tick();
     instances[0]!.simulateOpen();
     await tick();
@@ -338,7 +356,9 @@ describe("CulpeoStreamClient — basic connect/disconnect", () => {
     await tick();
     instances[0]!.simulateOpen();
     await tick();
-    instances[0]!.simulateMessage(makeInitErrorText("unauthorized", "Bad token"));
+    instances[0]!.simulateMessage(
+      makeInitErrorText("unauthorized", "Bad token"),
+    );
     await tick();
 
     await expect(connectP).rejects.toThrow("unauthorized");
@@ -355,7 +375,9 @@ describe("CulpeoStreamClient — basic connect/disconnect", () => {
     await tick();
     instances[0]!.simulateOpen();
     await tick();
-    instances[0]!.simulateMessage(makeInitErrorText("unauthorized", "Bad token"));
+    instances[0]!.simulateMessage(
+      makeInitErrorText("unauthorized", "Bad token"),
+    );
     await tick();
 
     await connectP.catch((err: Error) => {
@@ -410,13 +432,22 @@ describe("CulpeoStreamClient — media", () => {
     const mediaFrames: MediaMessage[] = [];
     client.on("media", (f) => mediaFrames.push(f));
 
-    const connectP = client.connect("wss://localhost:8443", makeOpts({ streams: makeStreams("output") }));
+    const connectP = client.connect(
+      "wss://localhost:8443",
+      makeOpts({ streams: makeStreams("output") }),
+    );
     await tick();
     instances[0]!.simulateOpen();
     await tick();
     instances[0]!.simulateMessage(
       makeInitAckText("sess", [
-        { id: "s1", type: "output", content_type: "audio/opus", offset_type: "message", purpose: "voice" },
+        {
+          id: "s1",
+          type: "output",
+          content_type: "audio/opus",
+          offset_type: "message",
+          purpose: "voice",
+        },
       ]),
     );
     await tick();
@@ -433,9 +464,9 @@ describe("CulpeoStreamClient — media", () => {
   it("throws when sendMedia is called before connect", () => {
     const { factory } = makeMockWsFactory();
     const client = new CulpeoStreamClient({ WebSocket: factory });
-    expect(() =>
-      client.sendMedia("s1", new ArrayBuffer(4)),
-    ).toThrow(/not established/i);
+    expect(() => client.sendMedia("s1", new ArrayBuffer(4))).toThrow(
+      /not established/i,
+    );
   });
 
   it("can send media after session is established", async () => {
@@ -451,7 +482,13 @@ describe("CulpeoStreamClient — media", () => {
     await tick();
     instances[0]!.simulateMessage(
       makeInitAckText("sess", [
-        { id: "s1", type: "input", content_type: "audio/opus", offset_type: "message", purpose: "voice" },
+        {
+          id: "s1",
+          type: "input",
+          content_type: "audio/opus",
+          offset_type: "message",
+          purpose: "voice",
+        },
       ]),
     );
     await tick();
@@ -513,7 +550,9 @@ describe("CulpeoStreamClient — application events", () => {
     await tick();
 
     expect(instances[0]!.sent.length).toBeGreaterThan(sentBefore);
-    expect(instances[0]!.sent[instances[0]!.sent.length - 1] as string).toContain("app.hello");
+    expect(
+      instances[0]!.sent[instances[0]!.sent.length - 1] as string,
+    ).toContain("app.hello");
   });
 });
 
@@ -570,7 +609,13 @@ describe("CulpeoStreamClient — reconnection", () => {
     await tick();
     instances[0]!.simulateMessage(
       makeInitAckText("original-session-id", [
-        { id: "s1", type: "input", content_type: "audio/opus", offset_type: "message", purpose: "voice" },
+        {
+          id: "s1",
+          type: "input",
+          content_type: "audio/opus",
+          offset_type: "message",
+          purpose: "voice",
+        },
       ]),
     );
     await tick();
@@ -686,7 +731,9 @@ describe("CulpeoStreamClient — auth-refresh", () => {
     await tick();
     instances[0]!.simulateOpen();
     await tick();
-    instances[0]!.simulateMessage(makeInitErrorText("unauthorized", "bad creds"));
+    instances[0]!.simulateMessage(
+      makeInitErrorText("unauthorized", "bad creds"),
+    );
     await tick();
 
     let caughtErr: Error | undefined;
@@ -718,7 +765,11 @@ describe("CulpeoStreamClient — culpeo.close from server", () => {
     const closeFrame = serializeFrame({
       kind: "control",
       event: "culpeo.close",
-      headers: { event: "culpeo.close", code: "server-shutdown", reason: "Maintenance" },
+      headers: {
+        event: "culpeo.close",
+        code: "server-shutdown",
+        reason: "Maintenance",
+      },
       body: {},
     });
     if (closeFrame.frameType !== "text") throw new Error();
@@ -747,7 +798,13 @@ describe("CulpeoStreamClient — confirmedStreams", () => {
     await tick();
     instances[0]!.simulateMessage(
       makeInitAckText("sess", [
-        { id: "s1", type: "input", content_type: "audio/opus", offset_type: "message", purpose: "voice" },
+        {
+          id: "s1",
+          type: "input",
+          content_type: "audio/opus",
+          offset_type: "message",
+          purpose: "voice",
+        },
       ]),
     );
     await tick();

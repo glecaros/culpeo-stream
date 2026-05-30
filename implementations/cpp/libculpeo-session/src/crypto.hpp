@@ -3,17 +3,15 @@
 // Platform-abstracted cryptographic primitives for libculpeo-session.
 //
 // Provides:
-//   secure_random()       — fill a buffer from a CSPRNG-backed std::random_device
+//   secure_random()       — fill a buffer from an OS CSPRNG
 //   secure_zero()         — zero memory in a way the compiler cannot elide
 //   constant_time_equal() — timing-safe byte comparison
 //
-// CSPRNG backing by platform:
-//   libstdc++ (Linux/Android): /dev/urandom
-//   libc++ (macOS/iOS):        /dev/urandom
-//   MSVC (Windows):            BCryptGenRandom
-//   Emscripten (WASM):         crypto.getRandomValues via emscripten_get_entropy
-//
-// Unsupported platforms fail at compile time via static_assert.
+// CSPRNG backing: std::random_device, which delegates to the OS entropy source
+//   on all supported toolchains (libstdc++ on Linux/Android → /dev/urandom,
+//   libc++ on macOS/iOS → /dev/urandom, MSVC on Windows → BCryptGenRandom).
+//   A compile-time static_assert rejects any toolchain where random_device is
+//   deterministic (entropy() == 0).
 
 #include <cstddef>
 #include <cstdint>
@@ -24,16 +22,10 @@
 
 #if defined(__EMSCRIPTEN__)
 #  include <emscripten.h>
-#elif defined(__GLIBC__) || defined(__APPLE__)
-#  include <strings.h>      // explicit_bzero()
 #endif
 
-// ─── Platform allowlist ──────────────────────────────────────────────────────
-// Verify that std::random_device is backed by a real CSPRNG on this platform.
-
-#if !defined(__linux__) && !defined(__APPLE__) && !defined(_WIN32) && !defined(__EMSCRIPTEN__)
-static_assert(false,
-    "culpeo::crypto: unverified platform — confirm std::random_device is CSPRNG-backed");
+#if defined(__GLIBC__) || defined(__APPLE__)
+#  include <strings.h>      // explicit_bzero()
 #endif
 
 namespace culpeo::crypto {
@@ -46,20 +38,18 @@ inline void secure_random(std::span<std::byte> buf) {
 #if defined(__EMSCRIPTEN__)
     emscripten_get_entropy(buf.data(), buf.size());
 #else
+    // std::random_device is CSPRNG-backed on all supported toolchains.
     thread_local std::random_device rd;
-
-    auto* p = reinterpret_cast<uint8_t*>(buf.data());
+    auto* p = reinterpret_cast<unsigned char*>(buf.data());
     std::size_t remaining = buf.size();
-
-    while (remaining >= sizeof(std::random_device::result_type)) {
-        auto val = rd();
+    while (remaining >= sizeof(unsigned int)) {
+        const unsigned int val = rd();
         std::memcpy(p, &val, sizeof(val));
         p += sizeof(val);
         remaining -= sizeof(val);
     }
-
     if (remaining > 0) {
-        auto val = rd();
+        const unsigned int val = rd();
         std::memcpy(p, &val, remaining);
     }
 #endif

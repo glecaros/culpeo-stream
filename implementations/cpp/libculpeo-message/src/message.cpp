@@ -93,6 +93,11 @@ constexpr std::array<std::string_view, 10> kReservedHeaderNames{
         return std::unexpected(Error::invalid_numeric_parameter);
     }
 
+    // Reject leading zeros (e.g. "016000" is not a valid decimal integer)
+    if (value.size() > 1 && value[0] == '0') {
+        return std::unexpected(Error::invalid_content_type);
+    }
+
     std::uint32_t parsed = 0;
     for (const char ch : value) {
         if (ch < '0' || ch > '9') {
@@ -342,6 +347,14 @@ std::expected<ParsedContentType, Error> parse_content_type(std::string_view valu
 
     if (!rate.has_value() || !channels.has_value() || !bits.has_value()) {
         return std::unexpected(Error::missing_content_type_parameter);
+    }
+
+    // Validate semantic constraints
+    if (*channels == 0) {
+        return std::unexpected(Error::invalid_content_type);
+    }
+    if (*bits == 0 || *bits % 8 != 0) {
+        return std::unexpected(Error::invalid_content_type);
     }
 
     return ParsedContentType{AudioPcmContentType{.rate = *rate, .channels = *channels, .bits = *bits}};

@@ -126,6 +126,24 @@ public interface ICulpeoStreamSession
 public interface ICulpeoStreamHandler
 {
     /// <summary>
+    /// Called during <c>culpeo.init</c> processing, <em>before</em> the session
+    /// is established. Implementations must validate the bearer token (or any other
+    /// credential embedded in the <paramref name="authorization"/> header value).
+    /// </summary>
+    /// <param name="authorization">
+    /// The raw value of the <c>Authorization</c> header from the
+    /// <c>culpeo.init</c> frame, e.g. <c>"Bearer eyJhbGci…"</c>. May be empty if
+    /// the client omitted the header (the middleware will already have rejected
+    /// empty-authorization frames before this call).
+    /// </param>
+    /// <returns>
+    /// <see langword="true"/> to allow the session to be established;
+    /// <see langword="false"/> to reject it with <c>culpeo.init-error</c>
+    /// code <c>unauthorized</c>.
+    /// </returns>
+    Task<bool> AuthenticateAsync(string authorization, CancellationToken cancellationToken);
+
+    /// <summary>
     /// Called once after the session is established and <c>culpeo.init-ack</c>
     /// has been sent to the client. Use this to set up any session-level state.
     /// </summary>

@@ -20,7 +20,17 @@ public sealed class CulpeoSessionOptions
 
     public int SessionIdByteLength { get; init; } = 16;
 
-    public int NonceByteLength { get; init; } = 16;
+    /// <summary>
+    /// Byte length of auth-refresh nonces. Default is 32 (256 bits).
+    /// Must be at least 16 (128 bits).
+    /// </summary>
+    public int NonceByteLength { get; init; } = 32;
+
+    /// <summary>
+    /// Minimum seconds between successive auth-refresh challenges on a single
+    /// session. Default is 30 s.
+    /// </summary>
+    public int MinAuthRefreshIntervalSeconds { get; init; } = 30;
 }
 
 public sealed class CulpeoProcessResult
@@ -122,15 +132,22 @@ public sealed class CulpeoSessionServer(CulpeoSessionOptions? options = null)
 
 public sealed class CulpeoConnection(CulpeoSessionServer server)
 {
-    private readonly HashSet<string> issuedNonces = new(StringComparer.Ordinal);
     private readonly Queue<DateTimeOffset> pingTimestamps = new();
     private SessionSnapshot? snapshot;
     private string? pendingNonce;
     private DateTimeOffset? authChallengeIssuedAt;
+    private DateTimeOffset? lastAuthRefreshIssuedAt;
 
     public CulpeoSessionState State { get; private set; } = CulpeoSessionState.Uninitialized;
 
     public string? SessionId => snapshot?.SessionId;
+
+    /// <summary>
+    /// The UTC time at which this session was first established. Preserved across
+    /// resumptions so timestamps remain continuous. <see langword="null"/> before
+    /// the session is established.
+    /// </summary>
+    public DateTimeOffset? SessionStartedAt => snapshot?.SessionStartedAt;
 
     public IReadOnlyList<CulpeoStreamInfo> Streams => snapshot is null
         ? []
@@ -186,10 +203,22 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         cancellationToken.ThrowIfCancellationRequested();
         EnsureEstablished();
 
+        if (pendingNonce is not null)
+        {
+            throw new InvalidOperationException("Auth refresh already pending.");
+        }
+
+        var now = server.Options.TimeProvider.GetUtcNow();
+        if (lastAuthRefreshIssuedAt is not null
+            && (now - lastAuthRefreshIssuedAt.Value).TotalSeconds < server.Options.MinAuthRefreshIntervalSeconds)
+        {
+            throw new InvalidOperationException("Auth refresh issued too recently.");
+        }
+
         var nonce = GenerateOpaqueId(server.Options.NonceByteLength);
-        issuedNonces.Add(nonce);
         pendingNonce = nonce;
-        authChallengeIssuedAt = server.Options.TimeProvider.GetUtcNow();
+        authChallengeIssuedAt = now;
+        lastAuthRefreshIssuedAt = now;
 
         return ValueTask.FromResult(new CulpeoMessage(
             CulpeoMessageKind.Control,
@@ -337,7 +366,17 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         }
 
         var nonce = nonceProperty.GetString();
-        if (string.IsNullOrWhiteSpace(nonce) || pendingNonce is null || !issuedNonces.Remove(nonce) || !string.Equals(nonce, pendingNonce, StringComparison.Ordinal))
+        if (string.IsNullOrWhiteSpace(nonce) || pendingNonce is null)
+        {
+            throw new ProtocolValidationException("unauthorized", "Invalid auth refresh nonce.");
+        }
+
+        // Constant-time comparison to prevent timing oracle attacks (SEC-011).
+        bool equal = CryptographicOperations.FixedTimeEquals(
+            System.Text.Encoding.ASCII.GetBytes(nonce),
+            System.Text.Encoding.ASCII.GetBytes(pendingNonce));
+
+        if (!equal)
         {
             throw new ProtocolValidationException("unauthorized", "Invalid auth refresh nonce.");
         }
@@ -415,7 +454,7 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
             .Select(stream => new StreamState(GenerateOpaqueId(8), stream.ContentType, stream.Type, stream.Purpose, 0, stream.OffsetType))
             .ToDictionary(stream => stream.Id, StringComparer.Ordinal);
 
-        return new SessionSnapshot(sessionId, bufferWindow, streams);
+        return new SessionSnapshot(sessionId, bufferWindow, streams, server.Options.TimeProvider.GetUtcNow());
     }
 
     private SessionSnapshot ResumeSession(string sessionId, InitRequest init, int bufferWindow)
@@ -820,7 +859,7 @@ internal static class ContentTypeUtilities
     }
 }
 
-internal sealed class SessionSnapshot(string sessionId, int bufferWindowMs, Dictionary<string, StreamState> streams)
+internal sealed class SessionSnapshot(string sessionId, int bufferWindowMs, Dictionary<string, StreamState> streams, DateTimeOffset sessionStartedAt)
 {
     public string SessionId { get; } = sessionId;
 
@@ -829,6 +868,13 @@ internal sealed class SessionSnapshot(string sessionId, int bufferWindowMs, Dict
     public Dictionary<string, StreamState> Streams { get; } = streams;
 
     public DateTimeOffset? DisconnectedAt { get; set; }
+
+    /// <summary>
+    /// UTC time at which the session was originally established.
+    /// Preserved across resumptions so session-relative timestamps remain
+    /// continuous.
+    /// </summary>
+    public DateTimeOffset SessionStartedAt { get; } = sessionStartedAt;
 }
 
 internal sealed class StreamState(string id, string contentType, CulpeoStreamType type, string? purpose, long currentOffset, OffsetType offsetType)
@@ -926,4 +972,14 @@ internal sealed class ProtocolValidationException(string code, string reason, Re
     public string Reason { get; } = reason;
 
     public ReadOnlyMemory<byte>? Body { get; } = body;
+}
+
+/// <summary>
+/// Thrown when a CulpeoStream protocol constraint is violated in a way that
+/// requires closing the connection (e.g., maximum message size exceeded).
+/// </summary>
+public sealed class CulpeoProtocolException(string code, string reason) : Exception(reason)
+{
+    /// <summary>CulpeoStream close/error code, e.g. <c>"protocol-error"</c>.</summary>
+    public string Code { get; } = code;
 }

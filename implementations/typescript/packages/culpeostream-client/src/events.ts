@@ -16,7 +16,9 @@
  */
 
 /** Listener type: void-payload events take no argument; all others take exactly one. */
-export type Listener<T> = [T] extends [void] ? () => void : (payload: T) => void;
+export type Listener<T> = [T] extends [void]
+  ? () => void
+  : (payload: T) => void;
 
 // Internal alias used to store heterogeneous listeners in a single collection.
 type AnyListener = (...args: readonly unknown[]) => void;

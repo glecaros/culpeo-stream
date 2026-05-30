@@ -171,6 +171,7 @@ public sealed class MiddlewareTests
 
     private sealed class NoopHandler : ICulpeoStreamHandler
     {
+        public Task<bool> AuthenticateAsync(string authorization, CancellationToken ct) => Task.FromResult(true);
         public Task OnConnectedAsync(ICulpeoStreamSession session, CancellationToken ct) => Task.CompletedTask;
         public Task OnMediaFrameAsync(ICulpeoStreamSession session, CulpeoMediaFrameContext frame, CancellationToken ct) => Task.CompletedTask;
         public Task OnEventAsync(ICulpeoStreamSession session, CulpeoEventContext @event, CancellationToken ct) => Task.CompletedTask;

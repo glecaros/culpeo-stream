@@ -84,7 +84,11 @@ describe("computeBackoffDelayMs", () => {
   });
 
   it("respects a custom baseDelayMs", () => {
-    const custom: ReconnectOptions = { maxAttempts: 10, baseDelayMs: 500, maxDelayMs: 10_000 };
+    const custom: ReconnectOptions = {
+      maxAttempts: 10,
+      baseDelayMs: 500,
+      maxDelayMs: 10_000,
+    };
     // attempt 0: cap = 500; with half: 250
     expect(computeBackoffDelayMs(0, custom, half)).toBe(250);
   });

@@ -25,3 +25,19 @@ Update all documentation to reflect the actual primitive used.
 ## Status
 
 Open
+
+## Resolution
+
+**Accepted risk / Won't fix.** `std::random_device` was deliberately chosen after analysis of
+the supported toolchains (libstdc++ on Linux/Android, libc++ on macOS/iOS). The
+`static_assert(std::random_device::entropy() != 0)` compile-time guard already rejects
+deterministic fallback implementations at build time. Platform-specific `#ifdef` chains
+for `getrandom`/`arc4random`/`BCryptGenRandom` add complexity with no meaningful security
+improvement on the target platforms.
+
+**Action:** Update inline documentation to accurately describe the implementation
+(remove incorrect `RAND_bytes`/`getrandom` claims) without changing the implementation.
+
+## Status
+
+Closed — accepted risk

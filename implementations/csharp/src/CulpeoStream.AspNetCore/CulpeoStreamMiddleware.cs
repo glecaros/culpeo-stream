@@ -160,6 +160,22 @@ public sealed class CulpeoStreamMiddleware
         }
     }
 
-    private static string GetClientIp(HttpContext context)
-        => context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+    private string GetClientIp(HttpContext context)
+    {
+        if (_options.TrustedProxyCount > 0)
+        {
+            var forwarded = context.Request.Headers["X-Forwarded-For"].FirstOrDefault();
+            if (!string.IsNullOrEmpty(forwarded))
+            {
+                var ips = forwarded.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                var index = ips.Length - _options.TrustedProxyCount;
+                if (index >= 0 && index < ips.Length)
+                {
+                    return ips[index];
+                }
+            }
+        }
+
+        return context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+    }
 }
