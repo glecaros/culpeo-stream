@@ -801,3 +801,73 @@ The WebSocket binding MUST use `wss://` in production. Plain `ws://` MAY be used
 ---
 
 *CulpeoStream is an open protocol. Contributions and feedback are welcome.*
+
+## Addendum C: HTTP/2 Binding
+
+This addendum defines how CulpeoStream frames are carried over HTTP/2 ([RFC 9113](https://datatracker.ietf.org/doc/html/rfc9113)).
+
+### C.1 Overview
+
+HTTP/2 provides a reliable, ordered, full-duplex byte stream per stream ID, satisfying all CulpeoStream transport requirements. The HTTP/2 binding uses a single long-lived HTTP/2 request stream for bidirectional CulpeoStream frame exchange, replacing the WebSocket upgrade handshake with standard HTTP/2 request headers.
+
+### C.2 Request Setup
+
+Clients open a CulpeoStream session by sending an HTTP/2 POST request with the following mandatory headers:
+
+```
+:method = POST
+:path   = <server-defined path>
+:scheme = https
+Content-Type: application/culpeostream
+Culpeostream-Version: 1.0
+```
+
+Servers that accept the connection respond with:
+
+```
+:status = 200
+Content-Type: application/culpeostream
+```
+
+Both sides then begin sending CulpeoStream frames as DATA frames on the same HTTP/2 stream.
+
+If the server rejects the connection (e.g., unsupported version, authentication failure), it responds with an appropriate HTTP status code (`401`, `400`, `503`) and closes the stream.
+
+### C.3 Frame Type Mapping
+
+HTTP/2 DATA frames carry a raw byte stream. Because HTTP/2 does not distinguish text from binary at the frame level, the CulpeoStream frame type MUST be encoded in the frame itself. The first byte of each CulpeoStream frame envelope is a **type octet**:
+
+| Value | Meaning |
+|---|---|
+| `0x01` | Control / event frame (headers + JSON body) |
+| `0x02` | Media frame (headers + raw bytes) |
+
+The remainder of the frame follows the standard CulpeoStream frame format (Section 4): header block terminated by `\r\n\r\n`, followed by the body.
+
+### C.4 Frame Boundaries
+
+HTTP/2 does not preserve message boundaries within a stream. The receiver MUST use a length-prefix to delimit frames. Each CulpeoStream frame on the HTTP/2 transport is preceded by a **4-byte big-endian unsigned integer** indicating the length of the following frame (type octet + header block + body), not including the 4-byte length prefix itself.
+
+```
++--------+--------+--------+--------+------- ... ------+
+|           frame_length (4 bytes)  |  frame_data       |
++--------+--------+--------+--------+------- ... ------+
+```
+
+Maximum frame size is implementation-defined but MUST be communicated via server configuration and enforced on both sides. The default maximum is 1 MiB.
+
+### C.5 Encryption
+
+The HTTP/2 binding MUST use TLS (`https`). Plaintext HTTP/2 (`h2c`) MAY be used in local development only.
+
+### C.6 Session Resumption
+
+Session resumption follows the same protocol as the WebSocket binding (Section 7.3). The `culpeo.init` frame is sent as the first DATA frame after the HTTP/2 request is established. Resume headers (`Session-Id`, `Resume-Offset`) are carried in the `culpeo.init` frame body, not as HTTP/2 headers.
+
+### C.7 Keepalive
+
+CulpeoStream `culpeo.ping` / `culpeo.pong` frames are used for keepalive and RTT measurement, identical to the WebSocket binding. HTTP/2 PING frames SHOULD NOT be used in place of the CulpeoStream ping mechanism.
+
+### C.8 Connection vs. Session Lifetime
+
+A single HTTP/2 connection MAY carry multiple CulpeoStream sessions on separate HTTP/2 stream IDs. Each HTTP/2 stream is an independent CulpeoStream session. Connection-level keepalive and flow control are handled by the HTTP/2 layer; session-level concerns are handled by the CulpeoStream protocol.

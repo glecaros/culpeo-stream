@@ -363,6 +363,24 @@ struct Session::Impl {
         return {};
     }
 
+    // Map a CulpeoStream protocol close code to the appropriate WebSocket status code.
+    // RFC 6455 §7.4.1 close codes.
+    static int to_ws_close_code(std::string_view culpeo_code) noexcept {
+        if (culpeo_code == "normal")                       return 1000;
+        if (culpeo_code == "unauthorized"   ||
+            culpeo_code == "auth-expired"   ||
+            culpeo_code == "auth-failed")                  return 1008;
+        // All other codes ("protocol-error", "version-unsupported",
+        // "invalid-streams", "session-expired", etc.) → 1002 Protocol Error.
+        return 1002;
+    }
+
+    // Close the transport with a WebSocket close code derived from a
+    // CulpeoStream protocol code.  Swallows all exceptions (close is best-effort).
+    void close_transport(std::string_view culpeo_code, std::string_view reason) noexcept {
+        try { transport.close(to_ws_close_code(culpeo_code), reason); } catch (...) {}
+    }
+
     // Send init-error frame and close. Mutex must NOT be held.
     void send_init_error_and_close(std::string_view code,
                                     std::string_view reason,
@@ -373,7 +391,7 @@ struct Session::Impl {
              {"Reason", reason},
              {"Content-Type", "application/json"}},
             body);
-        try { transport.close(); } catch (...) {}
+        close_transport(code, reason);
     }
 
     // Send culpeo.close and transition. Caller must have released the mutex.
@@ -780,7 +798,7 @@ struct Session::Impl {
             // No outstanding challenge — protocol error
             lock.unlock();
             send_close_frame("protocol-error", "Unexpected culpeo.auth-response");
-            try { transport.close(); } catch (...) {}
+            close_transport("protocol-error", "Unexpected culpeo.auth-response");
             std::unique_lock<std::mutex> re(mutex);
             transition_to_closed_locked();
             return std::unexpected(Error::protocol_error);
@@ -796,7 +814,7 @@ struct Session::Impl {
             auth_mgr.clear();
             lock.unlock();
             send_close_frame("unauthorized", "Invalid auth-response body");
-            try { transport.close(); } catch (...) {}
+            close_transport("unauthorized", "Invalid auth-response body");
             std::unique_lock<std::mutex> re(mutex);
             transition_to_closed_locked();
             return std::unexpected(Error::json_error);
@@ -813,7 +831,7 @@ struct Session::Impl {
             lock.unlock();
             send_close_frame("auth-expired", expired ? "Auth-refresh nonce expired"
                                                      : "Nonce mismatch");
-            try { transport.close(); } catch (...) {}
+            close_transport("auth-expired", expired ? "Auth-refresh nonce expired" : "Nonce mismatch");
             std::unique_lock<std::mutex> re(mutex);
             transition_to_closed_locked();
             return std::unexpected(nonce_result.error());
@@ -841,7 +859,7 @@ struct Session::Impl {
                 transition_to_closed_locked();
                 re.unlock();
                 send_close_frame("auth-expired", "New credentials rejected");
-                try { transport.close(); } catch (...) {}
+                close_transport("auth-expired", "New credentials rejected");
             }
             return std::unexpected(Error::auth_failed);
         }
@@ -869,7 +887,7 @@ struct Session::Impl {
 
         // Respond with our own close (spec §6.1: "SHOULD respond with its own culpeo.close")
         send_close_frame(code_str, reason_str);
-        try { transport.close(); } catch (...) {}
+        close_transport(code_str, reason_str);
 
         if (cb) cb(code_str, reason_str);
 
@@ -904,7 +922,7 @@ Session::process_control_frame(const culpeo::message::ParsedHeadersView& f) noex
             impl_->transition_to_closed_locked();
             lock.unlock();
             impl_->send_close_frame("protocol-error", "Control frame missing Event header");
-            try { impl_->transport.close(); } catch (...) {}
+            impl_->close_transport("protocol-error", "Control frame missing Event header");
         } else if (impl_->state == SessionState::uninitialized ||
                    impl_->state == SessionState::initializing) {
             impl_->state = SessionState::initializing;
@@ -928,7 +946,7 @@ Session::process_control_frame(const culpeo::message::ParsedHeadersView& f) noex
 
         if (st == SessionState::established) {
             impl_->send_close_frame("protocol-error", "Invalid event name syntax");
-            try { impl_->transport.close(); } catch (...) {}
+            impl_->close_transport("protocol-error", "Invalid event name syntax");
         } else {
             impl_->send_init_error_and_close("protocol-error",
                 "Invalid event name syntax", "{}");
@@ -1009,7 +1027,7 @@ Session::process_media_frame(const culpeo::message::ParsedHeadersView& f) noexce
         impl_->transition_to_closed_locked();
         lock.unlock();
         impl_->send_close_frame("protocol-error", "Media frame missing Stream-Id");
-        try { impl_->transport.close(); } catch (...) {}
+        impl_->close_transport("protocol-error", "Media frame missing Stream-Id");
         return std::unexpected(Error::protocol_error);
     }
 
@@ -1021,7 +1039,7 @@ Session::process_media_frame(const culpeo::message::ParsedHeadersView& f) noexce
         impl_->transition_to_closed_locked();
         lock.unlock();
         impl_->send_close_frame("protocol-error", "Invalid stream direction");
-        try { impl_->transport.close(); } catch (...) {}
+        impl_->close_transport("protocol-error", "Invalid stream direction");
         return std::unexpected(dir_check.error());
     }
 
@@ -1033,7 +1051,7 @@ Session::process_media_frame(const culpeo::message::ParsedHeadersView& f) noexce
         impl_->transition_to_closed_locked();
         lock.unlock();
         impl_->send_close_frame("protocol-error", "Media frame missing Offset");
-        try { impl_->transport.close(); } catch (...) {}
+        impl_->close_transport("protocol-error", "Media frame missing Offset");
         return std::unexpected(Error::protocol_error);
     }
 
@@ -1042,7 +1060,7 @@ Session::process_media_frame(const culpeo::message::ParsedHeadersView& f) noexce
         impl_->transition_to_closed_locked();
         lock.unlock();
         impl_->send_close_frame("protocol-error", "Invalid Offset header");
-        try { impl_->transport.close(); } catch (...) {}
+        impl_->close_transport("protocol-error", "Invalid Offset header");
         return std::unexpected(Error::protocol_error);
     }
 
@@ -1052,7 +1070,7 @@ Session::process_media_frame(const culpeo::message::ParsedHeadersView& f) noexce
         impl_->transition_to_closed_locked();
         lock.unlock();
         impl_->send_close_frame("protocol-error", "Offset mismatch");
-        try { impl_->transport.close(); } catch (...) {}
+        impl_->close_transport("protocol-error", "Offset mismatch");
         return std::unexpected(Error::offset_mismatch);
     }
 
@@ -1066,7 +1084,7 @@ Session::process_media_frame(const culpeo::message::ParsedHeadersView& f) noexce
         impl_->transition_to_closed_locked();
         lock.unlock();
         impl_->send_close_frame("protocol-error", "Media frame missing Content-Type");
-        try { impl_->transport.close(); } catch (...) {}
+        impl_->close_transport("protocol-error", "Media frame missing Content-Type");
         return std::unexpected(Error::protocol_error);
     }
 
@@ -1074,7 +1092,7 @@ Session::process_media_frame(const culpeo::message::ParsedHeadersView& f) noexce
         impl_->transition_to_closed_locked();
         lock.unlock();
         impl_->send_close_frame("protocol-error", "Content-Type mismatch");
-        try { impl_->transport.close(); } catch (...) {}
+        impl_->close_transport("protocol-error", "Content-Type mismatch");
         return std::unexpected(Error::content_type_mismatch);
     }
 
@@ -1099,7 +1117,7 @@ Session::process_media_frame(const culpeo::message::ParsedHeadersView& f) noexce
         impl_->transition_to_closed_locked();
         lock.unlock();
         impl_->send_close_frame("protocol-error", "Offset overflow");
-        try { impl_->transport.close(); } catch (...) {}
+        impl_->close_transport("protocol-error", "Offset overflow");
         return std::unexpected(adv.error());
     }
 
@@ -1243,7 +1261,7 @@ void Session::close(std::string_view code, std::string_view reason) noexcept {
     lock.unlock();
 
     impl_->send_close_frame(code_str, reason_str);
-    try { impl_->transport.close(); } catch (...) {}
+    impl_->close_transport(code_str, reason_str);
 
     if (cb) cb(code_str, reason_str);
 }

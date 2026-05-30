@@ -339,3 +339,123 @@ None. The removed code provided no security benefit and constituted an unbounded
 
 ### Spec Reference
 §A.4
+
+## Phase 3: Client library architecture — ConnectAsync + background loop
+**Date:** 2026-05-29
+**Phase:** Phase 3 — Client Library
+**Status:** Decided
+
+### Context
+`CulpeoStreamClient` needs to support both a synchronous initial handshake (caller waits for `culpeo.init-ack` before returning) and an ongoing background receive loop that handles reconnections, auth-refresh challenges, and incoming media/events.
+
+### Decision
+`ConnectAsync` performs the initial WebSocket connection and `culpeo.init` handshake synchronously (from the caller's perspective). On success it emits `SessionEstablished` into the event channel, starts a `Task.Run` background receive loop, and returns. The background loop drives all subsequent receives, reconnects, and auth-refresh handling. `ReceiveAsync` reads from an unbounded `Channel<CulpeoClientEvent>` that both the initial connect and the background loop write to.
+
+### Tradeoffs
+- **Pros:** Simple caller experience; clean separation between initial handshake and steady-state; the channel lets callers use `await foreach` without worrying about reconnects.
+- **Cons:** The background `Task.Run` is detached from the caller's `CancellationToken` (uses the lifetime CTS instead), meaning callers must await `DisposeAsync` or `DisconnectAsync` for clean shutdown.
+
+### Spec Reference
+§7.1, §7.2, §10.4
+
+---
+
+## Phase 3: WebSocket factory for testability
+**Date:** 2026-05-29
+**Phase:** Phase 3 — Client Library
+**Status:** Decided
+
+### Context
+`CulpeoStreamClient` creates a `ClientWebSocket` internally and calls `ConnectAsync` on it. Unit tests need to substitute in-memory WebSockets without a real network. Subclassing is not possible (class is `sealed`). Mocking the BCL `ClientWebSocket` with external frameworks was ruled out (no external dependencies in Core).
+
+### Decision
+Added an `internal Func<Uri, CancellationToken, Task<WebSocket>>? WebSocketFactory` property to `CulpeoStreamClient`. When non-null it replaces the default `ClientWebSocket` path. Test assemblies are granted access via `[assembly: InternalsVisibleTo("CulpeoStream.Client.Tests")]`. Tests use a hand-rolled `MemoryWebSocket` built on `System.Threading.Channels` pipes.
+
+### Tradeoffs
+- **Pros:** No external mocking library; full control over WebSocket lifecycle in tests; production code path remains unchanged.
+- **Cons:** Internal surface exposed to tests via `InternalsVisibleTo`; the `MemoryWebSocket` is a non-trivial in-test abstraction but is self-contained.
+
+### Spec Reference
+§3 (transport abstraction)
+
+---
+
+## Phase 3: wss:// enforcement in client
+**Date:** 2026-05-29
+**Phase:** Phase 3 — Client Library
+**Status:** Decided
+
+### Context
+§3.1 of the spec requires encrypted transports in production. The client must enforce `wss://` by default.
+
+### Decision
+`ConnectAsync` checks `serverUri.Scheme` against `"ws"` (case-insensitive) before creating the WebSocket. If the scheme is `ws://` and `AllowInsecureConnections` is `false` (the default), it throws `InvalidOperationException` immediately. A doc-comment on `AllowInsecureConnections` clearly marks it as a security risk for local development only. No compile-time warning is emitted (that would require a different API surface).
+
+### Tradeoffs
+- Plaintext connections are blocked by default, matching the security requirement.
+- The `AllowInsecureConnections` opt-in flag lets integration tests and local dev work without real TLS.
+- No `[Obsolete]` attribute was placed on the property itself since that would flag every use, even `false`.
+
+### Spec Reference
+§3.1, §A.5
+
+---
+
+## Phase 3: Full-jitter exponential backoff for reconnection
+**Date:** 2026-05-29
+**Phase:** Phase 3 — Client Library
+**Status:** Decided
+
+### Context
+§10.4 says clients SHOULD use exponential backoff between reconnection attempts. Full-jitter is the recommended algorithm to avoid thundering-herd problems with many simultaneous reconnects.
+
+### Decision
+Used `random(0, min(MaxBackoff, InitialBackoff × 2^attempt))` where `random` draws from `RandomNumberGenerator.GetInt32`. This provides full-jitter backoff as described in the AWS Architecture Blog. `InitialBackoff` defaults to 1 s, `MaxBackoff` to 30 s, `MaxReconnectAttempts` to 10.
+
+### Tradeoffs
+- Full-jitter has lower average reconnection latency than exponential-only while distributing load more evenly.
+- `RandomNumberGenerator.GetInt32` is cryptographically secure but slightly heavier than `Random.Next`. For backoff the overhead is negligible.
+
+### Spec Reference
+§10.4
+
+---
+
+## Phase 3: Offset tracking — per-stream send and receive cursors
+**Date:** 2026-05-29
+**Phase:** Phase 3 — Client Library
+**Status:** Decided
+
+### Context
+§8.2 defines three offset types (`time`, `byte`, `message`) and §7.2 / §8.2 require clients to track the highest received offset per stream for resumption. The client also needs to stamp outgoing media frames with the correct offset.
+
+### Decision
+`ClientStreamState` holds two cursors per stream: `SendOffset` (used as `Offset` on outgoing frames, advanced after each `SendMediaAsync`) and `ReceiveOffset` (updated on each incoming media frame, used as `resume_offset` for output streams). For `time`-typed PCM streams the bytes-per-sample stride is precomputed from the `audio/pcm` content-type parameters at init-ack parse time.
+
+### Tradeoffs
+- Two cursors cleanly handle duplex streams where both parties send.
+- PCM stride is precomputed once, keeping `SendMediaAsync` allocation-free.
+- If a future spec version adds other time-based content types the helper returns a byte-fallback.
+
+### Spec Reference
+§5.5, §8.2, §7.2
+
+---
+
+## Phase 3: ContentTypeUtilities made public
+**Date:** 2026-05-29
+**Phase:** Phase 3 — Client Library
+**Status:** Decided
+
+### Context
+`CulpeoStream.Client` needed to validate incoming media frame `Content-Type` against the declared stream content-type (§6.2). The matching logic already existed in `CulpeoStream.Core` as `ContentTypeUtilities` but was `internal`.
+
+### Decision
+Changed `ContentTypeUtilities` and its associated `ParsedContentType` record from `internal` to `public` in `CulpeoStream.Core`. This avoids duplication without requiring `InternalsVisibleTo` on Core.
+
+### Tradeoffs
+- Slightly wider public surface on Core; but this utility is genuinely reusable and its semantics are spec-defined, so public visibility is appropriate.
+- No breaking change since the types were not previously accessible.
+
+### Spec Reference
+§6.2

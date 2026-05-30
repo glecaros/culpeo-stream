@@ -86,6 +86,19 @@ A transport-agnostic implementation of the CulpeoStream session model:
 - `SendMediaAsync(streamId, byte[], CancellationToken)`
 - Event callbacks / `IAsyncEnumerable` for incoming frames
 
+### Phase 4 — HTTP/2 Transport (`CulpeoStream.Http2`)
+
+Implement an HTTP/2 transport to validate the transport-agnostic design with a second concrete transport. Uses `System.Net.Http.HttpClient` with `HttpVersion.Version20` and `HttpVersionPolicy.RequestVersionExact`.
+
+- New project: `src/CulpeoStream.Http2/`
+- `CulpeoHttp2Client` — connects via HTTP/2 POST, bidirectional streaming via request/response bodies
+- `CulpeoHttp2Server` — ASP.NET Core minimal API endpoint accepting HTTP/2 streaming connections
+- Frame framing per Addendum C: 1-byte type octet + 4-byte length prefix
+- `ICulpeoTransport` abstraction shared with the WebSocket transport (if not already present)
+- TLS required by default; `AllowHttp2Cleartext` opt-in for development
+- Interop test: `CulpeoHttp2Client` ↔ existing `CulpeoStream.AspNetCore` WebSocket server (session layer), and `CulpeoStreamClient` (WS) ↔ `CulpeoHttp2Server`
+- All existing tests must pass; add transport-specific and interop tests
+
 ## Technical Requirements
 
 - Target **net8.0** minimum

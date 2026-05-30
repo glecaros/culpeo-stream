@@ -139,8 +139,14 @@ public:
     // Send a binary (media) frame. Called without the session mutex held.
     virtual void send_binary(std::span<const std::byte> frame) = 0;
 
-    // Close the underlying connection.
-    virtual void close() = 0;
+    // Close the underlying connection with a WebSocket status code and reason.
+    // Standard WebSocket close codes:
+    //   1000 — Normal Closure
+    //   1001 — Going Away
+    //   1002 — Protocol Error  (used for CulpeoStream "protocol-error" events)
+    //   1008 — Policy Violation (used for CulpeoStream "unauthorized"/"auth-expired")
+    // The reason string SHOULD be ≤ 123 bytes (WebSocket RFC 6455 §5.5.1 limit).
+    virtual void close(int code, std::string_view reason) = 0;
 };
 
 // ─── Session configuration ────────────────────────────────────────────────────
