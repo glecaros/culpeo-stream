@@ -1104,7 +1104,7 @@ Session::process_media_frame(const culpeo::message::ParsedHeadersView& f) noexce
             impl_->transition_to_closed_locked();
             lock.unlock();
             impl_->send_close_frame("protocol-error", "Invalid Timestamp header");
-            try { impl_->transport.close(); } catch (...) {}
+            impl_->close_transport("protocol-error", "Invalid Timestamp header");
             return std::unexpected(Error::protocol_error);
         }
         timestamp_us = *ts_parsed;

@@ -294,3 +294,94 @@ No change. The finding was based on a hypothetical misreading of the formula; th
 
 ### Spec Reference
 Section 5.5 (time offset type, PCM sample counting)
+
+## TS-P3-001: ws Library for Server-Side WebSocket
+**Date:** 2026-06-05
+**Phase:** Phase 3
+**Status:** Decided
+
+### Context
+The server package needs a WebSocket server implementation. Options: Node.js 22 built-in WebSocket server (not yet stable/available), `ws` library (mature, widely used), `uWebSockets.js` (higher performance, different API).
+
+### Decision
+Use the `ws` library (`ws@^8`). It provides a stable, well-typed WebSocket server API (`WebSocketServer`) that aligns with the browser WebSocket client API used in Phase 2.
+
+### Tradeoffs
+- `ws` is synchronous/callback-based, adding minor complexity when integrating with async handlers.
+- `uWebSockets.js` would offer better throughput but has a non-standard API and less TypeScript support.
+- `ws` is the obvious choice for a reference implementation.
+
+### Spec Reference
+Phase 3 requirements
+
+## TS-P3-002: Notification Handler Fire-and-Forget Pattern
+**Date:** 2026-06-05
+**Phase:** Phase 3
+**Status:** Decided
+
+### Context
+The core `CulpeoServerSession.onNotification` callback type is `(n: SessionNotification) => void` — it is called synchronously within `receive()` and cannot return a Promise. The server-side handler methods (`onConnected`, `onMedia`, `onEvent`) are async. This creates a mismatch.
+
+### Decision
+Use `void this.handleNotification(n)` to fire the async notification handler without awaiting it. Critical ordering concern: the `init-error` notification fires *before* `dispatch(frame)` in `sendInitErrorAndClose`. Moving `ws.close()` to *after* `session.receive()` returns (in `handleInitMessage`) ensures the init-error frame is always sent before the WebSocket is closed.
+
+### Tradeoffs
+- Application callbacks (`onMedia`, `onEvent`) run asynchronously and may execute out of order if they take different amounts of time. Acceptable for a reference implementation.
+- Ordering is fully correct for session lifecycle events (init, close) because those happen within the init-message handler.
+
+### Spec Reference
+Section 4 (session lifecycle)
+
+## TS-P3-003: Session Store Save Strategy
+**Date:** 2026-06-05
+**Phase:** Phase 3
+**Status:** Decided
+
+### Context
+Session snapshots need to be saved to enable resumption. Options: save after every media frame (expensive), save only on disconnect (may lose recent offsets), save after init-ack + on disconnect.
+
+### Decision
+Save the snapshot twice: (1) immediately after init-ack is sent (makes the session resumable from the start), and (2) on WebSocket close (captures final offsets). This balances correctness with performance.
+
+### Tradeoffs
+- Resume offsets may be slightly stale for high-frequency media streams (no per-frame saves).
+- For a reference implementation this is acceptable; production deployments can subclass or wrap ISessionStore to add periodic saves.
+
+### Spec Reference
+Section 9 (session resumption)
+
+## TS-P3-004: maxMessageBytes via ws maxPayload
+**Date:** 2026-06-05
+**Phase:** Phase 3
+**Status:** Decided
+
+### Context
+The spec requires enforcing a maximum message size to prevent memory exhaustion attacks.
+
+### Decision
+Pass `maxPayload: options.maxMessageBytes ?? 1_048_576` to `WebSocketServer`. The `ws` library enforces this limit automatically, terminating connections that exceed it with WebSocket close code 1009. No application-level checking needed.
+
+### Tradeoffs
+- Enforcement happens at the ws layer before our code sees the message — clean, no parsing required.
+- The default 1 MiB limit is conservative; real deployments may need tuning.
+
+### Spec Reference
+Security requirements; WebSocket framing limits
+
+## TS-P3-005: JsonObject for sendEvent/onEvent Body Type
+**Date:** 2026-06-05
+**Phase:** Phase 3
+**Status:** Decided
+
+### Context
+The task spec defines `sendEvent(eventName: string, body: unknown)` and `onEvent(..., body: unknown)`. Using `unknown` in TypeScript strict mode requires casts before calling the core `SessionBase.sendEvent()` which takes `JsonObject`.
+
+### Decision
+Use `JsonObject` (from `culpeostream`) for `IServerSession.sendEvent` and `ICulpeoStreamHandler.onEvent` body parameters. This is more precise and avoids unsafe casts. The spec's use of `unknown` was a simplified interface description.
+
+### Tradeoffs
+- Callers must construct JSON-serializable bodies, which is the correct protocol constraint.
+- Slightly more opinionated than `unknown`, but avoids runtime errors from non-serializable values.
+
+### Spec Reference
+Section 6 (application event frames)
