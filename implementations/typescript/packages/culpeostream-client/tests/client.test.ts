@@ -12,7 +12,7 @@ import type {
   ConfirmedStreamDeclaration,
   InitAckFrame,
   InitErrorFrame,
-  MediaFrame,
+  MediaMessage,
   ResumeStreamDeclaration,
 } from "culpeostream";
 
@@ -91,7 +91,7 @@ function makeInitErrorText(
 }
 
 function makeMediaFrame(streamId: string): ArrayBuffer {
-  const frame: MediaFrame = {
+  const frame: MediaMessage = {
     kind: "media",
     headers: {
       streamId,
@@ -407,7 +407,7 @@ describe("CulpeoStreamClient — media", () => {
   it("delivers incoming media frames via the 'media' event", async () => {
     const { factory, instances } = makeMockWsFactory();
     const client = new CulpeoStreamClient({ WebSocket: factory });
-    const mediaFrames: MediaFrame[] = [];
+    const mediaFrames: MediaMessage[] = [];
     client.on("media", (f) => mediaFrames.push(f));
 
     const connectP = client.connect("wss://localhost:8443", makeOpts({ streams: makeStreams("output") }));

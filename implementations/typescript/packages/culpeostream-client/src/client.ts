@@ -21,11 +21,11 @@ import {
   serializeFrame,
 } from "culpeostream";
 import type {
-  ApplicationEventFrame,
+  ApplicationEventMessage,
   CloseCode,
   ConfirmedStreamDeclaration,
   InitErrorCode,
-  MediaFrame,
+  MediaMessage,
   ProtocolVersion,
   ResumeStreamDeclaration,
   RttMeasurement,
@@ -69,9 +69,9 @@ export interface ClientEventMap {
   /** Server sent culpeo.close, or the session was rejected with culpeo.init-error. */
   close: ClientCloseReason;
   /** Incoming media frame from the server. */
-  media: MediaFrame;
+  media: MediaMessage;
   /** Incoming application-level event from the server. */
-  event: ApplicationEventFrame;
+  event: ApplicationEventMessage;
   /** A non-fatal runtime error (parse error, unexpected frame type, etc.). */
   error: Error;
   /** RTT measurement from a completed ping/pong exchange. */
@@ -291,7 +291,7 @@ export class CulpeoStreamClient extends TypedEventEmitter<ClientEventMap> {
    */
   public sendEvent(
     event: string,
-    body: ApplicationEventFrame["body"],
+    body: ApplicationEventMessage["body"],
     streamId?: string,
   ): void {
     if (this.session === undefined || this.session.state !== "established") {

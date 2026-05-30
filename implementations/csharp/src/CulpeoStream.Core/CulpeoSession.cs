@@ -27,7 +27,7 @@ public sealed class CulpeoProcessResult
 {
     public static CulpeoProcessResult Empty(CulpeoSessionState state) => new([], false, null, state);
 
-    public CulpeoProcessResult(IReadOnlyList<CulpeoFrame> outboundFrames, bool shouldClose, string? closeCode, CulpeoSessionState state)
+    public CulpeoProcessResult(IReadOnlyList<CulpeoMessage> outboundFrames, bool shouldClose, string? closeCode, CulpeoSessionState state)
     {
         OutboundFrames = outboundFrames;
         ShouldClose = shouldClose;
@@ -35,7 +35,7 @@ public sealed class CulpeoProcessResult
         State = state;
     }
 
-    public IReadOnlyList<CulpeoFrame> OutboundFrames { get; }
+    public IReadOnlyList<CulpeoMessage> OutboundFrames { get; }
 
     public bool ShouldClose { get; }
 
@@ -138,7 +138,7 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
             .Select(stream => new CulpeoStreamInfo(stream.Id, stream.ContentType, stream.Type, stream.Purpose, stream.CurrentOffset, stream.OffsetType))
             .ToList());
 
-    public ValueTask<CulpeoProcessResult> ReceiveAsync(CulpeoFrame frame, CancellationToken cancellationToken = default)
+    public ValueTask<CulpeoProcessResult> ReceiveAsync(CulpeoMessage frame, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
@@ -157,7 +157,7 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         };
     }
 
-    public ValueTask<CulpeoFrame> SendMediaAsync(string streamId, ReadOnlyMemory<byte> payload, long timestamp, CancellationToken cancellationToken = default)
+    public ValueTask<CulpeoMessage> SendMediaAsync(string streamId, ReadOnlyMemory<byte> payload, long timestamp, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         EnsureEstablished();
@@ -172,8 +172,8 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         stream.RecordFrame(offset, server.Options.TimeProvider.GetUtcNow());
         stream.AdvanceOffset(payload.Length);
 
-        return ValueTask.FromResult(new CulpeoFrame(
-            CulpeoFrameKind.Media,
+        return ValueTask.FromResult(new CulpeoMessage(
+            CulpeoMessageKind.Media,
             payload,
             contentType: stream.ContentType,
             streamId: stream.Id,
@@ -181,7 +181,7 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
             timestamp: timestamp));
     }
 
-    public ValueTask<CulpeoFrame> IssueAuthRefreshAsync(CancellationToken cancellationToken = default)
+    public ValueTask<CulpeoMessage> IssueAuthRefreshAsync(CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         EnsureEstablished();
@@ -191,8 +191,8 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         pendingNonce = nonce;
         authChallengeIssuedAt = server.Options.TimeProvider.GetUtcNow();
 
-        return ValueTask.FromResult(new CulpeoFrame(
-            CulpeoFrameKind.Control,
+        return ValueTask.FromResult(new CulpeoMessage(
+            CulpeoMessageKind.Control,
             SerializeJsonBody(writer => writer.WriteString("nonce", nonce)),
             @event: "culpeo.auth-refresh",
             contentType: "application/json"));
@@ -217,9 +217,9 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         return ValueTask.CompletedTask;
     }
 
-    private CulpeoProcessResult HandleInitialFrame(CulpeoFrame frame)
+    private CulpeoProcessResult HandleInitialFrame(CulpeoMessage frame)
     {
-        if (frame.Kind != CulpeoFrameKind.Control || !string.Equals(frame.Event, "culpeo.init", StringComparison.Ordinal))
+        if (frame.Kind != CulpeoMessageKind.Control || !string.Equals(frame.Event, "culpeo.init", StringComparison.Ordinal))
         {
             return CloseWithCloseFrame("protocol-error", "The first frame must be culpeo.init.");
         }
@@ -267,9 +267,9 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         }
     }
 
-    private CulpeoProcessResult HandleEstablishedFrame(CulpeoFrame frame)
+    private CulpeoProcessResult HandleEstablishedFrame(CulpeoMessage frame)
     {
-        if (frame.Kind == CulpeoFrameKind.Media)
+        if (frame.Kind == CulpeoMessageKind.Media)
         {
             return HandleIncomingMedia(frame);
         }
@@ -295,7 +295,7 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         }
     }
 
-    private CulpeoProcessResult HandlePing(CulpeoFrame frame)
+    private CulpeoProcessResult HandlePing(CulpeoMessage frame)
     {
         using var document = JsonDocument.Parse(frame.Body.IsEmpty ? "{}"u8.ToArray() : frame.Body.ToArray());
         if (!document.RootElement.TryGetProperty("ts", out var tsProperty) || !tsProperty.TryGetInt64(out var ts))
@@ -310,8 +310,8 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         }
 
         var serverTs = now.ToUnixTimeMilliseconds() * 1000;
-        var pong = new CulpeoFrame(
-            CulpeoFrameKind.Control,
+        var pong = new CulpeoMessage(
+            CulpeoMessageKind.Control,
             SerializeJsonBody(writer =>
             {
                 writer.WriteNumber("ts", ts);
@@ -323,7 +323,7 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         return new CulpeoProcessResult([pong], false, null, State);
     }
 
-    private CulpeoProcessResult HandleAuthResponse(CulpeoFrame frame)
+    private CulpeoProcessResult HandleAuthResponse(CulpeoMessage frame)
     {
         if (string.IsNullOrWhiteSpace(frame.Authorization))
         {
@@ -347,7 +347,7 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         return CulpeoProcessResult.Empty(State);
     }
 
-    private CulpeoProcessResult HandleClose(CulpeoFrame frame)
+    private CulpeoProcessResult HandleClose(CulpeoMessage frame)
     {
         State = CulpeoSessionState.Closed;
         if (snapshot is not null)
@@ -356,8 +356,8 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
             server.SaveSession(snapshot);
         }
 
-        var close = new CulpeoFrame(
-            CulpeoFrameKind.Control,
+        var close = new CulpeoMessage(
+            CulpeoMessageKind.Control,
             SerializeJsonBody(_ => { }),
             @event: "culpeo.close",
             contentType: "application/json",
@@ -367,7 +367,7 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         return new CulpeoProcessResult([close], true, frame.Code ?? "normal-closure", State);
     }
 
-    private CulpeoProcessResult HandleIncomingMedia(CulpeoFrame frame)
+    private CulpeoProcessResult HandleIncomingMedia(CulpeoMessage frame)
     {
         try
         {
@@ -522,10 +522,10 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
            && ContentTypeUtilities.ContentTypesMatch(stream.ContentType, declaration.ContentType)
            && string.Equals(stream.Purpose, declaration.Purpose, StringComparison.Ordinal);
 
-    private CulpeoFrame CreateInitAckFrame(SessionSnapshot currentSnapshot, string version, int bufferWindow, bool resumption)
+    private CulpeoMessage CreateInitAckFrame(SessionSnapshot currentSnapshot, string version, int bufferWindow, bool resumption)
     {
-        return new CulpeoFrame(
-            CulpeoFrameKind.Control,
+        return new CulpeoMessage(
+            CulpeoMessageKind.Control,
             SerializeJsonBody(writer =>
             {
                 writer.WriteString("version", version);
@@ -574,8 +574,8 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         State = CulpeoSessionState.Closed;
         return new CulpeoProcessResult(
             [
-                new CulpeoFrame(
-                    CulpeoFrameKind.Control,
+                new CulpeoMessage(
+                    CulpeoMessageKind.Control,
                     SerializeJsonBody(_ => { }),
                     @event: "culpeo.close",
                     contentType: "application/json",
@@ -592,8 +592,8 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         State = CulpeoSessionState.Closed;
         return new CulpeoProcessResult(
             [
-                new CulpeoFrame(
-                    CulpeoFrameKind.Control,
+                new CulpeoMessage(
+                    CulpeoMessageKind.Control,
                     body ?? SerializeJsonBody(_ => { }),
                     @event: "culpeo.init-error",
                     contentType: "application/json",
@@ -616,8 +616,8 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
 
         return new CulpeoProcessResult(
             [
-                new CulpeoFrame(
-                    CulpeoFrameKind.Control,
+                new CulpeoMessage(
+                    CulpeoMessageKind.Control,
                     SerializeJsonBody(_ => { }),
                     @event: "culpeo.close",
                     contentType: "application/json",

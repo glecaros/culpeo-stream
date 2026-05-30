@@ -55,13 +55,13 @@ public sealed class IntegrationTests
         using var server = CreateServer(new NoopHandler());
         using var ws = await ConnectAsync(server);
 
-        var response = await FrameHelper.InitSessionAsync(ws);
+        var response = await MessageHelper.InitSessionAsync(ws);
 
         Assert.Equal("culpeo.init-ack", response.Event);
         Assert.NotNull(response.SessionId);
         Assert.NotEmpty(response.SessionId!);
 
-        using var body = FrameHelper.ParseBody(response);
+        using var body = MessageHelper.ParseBody(response);
         Assert.Equal("0.3", body.RootElement.GetProperty("version").GetString());
         var streams = body.RootElement.GetProperty("streams");
         Assert.Equal(1, streams.GetArrayLength());
@@ -76,20 +76,20 @@ public sealed class IntegrationTests
         var bodyBytes = Encoding.UTF8.GetBytes(
             """{"version":"9.9","streams":[{"content_type":"audio/opus","type":"input","offset_type":"message"}]}""");
 
-        var initFrame = new CulpeoFrame(
-            CulpeoFrameKind.Control,
+        var initFrame = new CulpeoMessage(
+            CulpeoMessageKind.Control,
             bodyBytes,
             @event: "culpeo.init",
             authorization: "Bearer tok",
             contentType: "application/json");
 
-        await FrameHelper.SendControlFrameAsync(ws, initFrame);
-        var response = await FrameHelper.ReceiveFrameAsync(ws);
+        await MessageHelper.SendControlFrameAsync(ws, initFrame);
+        var response = await MessageHelper.ReceiveFrameAsync(ws);
 
         Assert.Equal("culpeo.init-error", response.Event);
         Assert.Equal("unsupported-version", response.Code);
 
-        using var body = FrameHelper.ParseBody(response);
+        using var body = MessageHelper.ParseBody(response);
         Assert.True(body.RootElement.TryGetProperty("supported_versions", out var versions));
         Assert.Contains("0.3", versions.EnumerateArray().Select(v => v.GetString()));
     }
@@ -103,15 +103,15 @@ public sealed class IntegrationTests
         var bodyBytes = Encoding.UTF8.GetBytes(
             """{"version":"0.3","streams":[{"content_type":"audio/opus","type":"input","offset_type":"message"}]}""");
 
-        var initFrame = new CulpeoFrame(
-            CulpeoFrameKind.Control,
+        var initFrame = new CulpeoMessage(
+            CulpeoMessageKind.Control,
             bodyBytes,
             @event: "culpeo.init",
             // no Authorization header
             contentType: "application/json");
 
-        await FrameHelper.SendControlFrameAsync(ws, initFrame);
-        var response = await FrameHelper.ReceiveFrameAsync(ws);
+        await MessageHelper.SendControlFrameAsync(ws, initFrame);
+        var response = await MessageHelper.ReceiveFrameAsync(ws);
 
         Assert.Equal("culpeo.init-error", response.Event);
         Assert.Equal("unauthorized", response.Code);
@@ -124,14 +124,14 @@ public sealed class IntegrationTests
         using var ws = await ConnectAsync(server);
 
         // Send a ping before init
-        var pingFrame = new CulpeoFrame(
-            CulpeoFrameKind.Control,
+        var pingFrame = new CulpeoMessage(
+            CulpeoMessageKind.Control,
             Encoding.UTF8.GetBytes("""{"ts":1234567890}"""),
             @event: "culpeo.ping",
             contentType: "application/json");
 
-        await FrameHelper.SendControlFrameAsync(ws, pingFrame);
-        var response = await FrameHelper.ReceiveFrameAsync(ws);
+        await MessageHelper.SendControlFrameAsync(ws, pingFrame);
+        var response = await MessageHelper.ReceiveFrameAsync(ws);
 
         Assert.Equal("culpeo.close", response.Event);
         Assert.Equal("protocol-error", response.Code);
@@ -148,7 +148,7 @@ public sealed class IntegrationTests
         using var server = CreateServer(handler);
         using var ws = await ConnectAsync(server);
 
-        var ack = await FrameHelper.InitSessionAsync(ws);
+        var ack = await MessageHelper.InitSessionAsync(ws);
         Assert.Equal("culpeo.init-ack", ack.Event);
 
         var sessionId = await tcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
@@ -165,19 +165,19 @@ public sealed class IntegrationTests
         using var server = CreateServer(handler);
         using var ws = await ConnectAsync(server);
 
-        var ack = await FrameHelper.InitSessionAsync(ws);
+        var ack = await MessageHelper.InitSessionAsync(ws);
         var streamId = ExtractFirstStreamId(ack);
 
         // Send a binary (media) frame
-        var mediaFrame = new CulpeoFrame(
-            CulpeoFrameKind.Media,
+        var mediaFrame = new CulpeoMessage(
+            CulpeoMessageKind.Media,
             new byte[] { 0x01, 0x02, 0x03, 0x04 },
             contentType: "audio/pcm;rate=16000;channels=1;bits=16",
             streamId: streamId,
             offset: 0,
             timestamp: 0);
 
-        var serializer = new CulpeoFrameSerializer();
+        var serializer = new CulpeoMessageSerializer();
         var bytes = await serializer.SerializeAsync(mediaFrame);
         await ws.SendAsync(bytes.AsMemory(), WebSocketMessageType.Binary, endOfMessage: true, default);
 
@@ -197,16 +197,16 @@ public sealed class IntegrationTests
         using var server = CreateServer(handler);
         using var ws = await ConnectAsync(server);
 
-        await FrameHelper.InitSessionAsync(ws);
+        await MessageHelper.InitSessionAsync(ws);
 
         // Send a custom application event
-        var eventFrame = new CulpeoFrame(
-            CulpeoFrameKind.Control,
+        var eventFrame = new CulpeoMessage(
+            CulpeoMessageKind.Control,
             Encoding.UTF8.GetBytes("""{"text":"hello"}"""),
             @event: "myapp.transcript",
             contentType: "application/json");
 
-        await FrameHelper.SendControlFrameAsync(ws, eventFrame);
+        await MessageHelper.SendControlFrameAsync(ws, eventFrame);
 
         var received = await eventReceived.Task.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.Equal("myapp.transcript", received.EventName);
@@ -225,18 +225,18 @@ public sealed class IntegrationTests
         using var server = CreateServer(handler);
         using var ws = await ConnectAsync(server);
 
-        await FrameHelper.InitSessionAsync(ws);
+        await MessageHelper.InitSessionAsync(ws);
 
         // Send culpeo.close
-        var closeFrame = new CulpeoFrame(
-            CulpeoFrameKind.Control,
+        var closeFrame = new CulpeoMessage(
+            CulpeoMessageKind.Control,
             "{}"u8.ToArray(),
             @event: "culpeo.close",
             contentType: "application/json",
             code: "normal",
             reason: "test done");
 
-        await FrameHelper.SendControlFrameAsync(ws, closeFrame);
+        await MessageHelper.SendControlFrameAsync(ws, closeFrame);
 
         var closeCode = await disconnectTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.NotNull(closeCode);
@@ -250,20 +250,20 @@ public sealed class IntegrationTests
         using var server = CreateServer(new NoopHandler());
         using var ws = await ConnectAsync(server);
 
-        await FrameHelper.InitSessionAsync(ws);
+        await MessageHelper.InitSessionAsync(ws);
 
         var ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1000L;
-        var pingFrame = new CulpeoFrame(
-            CulpeoFrameKind.Control,
+        var pingFrame = new CulpeoMessage(
+            CulpeoMessageKind.Control,
             Encoding.UTF8.GetBytes($"{{\"ts\":{ts}}}"),
             @event: "culpeo.ping",
             contentType: "application/json");
 
-        await FrameHelper.SendControlFrameAsync(ws, pingFrame);
-        var pong = await FrameHelper.ReceiveFrameAsync(ws);
+        await MessageHelper.SendControlFrameAsync(ws, pingFrame);
+        var pong = await MessageHelper.ReceiveFrameAsync(ws);
 
         Assert.Equal("culpeo.pong", pong.Event);
-        using var body = FrameHelper.ParseBody(pong);
+        using var body = MessageHelper.ParseBody(pong);
         Assert.Equal(ts, body.RootElement.GetProperty("ts").GetInt64());
         Assert.True(body.RootElement.TryGetProperty("server_ts", out _));
     }
@@ -299,20 +299,20 @@ public sealed class IntegrationTests
         var bodyBytes = Encoding.UTF8.GetBytes(
             """{"version":"0.3","streams":[{"content_type":"audio/opus","type":"output","offset_type":"message"}]}""");
 
-        var initFrame = new CulpeoFrame(
-            CulpeoFrameKind.Control,
+        var initFrame = new CulpeoMessage(
+            CulpeoMessageKind.Control,
             bodyBytes,
             @event: "culpeo.init",
             authorization: "Bearer tok",
             contentType: "application/json");
 
-        await FrameHelper.SendControlFrameAsync(ws, initFrame);
-        var ack = await FrameHelper.ReceiveFrameAsync(ws);
+        await MessageHelper.SendControlFrameAsync(ws, initFrame);
+        var ack = await MessageHelper.ReceiveFrameAsync(ws);
         Assert.Equal("culpeo.init-ack", ack.Event);
 
         // Wait for server to send and then receive the media frame
-        var mediaFrame = await FrameHelper.ReceiveFrameAsync(ws);
-        Assert.Equal(CulpeoFrameKind.Media, mediaFrame.Kind);
+        var mediaFrame = await MessageHelper.ReceiveFrameAsync(ws);
+        Assert.Equal(CulpeoMessageKind.Media, mediaFrame.Kind);
         Assert.Equal(outputStreamId, mediaFrame.StreamId);
         Assert.Equal(2, mediaFrame.Body.Length);
     }
@@ -332,7 +332,7 @@ public sealed class IntegrationTests
         var tasks = Enumerable.Range(0, sessionCount).Select(async _ =>
         {
             var ws = await ConnectAsync(server);
-            var ack = await FrameHelper.InitSessionAsync(ws);
+            var ack = await MessageHelper.InitSessionAsync(ws);
             return ack.SessionId!;
         }).ToList();
 
@@ -366,15 +366,15 @@ public sealed class IntegrationTests
             ]}
             """);
 
-        var initFrame = new CulpeoFrame(
-            CulpeoFrameKind.Control,
+        var initFrame = new CulpeoMessage(
+            CulpeoMessageKind.Control,
             bodyBytes,
             @event: "culpeo.init",
             authorization: "Bearer tok",
             contentType: "application/json");
 
-        await FrameHelper.SendControlFrameAsync(ws, initFrame);
-        var response = await FrameHelper.ReceiveFrameAsync(ws);
+        await MessageHelper.SendControlFrameAsync(ws, initFrame);
+        var response = await MessageHelper.ReceiveFrameAsync(ws);
 
         Assert.Equal("culpeo.init-error", response.Event);
         Assert.Equal("invalid-streams", response.Code);
@@ -405,9 +405,9 @@ public sealed class IntegrationTests
 
     // ── Private helpers ────────────────────────────────────────────────────────
 
-    private static string ExtractFirstStreamId(CulpeoFrame ack)
+    private static string ExtractFirstStreamId(CulpeoMessage ack)
     {
-        using var body = FrameHelper.ParseBody(ack);
+        using var body = MessageHelper.ParseBody(ack);
         return body.RootElement
             .GetProperty("streams")[0]
             .GetProperty("id")

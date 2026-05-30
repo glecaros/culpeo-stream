@@ -21,11 +21,11 @@ Within the 8 KiB block limit (8192 bytes), an attacker can send headers of the f
 
 ### Attack Scenario
 
-1. Attacker opens a WebSocket connection to a CulpeoStream endpoint backed by `libculpeo-frame`.
+1. Attacker opens a WebSocket connection to a CulpeoStream endpoint backed by `libculpeo-message`.
 2. Attacker sends a frame whose header block is filled with unique short headers up to the 8 KiB block limit (e.g., 1,000–1,100 headers of 7–8 bytes each).
 3. Every call to `parse_headers` on that connection processes all headers; each header triggers 10 string comparisons for reserved header matching.
 4. Repeated rapidly, this provides a ~18× CPU amplification per request relative to what the spec permits.
-5. For TLS-terminating proxies that pass the raw WebSocket frame to `libculpeo-frame`, the attacker pays TLS cost once but generates disproportionate parser CPU load on the server.
+5. For TLS-terminating proxies that pass the raw WebSocket frame to `libculpeo-message`, the attacker pays TLS cost once but generates disproportionate parser CPU load on the server.
 
 ### Impact
 

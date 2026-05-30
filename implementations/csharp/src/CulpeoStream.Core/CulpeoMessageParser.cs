@@ -14,14 +14,14 @@ public sealed class ParseLimits
     public int MaxHeaderValueLength { get; init; } = 4096;
 }
 
-public sealed class CulpeoFrameParser(ParseLimits limits)
+public sealed class CulpeoMessageParser(ParseLimits limits)
 {
     private static readonly SearchValues<byte> ForbiddenHeaderBytes = SearchValues.Create([(byte)'\r', (byte)'\n', (byte)0]);
     private readonly ParseLimits _limits = limits ?? throw new ArgumentNullException(nameof(limits));
 
-    public CulpeoFrameParser() : this(ParseLimits.Default) { }
+    public CulpeoMessageParser() : this(ParseLimits.Default) { }
 
-    public ValueTask<CulpeoFrame> ParseAsync(ReadOnlyMemory<byte> frameBytes, CulpeoFrameKind kind, CancellationToken cancellationToken = default)
+    public ValueTask<CulpeoMessage> ParseAsync(ReadOnlyMemory<byte> frameBytes, CulpeoMessageKind kind, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
@@ -150,7 +150,7 @@ public sealed class CulpeoFrameParser(ParseLimits limits)
             }
         }
 
-        return ValueTask.FromResult(new CulpeoFrame(
+        return ValueTask.FromResult(new CulpeoMessage(
             kind,
             body,
             @event,

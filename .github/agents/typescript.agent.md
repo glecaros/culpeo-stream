@@ -88,9 +88,9 @@ A runtime-agnostic TypeScript implementation of the CulpeoStream protocol:
 - Per-session handler interface with typed stream access
 - Session store interface for resumption (in-memory default, pluggable)
 
-### Phase 4 (Stretch) — WebAssembly Frame Parser
+### Phase 4 (Stretch) — WebAssembly Message Parser
 
-If the TypeScript frame parser shows measurable overhead in profiling, implement the header parser and serializer in C compiled to WASM, with a TypeScript wrapper that falls back to the pure-TS implementation when WASM is unavailable. Coordinate with the C++ Core Agent on whether the C API from `libculpeo-frame` can be compiled with Emscripten.
+If the TypeScript message parser shows measurable overhead in profiling, implement the header parser and serializer in C compiled to WASM, with a TypeScript wrapper that falls back to the pure-TS implementation when WASM is unavailable. Coordinate with the C++ Core Agent on whether the C API from `libculpeo-message` can be compiled with Emscripten.
 
 ## Technical Requirements
 
@@ -98,7 +98,7 @@ If the TypeScript frame parser shows measurable overhead in profiling, implement
 - Runtime-agnostic core — no Node.js or browser APIs in `culpeostream` core
 - `culpeostream/client` uses the standard `WebSocket` API only
 - `culpeostream/server` uses `ws` or Node.js `http`/`https` modules
-- Full type coverage: frame types, event payloads, stream declarations, error codes — all as discriminated unions, not stringly typed
+- Full type coverage: message types, event payloads, stream declarations, error codes — all as discriminated unions, not stringly typed
 - ESM-first with CommonJS compatibility via dual package exports
 - Zero runtime dependencies in the core package
 - Auth tokens must never appear in error messages, logs, or thrown `Error` objects
@@ -108,7 +108,7 @@ If the TypeScript frame parser shows measurable overhead in profiling, implement
 Define the protocol surface as discriminated unions:
 
 ```typescript
-type CulpeoFrame =
+type CulpeoMessage =
   | { event: 'culpeo.init'; headers: InitHeaders; body: InitBody }
   | { event: 'culpeo.init-ack'; headers: InitAckHeaders; body: InitAckBody }
   | { event: 'culpeo.init-error'; headers: InitErrorHeaders; body: InitErrorBody }

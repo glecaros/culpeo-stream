@@ -6,9 +6,9 @@
 
 ### Description
 
-Both the C# `CulpeoFrameSerializer` and the TypeScript `serializeTextFrame`/`serializeBinaryFrame` functions write header values directly into the output without checking for CR, LF, or NUL bytes. The C++ `serialize_frame` correctly validates each header via `valid_header_name` and `valid_header_value` before writing.
+Both the C# `CulpeoMessageSerializer` and the TypeScript `serializeTextFrame`/`serializeBinaryFrame` functions write header values directly into the output without checking for CR, LF, or NUL bytes. The C++ `serialize_frame` correctly validates each header via `valid_header_name` and `valid_header_value` before writing.
 
-**C# `CulpeoFrameSerializer.AppendHeader`:**
+**C# `CulpeoMessageSerializer.AppendHeader`:**
 ```csharp
 private static void AppendHeader(StringBuilder builder, string name, string? value)
 {
@@ -28,7 +28,7 @@ data: `${headers.map(([name, value]) => `${name}: ${value}\r\n`).join("")}\r\n..
 
 In the current session implementations, all outgoing header values are either hardcoded constants (`"culpeo.init-ack"`, `"application/json"`) or generated from cryptographically-safe hex sources. There is no active exploit path in the existing session code. However:
 
-1. The `CulpeoFrame` constructor (C#) and frame type objects (TypeScript) are part of the **public API**. Library consumers who construct frames manually and serialize them with the provided serializers bypass any validation.
+1. The `CulpeoMessage` constructor (C#) and frame type objects (TypeScript) are part of the **public API**. Library consumers who construct frames manually and serialize them with the provided serializers bypass any validation.
 2. In the TypeScript `CulpeoClientSession.sendEvent`, the `event` parameter is a caller-supplied `string` that is written directly into a header:
    ```typescript
    await this.dispatch({ kind: "control", event, headers: { event, ... }, body });
@@ -47,13 +47,13 @@ In the current session implementations, all outgoing header values are either ha
 4. The peer session closes unexpectedly, disrupting the session.
 
 **C# public API misuse:**
-1. A library consumer constructs `new CulpeoFrame(..., reason: userInput)`.
+1. A library consumer constructs `new CulpeoMessage(..., reason: userInput)`.
 2. `userInput` contains `"\r\nCode: auth-expired"`.
 3. Serialization produces a frame with an injected `Code` header that overrides the intended protocol semantics.
 
 ### Impact
 
-Low in the existing session code where headers are fully controlled. Medium if library consumers pass user-controlled strings to `sendEvent` or the `CulpeoFrame` constructor without sanitizing first.
+Low in the existing session code where headers are fully controlled. Medium if library consumers pass user-controlled strings to `sendEvent` or the `CulpeoMessage` constructor without sanitizing first.
 
 ### Proposed Mitigation
 

@@ -3,13 +3,13 @@ using System.Text;
 
 namespace CulpeoStream.Core;
 
-public sealed class CulpeoFrameSerializer
+public sealed class CulpeoMessageSerializer
 {
-    public ValueTask<byte[]> SerializeAsync(CulpeoFrame frame, CancellationToken cancellationToken = default)
+    public ValueTask<byte[]> SerializeAsync(CulpeoMessage frame, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
-        var body = frame.Kind == CulpeoFrameKind.Control && frame.Body.IsEmpty
+        var body = frame.Kind == CulpeoMessageKind.Control && frame.Body.IsEmpty
             ? "{}"u8.ToArray()
             : frame.Body.ToArray();
 

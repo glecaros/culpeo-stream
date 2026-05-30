@@ -8,15 +8,15 @@ namespace CulpeoStream.AspNetCore.Tests;
 /// <summary>
 /// Helpers for sending and receiving CulpeoStream frames over a test WebSocket.
 /// </summary>
-internal static class FrameHelper
+internal static class MessageHelper
 {
-    private static readonly CulpeoFrameParser Parser = new();
-    private static readonly CulpeoFrameSerializer Serializer = new();
+    private static readonly CulpeoMessageParser Parser = new();
+    private static readonly CulpeoMessageSerializer Serializer = new();
 
     /// <summary>Sends a CulpeoStream control frame over the WebSocket.</summary>
     public static async Task SendControlFrameAsync(
         WebSocket ws,
-        CulpeoFrame frame,
+        CulpeoMessage frame,
         CancellationToken ct = default)
     {
         var bytes = await Serializer.SerializeAsync(frame, ct);
@@ -24,7 +24,7 @@ internal static class FrameHelper
     }
 
     /// <summary>Receives and parses the next frame from the WebSocket.</summary>
-    public static async Task<CulpeoFrame> ReceiveFrameAsync(
+    public static async Task<CulpeoMessage> ReceiveFrameAsync(
         WebSocket ws,
         CancellationToken ct = default)
     {
@@ -44,8 +44,8 @@ internal static class FrameHelper
         } while (!result.EndOfMessage);
 
         var kind = result.MessageType == WebSocketMessageType.Text
-            ? CulpeoFrameKind.Control
-            : CulpeoFrameKind.Media;
+            ? CulpeoMessageKind.Control
+            : CulpeoMessageKind.Media;
 
         return await Parser.ParseAsync(ms.ToArray(), kind, ct);
     }
@@ -53,7 +53,7 @@ internal static class FrameHelper
     /// <summary>
     /// Sends a <c>culpeo.init</c> frame and returns the server's response frame.
     /// </summary>
-    public static async Task<CulpeoFrame> InitSessionAsync(
+    public static async Task<CulpeoMessage> InitSessionAsync(
         WebSocket ws,
         string token = "Bearer test-token",
         string version = "0.3",
@@ -65,8 +65,8 @@ internal static class FrameHelper
             ? $@"{{""version"":""{version}"",""streams"":{streamsJson}}}"
             : $@"{{""version"":""{version}"",""streams"":{streamsJson}}}";
 
-        var initFrame = new CulpeoFrame(
-            CulpeoFrameKind.Control,
+        var initFrame = new CulpeoMessage(
+            CulpeoMessageKind.Control,
             Encoding.UTF8.GetBytes(bodyObj),
             @event: "culpeo.init",
             authorization: token,
@@ -78,6 +78,6 @@ internal static class FrameHelper
     }
 
     /// <summary>Reads the JSON body of a control frame as a <see cref="JsonDocument"/>.</summary>
-    public static JsonDocument ParseBody(CulpeoFrame frame)
+    public static JsonDocument ParseBody(CulpeoMessage frame)
         => JsonDocument.Parse(frame.Body.IsEmpty ? "{}"u8.ToArray() : frame.Body.ToArray());
 }

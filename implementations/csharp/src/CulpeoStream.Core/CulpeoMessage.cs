@@ -2,7 +2,7 @@ using System.Text;
 
 namespace CulpeoStream.Core;
 
-public enum CulpeoFrameKind
+public enum CulpeoMessageKind
 {
     Control,
     Media
@@ -23,10 +23,10 @@ public enum CulpeoStreamType
     Duplex
 }
 
-public sealed class CulpeoFrame
+public sealed class CulpeoMessage
 {
-    public CulpeoFrame(
-        CulpeoFrameKind kind,
+    public CulpeoMessage(
+        CulpeoMessageKind kind,
         ReadOnlyMemory<byte> body = default,
         string? @event = null,
         string? contentType = null,
@@ -53,7 +53,7 @@ public sealed class CulpeoFrame
         Code = code;
     }
 
-    public CulpeoFrameKind Kind { get; }
+    public CulpeoMessageKind Kind { get; }
 
     public string? Event { get; }
 

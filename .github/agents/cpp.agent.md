@@ -7,7 +7,7 @@ description: "Builds the C++ core library (libculpeo-message, libculpeo-session)
 
 ## Your Role
 
-You are building the C++ core library for CulpeoStream. This library is the performance foundation of the ecosystem — it will be used directly by native applications and will serve as the basis for Python bindings and potentially a WASM frame parser for the TypeScript implementation. Correctness and performance are equally important. This is not a prototype.
+You are building the C++ core library for CulpeoStream. This library is the performance foundation of the ecosystem — it will be used directly by native applications and will serve as the basis for Python bindings and potentially a WASM message parser for the TypeScript implementation. Correctness and performance are equally important. This is not a prototype.
 
 ## Repository
 
@@ -97,8 +97,8 @@ Provide a WebSocket transport adapter. Evaluate uWebSockets and libwebsockets; d
 
 ### Phase 4 — Python Bindings (`culpeostream-py`)
 
-- Use **pybind11** to expose the session and frame layers
-- `CulpeoSession`, `CulpeoStream`, `CulpeoFrame` Python classes
+- Use **pybind11** to expose the session and message layers
+- `CulpeoSession`, `CulpeoStream`, `CulpeoMessage` Python classes
 - Async-friendly: release the GIL on I/O operations
 - Publish to PyPI as `culpeostream` (local wheel for now)
 

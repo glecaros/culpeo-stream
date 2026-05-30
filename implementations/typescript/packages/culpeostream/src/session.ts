@@ -2,14 +2,14 @@ import { CulpeoError } from "./errors.js";
 import { createRandomId } from "./random.js";
 import { StreamRegistry, validateStreamDeclarations } from "./streams.js";
 import type {
-  ApplicationEventFrame,
+  ApplicationEventMessage,
   AuthRefreshFrame,
   AuthResponseFrame,
   ClientSessionOptions,
   CloseCode,
   CloseFrame,
   ConfirmedStreamDeclaration,
-  CulpeoFrame,
+  CulpeoMessage,
   InitAckFrame,
   InitErrorBody,
   InitErrorCode,
@@ -64,7 +64,7 @@ abstract class SessionBase {
     | ((notification: SessionNotification) => void)
     | undefined;
   protected readonly sendFrame:
-    | ((frame: CulpeoFrame) => void | Promise<void>)
+    | ((frame: CulpeoMessage) => void | Promise<void>)
     | undefined;
   protected readonly pendingPings = new Map<number, number>();
   protected readonly registry: StreamRegistry;
@@ -78,7 +78,7 @@ abstract class SessionBase {
     role: "client" | "server",
     streams: readonly ResumeStreamDeclaration[],
     options: {
-      sendFrame?: (frame: CulpeoFrame) => void | Promise<void>;
+      sendFrame?: (frame: CulpeoMessage) => void | Promise<void>;
       nowMicros?: () => number;
       onRtt?: (measurement: RttMeasurement) => void;
       onNotification?: (notification: SessionNotification) => void;
@@ -143,7 +143,7 @@ abstract class SessionBase {
 
   public async sendEvent(
     event: string,
-    body: ApplicationEventFrame["body"],
+    body: ApplicationEventMessage["body"],
     streamId?: string,
   ): Promise<void> {
     ensureEstablished(this.stateValue);
@@ -230,7 +230,7 @@ abstract class SessionBase {
     this.stateValue = "closed";
   }
 
-  protected handleMedia(frame: CulpeoFrame): void {
+  protected handleMedia(frame: CulpeoMessage): void {
     if (frame.kind !== "media") {
       return;
     }
@@ -243,7 +243,7 @@ abstract class SessionBase {
     notify(this.onNotification, { type: "media", frame });
   }
 
-  protected handleApplication(frame: ApplicationEventFrame): void {
+  protected handleApplication(frame: ApplicationEventMessage): void {
     if (
       frame.headers.streamId !== undefined &&
       !this.registry.has(frame.headers.streamId)
@@ -263,7 +263,7 @@ abstract class SessionBase {
     throw new CulpeoError(code, reason);
   }
 
-  protected async dispatch(frame: CulpeoFrame): Promise<void> {
+  protected async dispatch(frame: CulpeoMessage): Promise<void> {
     await this.sendFrame?.(frame);
   }
 }
@@ -313,7 +313,7 @@ export class CulpeoClientSession extends SessionBase {
     });
   }
 
-  public async receive(frame: CulpeoFrame): Promise<void> {
+  public async receive(frame: CulpeoMessage): Promise<void> {
     if (this.stateValue === "closed") {
       throw new CulpeoError(
         "protocol-error",
@@ -377,7 +377,7 @@ export class CulpeoClientSession extends SessionBase {
         );
         return;
       default:
-        this.handleApplication(frame as ApplicationEventFrame);
+        this.handleApplication(frame as ApplicationEventMessage);
     }
   }
 
@@ -530,7 +530,7 @@ export class CulpeoServerSession extends SessionBase {
       Math.max(1, options.authChallengeTimeoutMs ?? 30_000) * 1_000;
   }
 
-  public async receive(frame: CulpeoFrame): Promise<void> {
+  public async receive(frame: CulpeoMessage): Promise<void> {
     await this.checkTimeouts();
     if (this.stateValue === "closed") {
       throw new CulpeoError(
@@ -585,7 +585,7 @@ export class CulpeoServerSession extends SessionBase {
         );
         return;
       default:
-        this.handleApplication(frame as ApplicationEventFrame);
+        this.handleApplication(frame as ApplicationEventMessage);
     }
   }
 

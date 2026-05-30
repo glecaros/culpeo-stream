@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { parseFrame, serializeFrame } from "../src/frame.js";
+import { parseFrame, serializeFrame } from "../src/message.js";
 import type {
-  ApplicationEventFrame,
+  ApplicationEventMessage,
   InitFrame,
-  MediaFrame,
+  MediaMessage,
 } from "../src/types.js";
 
 describe("frame parser and serializer", () => {
@@ -42,7 +42,7 @@ describe("frame parser and serializer", () => {
   });
 
   it("round-trips media frames with a binary body", () => {
-    const frame: MediaFrame = {
+    const frame: MediaMessage = {
       kind: "media",
       headers: {
         streamId: "s1",
@@ -61,7 +61,7 @@ describe("frame parser and serializer", () => {
   });
 
   it("parses application events as passthrough control frames", () => {
-    const frame: ApplicationEventFrame = {
+    const frame: ApplicationEventMessage = {
       kind: "control",
       event: "x-app.transcript",
       headers: {

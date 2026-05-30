@@ -24,8 +24,8 @@ internal sealed class WebSocketTransportAdapter : ICulpeoStreamSession
     private readonly ICulpeoStreamHandler _handler;
     private readonly CulpeoStreamOptions _options;
     private readonly ILogger _logger;
-    private readonly CulpeoFrameParser _parser = new();
-    private readonly CulpeoFrameSerializer _serializer = new();
+    private readonly CulpeoMessageParser _parser = new();
+    private readonly CulpeoMessageSerializer _serializer = new();
     private readonly SemaphoreSlim _sendLock = new(1, 1);
 
     private DateTimeOffset _sessionStart;
@@ -89,8 +89,8 @@ internal sealed class WebSocketTransportAdapter : ICulpeoStreamSession
         }
 
         var bodyBytes = Encoding.UTF8.GetBytes(string.IsNullOrWhiteSpace(jsonBody) ? "{}" : jsonBody);
-        var frame = new CulpeoFrame(
-            CulpeoFrameKind.Control,
+        var frame = new CulpeoMessage(
+            CulpeoMessageKind.Control,
             bodyBytes,
             @event: eventName,
             contentType: "application/json",
@@ -159,12 +159,12 @@ internal sealed class WebSocketTransportAdapter : ICulpeoStreamSession
                 }
 
                 // ── Parse frame ────────────────────────────────────────────
-                CulpeoFrame frame;
+                CulpeoMessage frame;
                 try
                 {
                     var kind = messageType == WebSocketMessageType.Text
-                        ? CulpeoFrameKind.Control
-                        : CulpeoFrameKind.Media;
+                        ? CulpeoMessageKind.Control
+                        : CulpeoMessageKind.Media;
 
                     frame = await _parser.ParseAsync(messageBytes, kind, cancellationToken)
                         .ConfigureAwait(false);
@@ -201,7 +201,7 @@ internal sealed class WebSocketTransportAdapter : ICulpeoStreamSession
                 // ── Dispatch application-level frames to handler ───────────
                 if (result.State == CulpeoSessionState.Established && !result.ShouldClose)
                 {
-                    if (frame.Kind == CulpeoFrameKind.Media)
+                    if (frame.Kind == CulpeoMessageKind.Media)
                     {
                         var ctx = new CulpeoMediaFrameContext(
                             frame.StreamId!,
@@ -213,7 +213,7 @@ internal sealed class WebSocketTransportAdapter : ICulpeoStreamSession
                         await _handler.OnMediaFrameAsync(this, ctx, cancellationToken)
                             .ConfigureAwait(false);
                     }
-                    else if (frame.Kind == CulpeoFrameKind.Control && IsApplicationEvent(frame.Event))
+                    else if (frame.Kind == CulpeoMessageKind.Control && IsApplicationEvent(frame.Event))
                     {
                         var ctx = new CulpeoEventContext(
                             frame.Event!,
@@ -331,12 +331,12 @@ internal sealed class WebSocketTransportAdapter : ICulpeoStreamSession
         return (result.MessageType, accumulator.ToArray());
     }
 
-    private async Task SendFrameAsync(CulpeoFrame frame, CancellationToken cancellationToken)
+    private async Task SendFrameAsync(CulpeoMessage frame, CancellationToken cancellationToken)
     {
         var bytes = await _serializer.SerializeAsync(frame, cancellationToken)
             .ConfigureAwait(false);
 
-        var messageType = frame.Kind == CulpeoFrameKind.Control
+        var messageType = frame.Kind == CulpeoMessageKind.Control
             ? WebSocketMessageType.Text
             : WebSocketMessageType.Binary;
 
@@ -357,9 +357,9 @@ internal sealed class WebSocketTransportAdapter : ICulpeoStreamSession
         }
     }
 
-    private static CulpeoFrame BuildCloseFrame(string code, string reason)
+    private static CulpeoMessage BuildCloseFrame(string code, string reason)
         => new(
-            CulpeoFrameKind.Control,
+            CulpeoMessageKind.Control,
             "{}"u8.ToArray(),
             @event: "culpeo.close",
             contentType: "application/json",

@@ -6,11 +6,11 @@
 
 ### Description
 
-The fuzz directory (`implementations/cpp/libculpeo-frame/fuzz/`) contains only the harness file `frame_parser_fuzz.cpp`. There is no `corpus/` subdirectory and no seed files of any kind:
+The fuzz directory (`implementations/cpp/libculpeo-message/fuzz/`) contains only the harness file `message_parser_fuzz.cpp`. There is no `corpus/` subdirectory and no seed files of any kind:
 
 ```
 fuzz/
-  frame_parser_fuzz.cpp   ← harness only
+  message_parser_fuzz.cpp   ← harness only
   (no corpus/, no seeds)
 ```
 
@@ -35,7 +35,7 @@ Without seeds, the fuzzer provides much weaker coverage guarantees than intended
 
 ### Proposed Mitigation
 
-1. Create `implementations/cpp/libculpeo-frame/fuzz/corpus/` and add the following seed files (binary content described inline):
+1. Create `implementations/cpp/libculpeo-message/fuzz/corpus/` and add the following seed files (binary content described inline):
 
    - `seed_truncated` — valid header line with no CRLF-CRLF: `Event: culpeo.init\r\n`
    - `seed_overlength_header_block` — header value of exactly 8193 bytes (one over the default limit), terminated with `\r\n\r\n`

@@ -1,24 +1,24 @@
 import { CulpeoError } from "./errors.js";
 import type {
-  ApplicationEventFrame,
+  ApplicationEventMessage,
   AuthRefreshFrame,
   AuthResponseFrame,
   CloseFrame,
-  ControlFrame,
-  CulpeoFrame,
+  ControlMessage,
+  CulpeoMessage,
   InitAckBody,
   InitAckFrame,
   InitBody,
   InitErrorFrame,
   InitFrame,
   JsonObject,
-  MediaFrame,
+  MediaMessage,
   PingFrame,
   PongFrame,
   SerializedBinaryFrame,
   SerializedFrame,
   SerializedTextFrame,
-  TransportFrameType,
+  TransportMessageType,
 } from "./types.js";
 
 const encoder = new TextEncoder();
@@ -173,7 +173,7 @@ function parseJsonObject(bytes: Uint8Array): JsonObject {
   return parsed;
 }
 
-function frameToHeaders(frame: CulpeoFrame): [string, string][] {
+function frameToHeaders(frame: CulpeoMessage): [string, string][] {
   if (frame.kind === "media") {
     return [
       ["Stream-Id", frame.headers.streamId],
@@ -191,7 +191,7 @@ function frameToHeaders(frame: CulpeoFrame): [string, string][] {
   return controlFrameToHeaders(frame);
 }
 
-function controlFrameToHeaders(frame: ControlFrame): [string, string][] {
+function controlFrameToHeaders(frame: ControlMessage): [string, string][] {
   if (frame.event === "culpeo.init") {
     const initFrame = frame as InitFrame;
     return [
@@ -264,7 +264,7 @@ function controlFrameToHeaders(frame: ControlFrame): [string, string][] {
     ];
   }
 
-  const applicationFrame = frame as ApplicationEventFrame;
+  const applicationFrame = frame as ApplicationEventMessage;
   return [
     ["Event", applicationFrame.event],
     ...(applicationFrame.headers.streamId !== undefined
@@ -283,7 +283,7 @@ function controlFrameToHeaders(frame: ControlFrame): [string, string][] {
 }
 
 function serializeTextFrame(
-  frame: Exclude<CulpeoFrame, MediaFrame>,
+  frame: Exclude<CulpeoMessage, MediaMessage>,
 ): SerializedTextFrame {
   const headers = frameToHeaders(frame);
   return {
@@ -292,7 +292,7 @@ function serializeTextFrame(
   };
 }
 
-function serializeBinaryFrame(frame: MediaFrame): SerializedBinaryFrame {
+function serializeBinaryFrame(frame: MediaMessage): SerializedBinaryFrame {
   const headers = `${frameToHeaders(frame)
     .map(([name, value]) => `${name}: ${value}\r\n`)
     .join("")}\r\n`;
@@ -303,7 +303,7 @@ function serializeBinaryFrame(frame: MediaFrame): SerializedBinaryFrame {
   return { frameType: "binary", data: combined };
 }
 
-export function serializeFrame(frame: CulpeoFrame): SerializedFrame {
+export function serializeFrame(frame: CulpeoMessage): SerializedFrame {
   return frame.kind === "media"
     ? serializeBinaryFrame(frame)
     : serializeTextFrame(frame);
@@ -312,7 +312,7 @@ export function serializeFrame(frame: CulpeoFrame): SerializedFrame {
 function parseControlFrame(
   headers: Map<string, string>,
   body: JsonObject,
-): CulpeoFrame {
+): CulpeoMessage {
   const event = headers.get("event");
   if (event === undefined) {
     throw new CulpeoError(
@@ -440,7 +440,7 @@ function parseControlFrame(
       return frame;
     }
     default: {
-      const frame: ApplicationEventFrame = {
+      const frame: ApplicationEventMessage = {
         kind: "control",
         event,
         headers: {
@@ -461,9 +461,9 @@ function parseControlFrame(
 
 export function parseFrame(
   input: string | Uint8Array,
-  frameType: TransportFrameType,
+  frameType: TransportMessageType,
   limits?: Partial<ParseLimits>,
-): CulpeoFrame {
+): CulpeoMessage {
   const bytes = toUint8Array(input);
   const parseLimits: ParseLimits = { ...defaultParseLimits, ...limits };
   const headerBoundary = findHeaderBoundary(
@@ -488,7 +488,7 @@ export function parseFrame(
         "Media frames require Stream-Id, Offset, and Content-Type headers.",
       );
     }
-    const frame: MediaFrame = {
+    const frame: MediaMessage = {
       kind: "media",
       headers: {
         streamId,

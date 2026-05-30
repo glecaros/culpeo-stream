@@ -14,7 +14,7 @@ The actual code in both implementations **silently drops** excess pings without 
 
 **C# (`CulpeoSession.cs`):**
 ```csharp
-private CulpeoProcessResult HandlePing(CulpeoFrame frame)
+private CulpeoProcessResult HandlePing(CulpeoMessage frame)
 {
     ...
     if (!TryTrackPing(now))
