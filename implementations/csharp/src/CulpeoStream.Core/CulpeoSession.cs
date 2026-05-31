@@ -805,9 +805,11 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
     };
 }
 
-internal readonly record struct ParsedContentType(string MediaType, IReadOnlyDictionary<string, string> Parameters);
+/// <summary>Parsed components of a MIME content-type string.</summary>
+public readonly record struct ParsedContentType(string MediaType, IReadOnlyDictionary<string, string> Parameters);
 
-internal static class ContentTypeUtilities
+/// <summary>Utilities for parsing and matching MIME content-type strings (§6.2).</summary>
+public static class ContentTypeUtilities
 {
     public static bool ContentTypesMatch(string declaredContentType, string actualContentType)
     {

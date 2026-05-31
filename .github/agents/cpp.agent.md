@@ -95,9 +95,24 @@ public:
 
 Provide a WebSocket transport adapter. Evaluate uWebSockets and libwebsockets; document your choice in DECISIONS.md with reasoning.
 
-### Phase 4 — Python Bindings (`culpeostream-py`)
+### Phase 4 — HTTP/2 Transport Adapter (`libculpeo-transport-h2`)
 
-- Use **pybind11** to expose the session and message layers
+Implement an HTTP/2 transport adapter to prove the transport-agnostic design is real and not just theoretical. This phase makes `ITransport` meaningful by providing two concrete, production-quality transports.
+
+- New library: `implementations/cpp/libculpeo-transport-h2/`
+- Use **nghttp2** (via CMake FetchContent) as the HTTP/2 engine
+- Implement `ITransport` using Addendum C of the spec:
+  - 1-byte type octet prefix (`0x01` control, `0x02` media)
+  - 4-byte big-endian length-prefix framing
+  - TLS required (use OpenSSL or BoringSSL)
+- `CulpeoH2Client` — initiates an HTTP/2 POST to a server, sends/receives CulpeoStream frames
+- `CulpeoH2Server` — accepts HTTP/2 connections, dispatches to `ISessionHandler`
+- Interop test: connect `CulpeoH2Client` to the WebSocket server (using the session layer directly), verify full frame exchange
+- All tests pass under ASan+UBSan
+
+### Phase 5 — Python Bindings (`culpeostream-py`)
+
+- Use **pybind11** to expose the session and message layers (both WebSocket and HTTP/2 transports)
 - `CulpeoSession`, `CulpeoStream`, `CulpeoMessage` Python classes
 - Async-friendly: release the GIL on I/O operations
 - Publish to PyPI as `culpeostream` (local wheel for now)
@@ -112,6 +127,26 @@ Provide a WebSocket transport adapter. Evaluate uWebSockets and libwebsockets; d
 - Thread safety: session state machine must be safe for concurrent send/receive from separate threads
 - Sanitizer-clean: builds must pass under AddressSanitizer and UndefinedBehaviorSanitizer
 - Fuzz testing for the frame parser using libFuzzer — the parser must handle arbitrary byte sequences without crashing or undefined behavior
+
+## Concurrency Guidelines
+
+**Prefer atomics over locks.** Only use `std::mutex` when the problem genuinely cannot be solved with atomic operations:
+
+- **Use `std::atomic<T>`** for state flags, reference counting, shutdown guards, and "already initialized" checks. Prefer `std::memory_order_acquire/release` over `seq_cst` unless you specifically need total order.
+- **Use `std::mutex`** only when you must hold the lock across non-atomic compound operations (e.g. sending a frame where serialization + write must be uninterrupted).
+- **Never hold a mutex across a blocking I/O call** — use a staging buffer, release the lock, then dispatch.
+- Document the reason for each mutex in a comment. If you can't explain why an atomic wouldn't suffice, use an atomic.
+
+Examples:
+```cpp
+// ✅ Atomic — shutdown guard, non-blocking
+std::shared_ptr<std::atomic<bool>> alive = std::make_shared<std::atomic<bool>>(true);
+if (!alive->load(std::memory_order_acquire)) return; // fast-path, no lock
+
+// ✅ Mutex — compound read-modify-write on multiple fields
+std::lock_guard lock(mu_);
+// serialize frame into buffer, update sequence number, enqueue — must be atomic
+```
 
 ## Performance Targets
 

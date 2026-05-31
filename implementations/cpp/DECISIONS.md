@@ -498,3 +498,171 @@ if (value.size() > 1 && value[0] == '0') return std::unexpected(Error::invalid_c
 
 ### Spec Reference
 Section 6.1 (audio/pcm parameter semantics), CPP-002 review finding
+
+## Phase 3: WebSocket library choice — uWebSockets over libwebsockets
+**Date:** 2026-05-31
+**Phase:** Phase 3 — Transport Adapter
+**Status:** Decided
+
+### Context
+Phase 3 requires a concrete WebSocket transport adapter.  Two candidates were evaluated:
+
+**uWebSockets v20 (µWS)**
+- License: Apache 2.0 — permissive, compatible with commercial use without binary linkage obligations.
+- API: Pure C++17/20 header-only library backed by uSockets (C event loop).  Typed generics (`uWS::WebSocket<SSL, isServer>*`) fit naturally with C++ session layers.
+- Performance: Routinely benchmarked at the top of WebSocket server benchmarks (>1M msg/s on commodity hardware).
+- TLS: Handled at the App level (`uWS::SSLApp` vs `uWS::App`); per-connection handles are TLS-transparent.
+- Dependency footprint: uWebSockets headers (C++) + uSockets (C, ~5 source files).
+- Drawback: Not thread-safe — all operations on a `WebSocket*` must happen on the owning event-loop thread.
+
+**libwebsockets**
+- License: LGPL 2.1 (with exceptions) — requires careful handling in proprietary products; static linking triggers stronger copy-left obligations.
+- API: C API with callback-driven dispatch; C++ wrappers are unofficial.
+- TLS: Well-supported via OpenSSL, mbedTLS, wolfSSL.
+- Dependency footprint: Heavier — full C library with many optional protocol plugins.
+- Drawback: C API is significantly more verbose to integrate from a C++ session layer; error handling requires checking return codes on every lws function.
+
+### Decision
+**uWebSockets**.  Primary reasons:
+1. **License** — Apache 2.0 avoids LGPL linkage obligations.
+2. **C++ API** — generic WebSocket handle integrates cleanly with C++ callback patterns; the `uws_adapter.hpp` factory is 30 lines.
+3. **Performance** — consistent with the Phase 1 (<100 ns/frame) design target; uWS adds negligible overhead per send.
+4. **Header-only C++ layer** — the C++ headers are included as an INTERFACE CMake target (no extra compilation); only uSockets needs compiling.
+
+### Tradeoffs
+- The event-loop thread-affinity constraint requires off-loop sends to be deferred via `uWS::Loop::get()->defer()`.  `uws_adapter.hpp` handles this transparently.
+- uSockets must be built separately and linked into the final binary.  The `culpeo_transport_ws` library itself does NOT link against uSockets, keeping the core transport library lean and dependency-free.  Users who want the uWS backend include `<culpeo/uws_adapter.hpp>` and link uSockets themselves.
+
+### Spec Reference
+Addendum B — WebSocket Binding; C++ agent instructions Phase 3
+
+## Phase 3: WsTransport design — callback injection over direct WebSocket coupling
+**Date:** 2026-05-31
+**Phase:** Phase 3 — Transport Adapter
+**Status:** Decided
+
+### Context
+`ITransport` is an abstract interface.  The concrete `WsTransport` implementation must:
+1. Work with any WebSocket library (not just uWebSockets).
+2. Be unit-testable without a running WebSocket server.
+3. Be thread-safe for concurrent sends (session layer may call `send_media` from worker threads).
+
+Options considered:
+1. Template the transport on the WebSocket type (`WsTransport<uWS::WebSocket<SSL, true>>`)
+2. Erase the WebSocket handle behind another abstract interface (`IWsConnection`)
+3. Inject `std::function` callbacks for send_text, send_binary, and close
+
+### Decision
+Option 3 — `std::function` callback injection.
+
+```cpp
+class WsTransport : public ITransport {
+    std::function<void(std::span<const std::byte>)> send_text_fn_;
+    std::function<void(std::span<const std::byte>)> send_binary_fn_;
+    std::function<void(int, std::string_view)>      close_fn_;
+    std::mutex mu_;  // serializes all three operations
+};
+```
+
+A separate `uws_adapter.hpp` header provides a `make_uws_transport<SSL>(ws)` factory that creates the correct lambdas for a uWebSockets handle.  Tests pass mock lambdas with zero boilerplate.
+
+### Tradeoffs
+- `std::function` has a small indirect call overhead vs a virtual dispatch through a second interface.  For WebSocket sends (dominated by syscall cost), this is entirely negligible.
+- The callback approach means `WsTransport` cannot introspect the underlying connection state (e.g., is the socket still open?).  For the current API surface this is not needed; the session layer tracks its own state.
+- `std::function` copies of spans are not made automatically — the buffer passed to the callback is only valid for the call duration.  `uws_adapter.hpp` copies into a `std::vector<std::byte>` before deferring to the event loop; tests that inspect data synchronously are safe.
+
+### Spec Reference
+C++ agent instructions Phase 3 — ITransport interface, thread-safety requirements
+
+## Phase 3: ITransport::close() signature — integer WebSocket code + reason
+**Date:** 2026-05-31
+**Phase:** Phase 3 — Transport Adapter
+**Status:** Decided
+
+### Context
+The original `ITransport::close()` carried no arguments.  For a WebSocket transport, the close frame must carry a numeric status code (RFC 6455 §7.4.1) and an optional reason string.  Adding these makes the transport responsible for sending a well-formed WebSocket close frame rather than relying on the library's default.
+
+CulpeoStream uses string close codes ("normal", "protocol-error", "unauthorized", etc.) internally; these must be mapped to WebSocket integer codes.
+
+### Decision
+Updated `ITransport::close()` to:
+```cpp
+virtual void close(int code, std::string_view reason) = 0;
+```
+
+Added `to_ws_close_code(std::string_view culpeo_code)` as a private static helper in `Session::Impl`, and a `close_transport(culpeo_code, reason)` wrapper that calls it.  All 18 call sites in `session.cpp` were updated.
+
+Mapping:
+- `"normal"` → 1000 (Normal Closure)
+- `"unauthorized"` / `"auth-expired"` / `"auth-failed"` → 1008 (Policy Violation)
+- All other codes (`"protocol-error"`, `"version-unsupported"`, etc.) → 1002 (Protocol Error)
+
+The reason string passed to the transport is the same human-readable reason already present in the corresponding `culpeo.close` or `culpeo.init-error` protocol frame.
+
+### Tradeoffs
+Existing users of `ITransport` must update their `close()` override (one-line change: add `int code, std::string_view reason` parameters).  The `MockTransport` in the test suite was updated accordingly and now also captures `close_code` and `close_reason` for assertions.
+
+### Spec Reference
+RFC 6455 §7.4.1; Addendum B §B.3; C++ agent instructions Phase 3
+
+## Atomics-first concurrency policy
+**Date:** 2026-05-31
+**Phase:** Cross-cutting
+**Status:** Decided
+
+### Context
+Phase 3 introduced concurrency requirements in the transport layer (WsTransport mutex, uws_adapter shutdown flag). There was a tendency to use `std::mutex` broadly, even for simple boolean shutdown guards where a `std::atomic<bool>` suffices.
+
+### Decision
+Prefer `std::atomic<T>` for state flags, shutdown guards, and "already initialized" checks. Only use `std::mutex` when holding it across compound operations that must be uninterrupted (e.g. serializing a frame and appending it to a send queue atomically). Document the reason for each mutex at the declaration site.
+
+### Tradeoffs
+Atomics are cheaper (no kernel involvement, no contention sleep), but cannot atomically update two fields together. For single-field guards or flags, atomics are strictly superior. Mutexes remain appropriate for protecting multi-field invariants.
+
+### Spec Reference
+N/A (implementation policy)
+
+## Phase 3 review fixes: alive flag, exception swallowing, close-code mapping, reason sanitization
+**Date:** 2026-05-31
+**Phase:** Phase 3 — Transport Adapter
+**Status:** Decided
+
+### Context
+Phase 3 review (CPP-P3-001 through CPP-P3-004, SEC-017) identified five issues in `libculpeo-transport-ws`:
+
+1. **CPP-P3-001** — All `loop->defer()` lambdas in `uws_adapter.hpp` captured raw `uWS::Loop*` and `uWS::WebSocket*` without guarding against the socket/loop being destroyed before the deferred callback fired (use-after-free / UB on shutdown).
+2. **CPP-P3-002** — `std::function` callbacks invoked in `send_text`, `send_binary`, `close` could throw, causing an unhandled exception to propagate out of `ITransport` method calls, potentially crashing the event-loop thread.
+3. **CPP-P3-003** — `to_ws_close_code()` mapped `"server-shutdown"` and `"idle-timeout"` to RFC 6455 code 1002 (Protocol Error) rather than 1001 (Going Away), which misrepresents the close reason to the peer.
+4. **CPP-P3-004** — `Session` constructor and `uws_adapter.hpp` usage comment did not document the requirement that `ITransport` must outlive the `Session` instance, causing subtle lifetime bugs if the teardown order was wrong.
+5. **SEC-017** — `WsTransport::close()` passed the reason string directly to the callback without enforcing RFC 6455 §5.5.1 constraints: reason ≤ 123 bytes and no ASCII control characters.
+
+### Decision
+
+**CPP-P3-001 (`uws_adapter.hpp`):**
+`make_uws_transport()` now creates a `shared_ptr<atomic<bool>> alive` flag (initialized `true`) and captures it in every lambda. Each lambda guards with `alive->load(acquire)` before calling `loop->defer()`, and the inner defer lambda guards again before touching `ws`. The flag is returned to the caller as `UwsTransportResult::alive`. The `.close` handler MUST store it and call `alive->store(false, release)` at the very start, BEFORE resetting session or transport. The usage example in the file header was updated with the complete, correct shutdown sequence.
+
+**CPP-P3-002 (`transport_ws.cpp`):**
+All three `WsTransport` methods now wrap their callback invocations in `try { ... } catch (...) {}`. Transport-level exceptions are non-fatal: logging would require a logger dependency; silencing is safe because the session layer already has a best-effort close contract.
+
+**CPP-P3-003 (`session.cpp` `to_ws_close_code`):**
+Added a new branch before the catch-all `return 1002`:
+```cpp
+if (culpeo_code == "server-shutdown" || culpeo_code == "idle-timeout") return 1001;
+```
+
+**CPP-P3-004 (`session.hpp`, `uws_adapter.hpp`):**
+Added a Doxygen `@param transport` comment to the `Session` constructor explaining the lifetime requirement. Updated `uws_adapter.hpp` usage example to document the required Session-before-Transport teardown order.
+
+**SEC-017 (`transport_ws.cpp` `WsTransport::close`):**
+Before invoking the close callback:
+1. Truncate reason to 123 bytes if longer (RFC 6455 §5.5.1: max payload 125 bytes minus 2-byte status code).
+2. Replace all bytes with `unsigned char < 0x20` (except `\t`) with `'?'` to neutralise `\r\n` injection and other control characters.
+Full UTF-8 validation was not added in this pass (the RFC does not prohibit multi-byte sequences with values ≥ 0x80; stripping control bytes is the minimum required fix). A follow-up can add a proper UTF-8 validator.
+
+### Tradeoffs
+- The `UwsTransportResult` struct is a breaking API change vs. the original `std::unique_ptr<WsTransport>` return type, but no production callers exist yet and the change forces correct shutdown discipline on all future users.
+- Swallowing all exceptions in send/close loses observability but avoids crashing the event-loop thread; higher-level health monitoring (e.g. session on_error callback) is the correct place to surface errors.
+- Truncating the close reason at 123 bytes is lossy but safe; long reasons are usually diagnostic text where the first 123 bytes retain context.
+
+### Spec Reference
+RFC 6455 §5.5.1, §7.4.1; CPP-P3-001 through CPP-P3-004; SEC-017

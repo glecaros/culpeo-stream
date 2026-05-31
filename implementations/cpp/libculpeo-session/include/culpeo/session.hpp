@@ -139,8 +139,14 @@ public:
     // Send a binary (media) frame. Called without the session mutex held.
     virtual void send_binary(std::span<const std::byte> frame) = 0;
 
-    // Close the underlying connection.
-    virtual void close() = 0;
+    // Close the underlying connection with a WebSocket status code and reason.
+    // Standard WebSocket close codes:
+    //   1000 — Normal Closure
+    //   1001 — Going Away
+    //   1002 — Protocol Error  (used for CulpeoStream "protocol-error" events)
+    //   1008 — Policy Violation (used for CulpeoStream "unauthorized"/"auth-expired")
+    // The reason string SHOULD be ≤ 123 bytes (WebSocket RFC 6455 §5.5.1 limit).
+    virtual void close(int code, std::string_view reason) = 0;
 };
 
 // ─── Session configuration ────────────────────────────────────────────────────
@@ -201,7 +207,16 @@ struct SessionCallbacks {
 
 class Session {
 public:
-    // Construct a fresh session (no prior state — server-side for new connections).
+    /// Construct a session (server-side, for new or resuming connections).
+    ///
+    /// @param transport   Transport used for all outgoing frames.
+    ///                    MUST outlive this Session instance.
+    ///                    Typical usage: destroy Session before transport
+    ///                    in the WebSocket close handler — see uws_adapter.hpp
+    ///                    for the required shutdown sequence.
+    /// @param callbacks   Application-provided event hooks.
+    /// @param config      Protocol configuration (timeouts, sizes, etc.).
+    /// @param prior_state Optional persisted state for session resumption.
     explicit Session(
         ITransport& transport,
         SessionCallbacks callbacks = {},

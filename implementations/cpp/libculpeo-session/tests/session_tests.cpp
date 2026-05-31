@@ -26,6 +26,8 @@ struct MockTransport : ITransport {
     std::vector<std::vector<std::byte>> text_sent;
     std::vector<std::vector<std::byte>> binary_sent;
     bool closed{false};
+    int close_code{0};
+    std::string close_reason;
 
     void send_text(std::span<const std::byte> frame) override {
         std::lock_guard<std::mutex> lock(mu);
@@ -35,9 +37,11 @@ struct MockTransport : ITransport {
         std::lock_guard<std::mutex> lock(mu);
         binary_sent.emplace_back(frame.begin(), frame.end());
     }
-    void close() override {
+    void close(int code, std::string_view reason) override {
         std::lock_guard<std::mutex> lock(mu);
         closed = true;
+        close_code = code;
+        close_reason = std::string(reason);
     }
 
     std::size_t text_count() const {

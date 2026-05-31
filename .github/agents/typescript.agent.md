@@ -88,7 +88,20 @@ A runtime-agnostic TypeScript implementation of the CulpeoStream protocol:
 - Per-session handler interface with typed stream access
 - Session store interface for resumption (in-memory default, pluggable)
 
-### Phase 4 (Stretch) — WebAssembly Message Parser
+### Phase 4 — HTTP/2 Transport (`culpeostream-http2`)
+
+Implement an HTTP/2 transport to validate the transport-agnostic design with a second concrete transport. Uses Node.js `http2` module (server) and `node:http2` client session.
+
+- New package: `packages/culpeostream-http2/`
+- `createCulpeoHttp2Server(options)` — wraps `http2.createSecureServer`, accepts HTTP/2 POST connections, dispatches CulpeoStream sessions
+- `CulpeoHttp2Client` — opens an HTTP/2 request stream, sends/receives CulpeoStream frames
+- Frame framing per Addendum C of the spec: 1-byte type octet + 4-byte big-endian length prefix
+- TLS required; `allowInsecure` opt-in for development (h2c)
+- Shares `ICulpeoStreamHandler` and `ISessionStore` interfaces from `culpeostream-server`
+- Interop tests: `CulpeoHttp2Client` ↔ `culpeostream-server` (WebSocket) and `CulpeoStreamClient` (WS) ↔ `createCulpeoHttp2Server`
+- All existing 74+ tests must pass; add HTTP/2-specific and interop tests
+
+### Phase 5 (Stretch) — WebAssembly Message Parser
 
 If the TypeScript message parser shows measurable overhead in profiling, implement the header parser and serializer in C compiled to WASM, with a TypeScript wrapper that falls back to the pure-TS implementation when WASM is unavailable. Coordinate with the C++ Core Agent on whether the C API from `libculpeo-message` can be compiled with Emscripten.
 

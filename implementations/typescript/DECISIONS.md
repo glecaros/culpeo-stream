@@ -294,3 +294,196 @@ No change. The finding was based on a hypothetical misreading of the formula; th
 
 ### Spec Reference
 Section 5.5 (time offset type, PCM sample counting)
+
+## TS-P3-001: ws Library for Server-Side WebSocket
+**Date:** 2026-06-05
+**Phase:** Phase 3
+**Status:** Decided
+
+### Context
+The server package needs a WebSocket server implementation. Options: Node.js 22 built-in WebSocket server (not yet stable/available), `ws` library (mature, widely used), `uWebSockets.js` (higher performance, different API).
+
+### Decision
+Use the `ws` library (`ws@^8`). It provides a stable, well-typed WebSocket server API (`WebSocketServer`) that aligns with the browser WebSocket client API used in Phase 2.
+
+### Tradeoffs
+- `ws` is synchronous/callback-based, adding minor complexity when integrating with async handlers.
+- `uWebSockets.js` would offer better throughput but has a non-standard API and less TypeScript support.
+- `ws` is the obvious choice for a reference implementation.
+
+### Spec Reference
+Phase 3 requirements
+
+## TS-P3-002: Notification Handler Fire-and-Forget Pattern
+**Date:** 2026-06-05
+**Phase:** Phase 3
+**Status:** Decided
+
+### Context
+The core `CulpeoServerSession.onNotification` callback type is `(n: SessionNotification) => void` — it is called synchronously within `receive()` and cannot return a Promise. The server-side handler methods (`onConnected`, `onMedia`, `onEvent`) are async. This creates a mismatch.
+
+### Decision
+Use `void this.handleNotification(n)` to fire the async notification handler without awaiting it. Critical ordering concern: the `init-error` notification fires *before* `dispatch(frame)` in `sendInitErrorAndClose`. Moving `ws.close()` to *after* `session.receive()` returns (in `handleInitMessage`) ensures the init-error frame is always sent before the WebSocket is closed.
+
+### Tradeoffs
+- Application callbacks (`onMedia`, `onEvent`) run asynchronously and may execute out of order if they take different amounts of time. Acceptable for a reference implementation.
+- Ordering is fully correct for session lifecycle events (init, close) because those happen within the init-message handler.
+
+### Spec Reference
+Section 4 (session lifecycle)
+
+## TS-P3-003: Session Store Save Strategy
+**Date:** 2026-06-05
+**Phase:** Phase 3
+**Status:** Decided
+
+### Context
+Session snapshots need to be saved to enable resumption. Options: save after every media frame (expensive), save only on disconnect (may lose recent offsets), save after init-ack + on disconnect.
+
+### Decision
+Save the snapshot twice: (1) immediately after init-ack is sent (makes the session resumable from the start), and (2) on WebSocket close (captures final offsets). This balances correctness with performance.
+
+### Tradeoffs
+- Resume offsets may be slightly stale for high-frequency media streams (no per-frame saves).
+- For a reference implementation this is acceptable; production deployments can subclass or wrap ISessionStore to add periodic saves.
+
+### Spec Reference
+Section 9 (session resumption)
+
+## TS-P3-004: maxMessageBytes via ws maxPayload
+**Date:** 2026-06-05
+**Phase:** Phase 3
+**Status:** Decided
+
+### Context
+The spec requires enforcing a maximum message size to prevent memory exhaustion attacks.
+
+### Decision
+Pass `maxPayload: options.maxMessageBytes ?? 1_048_576` to `WebSocketServer`. The `ws` library enforces this limit automatically, terminating connections that exceed it with WebSocket close code 1009. No application-level checking needed.
+
+### Tradeoffs
+- Enforcement happens at the ws layer before our code sees the message — clean, no parsing required.
+- The default 1 MiB limit is conservative; real deployments may need tuning.
+
+### Spec Reference
+Security requirements; WebSocket framing limits
+
+## TS-P3-005: JsonObject for sendEvent/onEvent Body Type
+**Date:** 2026-06-05
+**Phase:** Phase 3
+**Status:** Decided
+
+### Context
+The task spec defines `sendEvent(eventName: string, body: unknown)` and `onEvent(..., body: unknown)`. Using `unknown` in TypeScript strict mode requires casts before calling the core `SessionBase.sendEvent()` which takes `JsonObject`.
+
+### Decision
+Use `JsonObject` (from `culpeostream`) for `IServerSession.sendEvent` and `ICulpeoStreamHandler.onEvent` body parameters. This is more precise and avoids unsafe casts. The spec's use of `unknown` was a simplified interface description.
+
+### Tradeoffs
+- Callers must construct JSON-serializable bodies, which is the correct protocol constraint.
+- Slightly more opinionated than `unknown`, but avoids runtime errors from non-serializable values.
+
+### Spec Reference
+Section 6 (application event frames)
+
+## TS-P3-001 — WebSocket listener teardown on connection close
+**Date:** 2026-05-31
+**Phase:** Phase 3 (review fixes)
+**Status:** Decided
+
+### Context
+`ServerConnection` registered `message`, `close`, and `error` listeners on the `ws.WebSocket` in its constructor but never explicitly removed them in `handleWsClose()`. Even after the socket reaches the `CLOSED` state, the `ws` library's internal listener arrays hold references to the closures, preventing garbage-collection of the `ServerConnection` instance and its associated session state.
+
+### Decision
+At the end of `handleWsClose()`, after calling `onClose()`, explicitly call `this.ws.removeAllListeners('message')`, `this.ws.removeAllListeners('close')`, and `this.ws.removeAllListeners('error')`.
+
+### Tradeoffs
+Has no effect on correctness (the socket is already closed by this point) but ensures deterministic GC of per-session state. Small extra code; zero risk.
+
+### Spec Reference
+N/A (implementation quality / memory management)
+
+## TS-P3-002 — Handler errors surface via optional onError callback
+**Date:** 2026-05-31
+**Phase:** Phase 3 (review fixes)
+**Status:** Decided
+
+### Context
+Previously, exceptions thrown by `handler.onMedia` and `handler.onEvent` were silently swallowed with a comment. Application developers had no way to observe these errors without patching the handler themselves.
+
+### Decision
+Add optional `onError?(session, error): Promise<void>` to `ICulpeoStreamHandler`. In the `media` and `application-event` catch blocks of `handleNotification()`, call `handler.onError` if provided, or fall back to `console.warn`. The session is never closed as a result — handler errors are non-fatal.
+
+### Tradeoffs
+Opt-in design keeps existing handlers valid (backward compatible). The fallback `console.warn` ensures operator visibility when `onError` is absent. Auth tokens must not appear in the thrown error — documented.
+
+### Spec Reference
+N/A (server API surface)
+
+## TS-P3-003 — LRU eviction replaces insertion-order eviction in InMemorySessionStore
+**Date:** 2026-05-31
+**Phase:** Phase 3 (review fixes)
+**Status:** Decided
+
+### Context
+The original store evicted the oldest-inserted entry when at capacity. An active high-traffic session inserted early could be evicted while recently-established but idle sessions were kept, violating the principle of least-recently-used fairness.
+
+### Decision
+Replace insertion-order eviction with LRU: add a `lastAccessedAt` field (monotonic integer counter, not `Date.now()` — avoids ms-precision ties) to each `StoredEntry`; increment it on every `save()` and `load()`; evict the entry with the lowest counter when at capacity. Emit a `console.warn` on eviction to alert operators.
+
+### Tradeoffs
+O(n) scan per eviction — acceptable for the expected session count (≤1000 default). Using a counter instead of timestamps avoids clock-skew and sub-millisecond collisions. A proper LRU cache with O(1) eviction (doubly-linked list + hash map) is not warranted at this scale.
+
+### Spec Reference
+N/A (server implementation quality / SEC-022)
+
+## SEC-020 — Authenticate callback receives sessionId for ownership verification
+**Date:** 2026-05-31
+**Phase:** Phase 3 (review fixes)
+**Status:** Decided
+
+### Context
+Any authenticated user could resume an arbitrary session by supplying a valid token plus a known session ID. The `authenticate(authorization)` callback had no way to verify ownership because it did not receive the session ID being resumed.
+
+### Decision
+Change the `authenticate` option signature to `(authorization: string, sessionId?: string) => Promise<boolean>`. The server passes `frame.headers.sessionId` (which may be `undefined` for new sessions) as the second argument. JSDoc documents that implementations SHOULD verify ownership when `sessionId` is provided.
+
+### Tradeoffs
+The change is backward-compatible (second parameter is optional). Existing handlers that ignore it are still valid. Full enforcement requires the application layer to implement the ownership check — this cannot be done in the library without opaque token introspection, which would violate the security invariant of not logging tokens.
+
+### Spec Reference
+Section 7 (session resumption); SEC-020
+
+## SEC-021 — Per-session rate limit on auth-refresh challenges
+**Date:** 2026-05-31
+**Phase:** Phase 3 (review fixes)
+**Status:** Decided
+
+### Context
+`ServerSessionImpl.requestAuthRefresh()` forwarded every call directly to the core session with no rate limiting. A buggy timer or adversarial server code could flood a client with challenges, causing excessive token-refresh work on the client side.
+
+### Decision
+Add `minAuthRefreshIntervalMs?: number` to `CulpeoServerOptions` (default: `30_000`). `ServerSessionImpl` tracks `lastAuthRefreshAt` (epoch ms) and silently drops calls that arrive within the cooldown window. When `minAuthRefreshIntervalMs` is set to `0`, rate limiting is disabled.
+
+### Tradeoffs
+Silently dropping is preferred over throwing because the caller (typically a timer) should not need to handle the error. A warning log was considered but omitted to avoid log noise in normal operation; the rate-limit is a soft cap, not an error condition.
+
+### Spec Reference
+Section 8.3 (auth-refresh); SEC-021
+
+## SEC-022 — LRU eviction warning; per-identity quotas documented
+**Date:** 2026-05-31
+**Phase:** Phase 3 (review fixes)
+**Status:** Decided
+
+### Context
+FIFO eviction in InMemorySessionStore could allow a high-volume client to fill the store and evict all other identities' sessions. Full per-identity quota enforcement requires `SessionSnapshot` to carry an `identity` field and the auth callback to surface the identity — both cross-cutting changes to the core package.
+
+### Decision
+Implement the minimal viable fix: LRU eviction (see TS-P3-003) reduces but does not eliminate the DoS window; a `console.warn` is emitted on every eviction to alert operators; and `maxSessions` JSDoc advises setting it to `(expected_peak_concurrent_sessions × safety_factor)`. Full per-identity quotas require a custom `ISessionStore` implementation, documented in code.
+
+### Tradeoffs
+Does not fully prevent a single identity from monopolising the store. Accepted because full identity tracking requires changes to the core protocol types and the authenticate callback contract, which would be a larger breaking change. Documented in DECISIONS.md and code comments so a custom store author has clear guidance.
+
+### Spec Reference
+N/A; SEC-022
