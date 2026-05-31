@@ -405,3 +405,157 @@ TEST_CASE("WsTransport: Session protocol error sends WS code 1002", "[transport_
 
     CHECK(ws_close_code == 1002);
 }
+
+// ─── Test: SEC-017 close reason sanitization ─────────────────────────────────
+
+TEST_CASE("WsTransport: close reason longer than 123 bytes is truncated", "[transport_ws][sec017]") {
+    std::string captured_reason;
+
+    WsTransport t(
+        [](auto) {},
+        [](auto) {},
+        [&](int, std::string_view reason) { captured_reason = std::string(reason); }
+    );
+
+    // Construct a reason that is exactly 200 bytes
+    std::string long_reason(200, 'A');
+    t.close(1002, long_reason);
+
+    REQUIRE(captured_reason.size() == 123);
+    CHECK(captured_reason == std::string(123, 'A'));
+}
+
+TEST_CASE("WsTransport: close reason with CRLF bytes is sanitized", "[transport_ws][sec017]") {
+    std::string captured_reason;
+
+    WsTransport t(
+        [](auto) {},
+        [](auto) {},
+        [&](int, std::string_view reason) { captured_reason = std::string(reason); }
+    );
+
+    // Reason containing \r\n injection attempt
+    t.close(1002, "Bad\r\nInjected");
+
+    // \r and \n are control chars < 0x20 — both must be replaced with '?'
+    CHECK(captured_reason == "Bad??Injected");
+}
+
+TEST_CASE("WsTransport: normal short close reason is passed through unchanged", "[transport_ws][sec017]") {
+    std::string captured_reason;
+    int captured_code = -1;
+
+    WsTransport t(
+        [](auto) {},
+        [](auto) {},
+        [&](int code, std::string_view reason) {
+            captured_code   = code;
+            captured_reason = std::string(reason);
+        }
+    );
+
+    t.close(1001, "Going away");
+
+    CHECK(captured_code   == 1001);
+    CHECK(captured_reason == "Going away");
+}
+
+// ─── Test: CPP-P3-002 exception swallowing ────────────────────────────────────
+
+TEST_CASE("WsTransport: throwing send_text callback does not propagate", "[transport_ws][p3-002]") {
+    WsTransport t(
+        [](std::span<const std::byte>) { throw std::runtime_error("send failure"); },
+        [](auto) {},
+        [](int, std::string_view) {}
+    );
+    // Must not throw
+    REQUIRE_NOTHROW(t.send_text(make_bytes("hello")));
+}
+
+TEST_CASE("WsTransport: throwing send_binary callback does not propagate", "[transport_ws][p3-002]") {
+    WsTransport t(
+        [](auto) {},
+        [](std::span<const std::byte>) { throw std::runtime_error("send failure"); },
+        [](int, std::string_view) {}
+    );
+    REQUIRE_NOTHROW(t.send_binary(make_bytes("data")));
+}
+
+TEST_CASE("WsTransport: throwing close callback does not propagate", "[transport_ws][p3-002]") {
+    WsTransport t(
+        [](auto) {},
+        [](auto) {},
+        [](int, std::string_view) { throw std::runtime_error("close failure"); }
+    );
+    REQUIRE_NOTHROW(t.close(1000, "bye"));
+}
+
+// ─── Test: CPP-P3-003 close code mapping ─────────────────────────────────────
+
+TEST_CASE("WsTransport: Session server-shutdown maps to WS code 1001", "[transport_ws][p3-003]") {
+    int ws_close_code = -1;
+
+    WsTransport transport(
+        [](auto) {},
+        [](auto) {},
+        [&](int code, std::string_view) { ws_close_code = code; }
+    );
+
+    SessionCallbacks cbs;
+    cbs.on_auth_validate = [](std::string_view) { return true; };
+    cbs.on_auth_response = [](std::string_view) { return true; };
+
+    Session session(transport, cbs);
+
+    std::string init_frame =
+        "Event: culpeo.init\r\n"
+        "Content-Type: application/json\r\n"
+        "Authorization: Bearer test-token\r\n"
+        "\r\n"
+        R"({"version":"0.3","streams":[{"content_type":"audio/pcm;rate=16000;channels=1;bits=16","type":"input","offset_type":"time"}]})";
+
+    auto bytes = make_bytes(init_frame);
+    namespace msg = culpeo::message;
+    auto parsed = msg::parse_headers(
+        msg::FrameType::control,
+        std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
+    REQUIRE(parsed.has_value());
+    REQUIRE(session.process_control_frame(*parsed).has_value());
+
+    session.close("server-shutdown", "Server restarting");
+    CHECK(ws_close_code == 1001);
+}
+
+TEST_CASE("WsTransport: Session idle-timeout maps to WS code 1001", "[transport_ws][p3-003]") {
+    int ws_close_code = -1;
+
+    WsTransport transport(
+        [](auto) {},
+        [](auto) {},
+        [&](int code, std::string_view) { ws_close_code = code; }
+    );
+
+    SessionCallbacks cbs;
+    cbs.on_auth_validate = [](std::string_view) { return true; };
+    cbs.on_auth_response = [](std::string_view) { return true; };
+
+    Session session(transport, cbs);
+
+    std::string init_frame =
+        "Event: culpeo.init\r\n"
+        "Content-Type: application/json\r\n"
+        "Authorization: Bearer test-token\r\n"
+        "\r\n"
+        R"({"version":"0.3","streams":[{"content_type":"audio/pcm;rate=16000;channels=1;bits=16","type":"input","offset_type":"time"}]})";
+
+    auto bytes = make_bytes(init_frame);
+    namespace msg = culpeo::message;
+    auto parsed = msg::parse_headers(
+        msg::FrameType::control,
+        std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
+    REQUIRE(parsed.has_value());
+    REQUIRE(session.process_control_frame(*parsed).has_value());
+
+    session.close("idle-timeout", "No activity");
+    CHECK(ws_close_code == 1001);
+}

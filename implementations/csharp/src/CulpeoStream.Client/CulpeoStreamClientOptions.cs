@@ -6,10 +6,16 @@ namespace CulpeoStream.Client;
 public sealed class CulpeoStreamClientOptions
 {
     /// <summary>
-    /// Bearer token (or full <c>Authorization</c> header value) used for the initial <c>culpeo.init</c>.
+    /// Static bearer token (or full <c>Authorization</c> header value) used when
+    /// <see cref="GetToken"/> is <see langword="null"/>.
     /// Never logged or exposed in traces.
+    /// <para>
+    /// At least one of <see cref="Authorization"/> or <see cref="GetToken"/> must be non-null.
+    /// When both are provided, <see cref="GetToken"/> takes precedence on every connect and
+    /// reconnect.
+    /// </para>
     /// </summary>
-    public required string Authorization { get; init; }
+    public string? Authorization { get; init; }
 
     /// <summary>
     /// Streams to declare in <c>culpeo.init</c>.
@@ -49,11 +55,34 @@ public sealed class CulpeoStreamClientOptions
     // ── Auth refresh ────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Called when the server sends <c>culpeo.auth-refresh</c>. Must return a fresh token
-    /// (full <c>Authorization</c> header value, e.g. <c>"Bearer eyJ…"</c>).
-    /// If <see langword="null"/>, the client closes with <c>auth-error</c> on any auth-refresh challenge.
+    /// Called on every <c>culpeo.init</c> (including reconnects) and when the server sends
+    /// <c>culpeo.auth-refresh</c>. Must return a fresh token (full <c>Authorization</c> header
+    /// value, e.g. <c>"Bearer eyJ…"</c>).
+    /// <para>
+    /// When non-null this takes precedence over <see cref="Authorization"/> on every connect and
+    /// reconnect, ensuring expired tokens are never reused.
+    /// </para>
+    /// <para>
+    /// If <see langword="null"/> and no <c>auth-refresh</c> challenge arrives, <see cref="Authorization"/>
+    /// is used. If <see langword="null"/> and an <c>auth-refresh</c> does arrive, the client
+    /// closes with <c>auth-expired</c>.
+    /// </para>
     /// </summary>
     public Func<CancellationToken, Task<string>>? GetToken { get; init; }
+
+    // ── Channel ──────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Capacity of the bounded event channel that buffers frames between the receive loop and
+    /// <see cref="CulpeoStreamClient.ReceiveAsync"/>.
+    /// Defaults to 1024.
+    /// <para>
+    /// <b>Important:</b> callers MUST consume <see cref="CulpeoStreamClient.ReceiveAsync"/>
+    /// continuously. A full channel will block the receive loop (back-pressure), which can
+    /// delay pong responses and session resumption.
+    /// </para>
+    /// </summary>
+    public int EventChannelCapacity { get; init; } = 1024;
 
     // ── Security ────────────────────────────────────────────────────────────────
 

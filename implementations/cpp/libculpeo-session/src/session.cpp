@@ -370,6 +370,10 @@ struct Session::Impl {
         if (culpeo_code == "unauthorized"   ||
             culpeo_code == "auth-expired"   ||
             culpeo_code == "auth-failed")                  return 1008;
+        // RFC 6455 §7.4.1: 1001 Going Away — server is shutting down or
+        // the endpoint is going away (idle timeout fits this semantic).
+        if (culpeo_code == "server-shutdown" ||
+            culpeo_code == "idle-timeout")                 return 1001;
         // All other codes ("protocol-error", "version-unsupported",
         // "invalid-streams", "session-expired", etc.) → 1002 Protocol Error.
         return 1002;

@@ -28,6 +28,7 @@ import {
 import type {
   ConfirmedStreamDeclaration,
   InitErrorCode,
+  InitFrame,
   JsonObject,
   SessionNotification,
   SessionSnapshot,
@@ -45,12 +46,18 @@ import { InMemorySessionStore } from "./store.js";
 export interface CulpeoServerOptions {
   /**
    * Authenticate an incoming session.
-   * Receives the full Authorization header value (e.g. "Bearer <token>").
+   * Receives the full Authorization header value (e.g. "Bearer <token>") and,
+   * when the client is resuming an existing session, the session ID.
    *
    * SECURITY: The authorization value MUST NOT appear in logs or errors.
+   * Implementations SHOULD verify session ownership when sessionId is provided —
+   * i.e. confirm that the supplied token originally created (or is authorised to
+   * resume) the identified session. Failing to do so allows any authenticated
+   * user to hijack an existing session by guessing its ID (SEC-020).
+   *
    * Return false to reject the connection with culpeo.init-error(unauthorized).
    */
-  authenticate: (authorization: string) => Promise<boolean>;
+  authenticate: (authorization: string, sessionId?: string) => Promise<boolean>;
 
   /** Application-level handler for session lifecycle and frame events. */
   handler: ICulpeoStreamHandler;
@@ -72,6 +79,13 @@ export interface CulpeoServerOptions {
    * Default: 0 (disabled).
    */
   authRefreshIntervalMs?: number;
+
+  /**
+   * Minimum interval (ms) between consecutive culpeo.auth-refresh challenges
+   * for the same session.  Calls within the cooldown window are silently dropped.
+   * Default: 30_000 (30 s). Set to 0 to disable rate-limiting.
+   */
+  minAuthRefreshIntervalMs?: number;
 
   /**
    * Maximum allowed WebSocket message size in bytes.
@@ -211,11 +225,14 @@ export function createCulpeoServer(options: CulpeoServerOptions): CulpeoServer {
 
 class ServerSessionImpl implements IServerSession {
   private readonly _streams: ReadonlyMap<string, StreamDeclaration>;
+  /** Epoch-ms of the last culpeo.auth-refresh challenge sent from this session. */
+  private lastAuthRefreshAt = 0;
 
   public constructor(
     private readonly coreSession: CulpeoServerSession,
     private readonly ws: WebSocketType,
     confirmedStreams: readonly ConfirmedStreamDeclaration[],
+    private readonly options: CulpeoServerOptions,
   ) {
     const map = new Map<string, StreamDeclaration>();
     for (const stream of confirmedStreams) {
@@ -248,6 +265,13 @@ class ServerSessionImpl implements IServerSession {
   }
 
   public async requestAuthRefresh(): Promise<void> {
+    const now = Date.now();
+    const minInterval = this.options.minAuthRefreshIntervalMs ?? 30_000;
+    if (minInterval > 0 && now - this.lastAuthRefreshAt < minInterval) {
+      // Silently drop — we're within the cooldown window (SEC-021).
+      return;
+    }
+    this.lastAuthRefreshAt = now;
     await this.coreSession.requestAuthRefresh();
   }
 
@@ -306,7 +330,10 @@ class ServerConnection {
   private pingTimer: ReturnType<typeof setInterval> | undefined;
   private authRefreshTimer: ReturnType<typeof setInterval> | undefined;
   private processing = false;
-  private readonly queue: Array<{ data: WebSocketType.RawData; isBinary: boolean }> = [];
+  private readonly queue: Array<{
+    data: WebSocketType.RawData;
+    isBinary: boolean;
+  }> = [];
   private closed = false;
 
   public constructor(
@@ -407,11 +434,16 @@ class ServerConnection {
       return;
     }
 
+    // TypeScript cannot fully narrow the ControlMessage union through the compound
+    // guard above, so we assert the narrowed type explicitly.
+    const initFrame = frame as InitFrame;
+
     // SECURITY: do not log the authorization value.
     let authenticated: boolean;
     try {
       authenticated = await this.options.authenticate(
-        frame.headers.authorization,
+        initFrame.headers.authorization,
+        initFrame.headers.sessionId, // undefined for new sessions — callers SHOULD verify ownership
       );
     } catch {
       authenticated = false;
@@ -428,8 +460,8 @@ class ServerConnection {
 
     // Load resume snapshot if a Session-Id was provided.
     let resumeSnapshot: SessionSnapshot | undefined;
-    if (frame.headers.sessionId !== undefined) {
-      const stored = await this.store.load(frame.headers.sessionId);
+    if (initFrame.headers.sessionId !== undefined) {
+      const stored = await this.store.load(initFrame.headers.sessionId);
       resumeSnapshot = stored ?? undefined;
     }
 
@@ -450,14 +482,11 @@ class ServerConnection {
     // Hand the init frame to the session state machine.
     // This will validate, send init-ack or init-error (via sendFrame), and fire
     // the notification. The init-error frame is sent before we close the ws.
-    await coreSession.receive(frame);
+    await coreSession.receive(initFrame);
 
     // If init failed (session closed without establishing), close the ws now
     // that the init-error frame has been dispatched.
-    if (
-      coreSession.state === "closed" &&
-      this.serverSession === undefined
-    ) {
+    if (coreSession.state === "closed" && this.serverSession === undefined) {
       if (
         this.ws.readyState === WebSocket.OPEN ||
         this.ws.readyState === WebSocket.CONNECTING
@@ -479,6 +508,7 @@ class ServerConnection {
           coreSession,
           this.ws,
           n.frame.body.streams,
+          this.options,
         );
 
         // Persist the session immediately so it can be resumed.
@@ -516,8 +546,15 @@ class ServerConnection {
               n.frame.body,
               BigInt(n.frame.headers.offset),
             );
-          } catch {
-            /* handler errors must not crash the server */
+          } catch (err) {
+            if (this.options.handler.onError !== undefined) {
+              void this.options.handler.onError(session, err);
+            } else {
+              console.warn(
+                "[culpeostream-server] handler.onMedia threw (unhandled):",
+                err,
+              );
+            }
           }
         }
         break;
@@ -532,8 +569,15 @@ class ServerConnection {
               n.frame.event,
               n.frame.body,
             );
-          } catch {
-            /* handler errors must not crash the server */
+          } catch (err) {
+            if (this.options.handler.onError !== undefined) {
+              void this.options.handler.onError(session, err);
+            } else {
+              console.warn(
+                "[culpeostream-server] handler.onEvent threw (unhandled):",
+                err,
+              );
+            }
           }
         }
         break;
@@ -576,6 +620,14 @@ class ServerConnection {
     }
 
     this.onClose();
+
+    // TS-P3-001: explicitly remove all WebSocket listeners so the JS engine can
+    // GC the ServerConnection and its session state.  (Merely closing the socket
+    // is not enough — the ws library may hold internal references to the closures
+    // we registered in the constructor until the listeners are detached.)
+    this.ws.removeAllListeners("message");
+    this.ws.removeAllListeners("close");
+    this.ws.removeAllListeners("error");
   }
 
   // ---------------------------------------------------------------------------
@@ -620,10 +672,7 @@ class ServerConnection {
   private async saveSnapshot(): Promise<void> {
     const coreSession = this.coreSession;
     if (coreSession === undefined) return;
-    if (
-      coreSession.state !== "established" &&
-      coreSession.state !== "closed"
-    ) {
+    if (coreSession.state !== "established" && coreSession.state !== "closed") {
       return;
     }
     try {

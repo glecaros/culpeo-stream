@@ -20,10 +20,7 @@ import {
 } from "vitest";
 import WebSocket from "ws";
 
-import {
-  parseFrame,
-  serializeFrame,
-} from "culpeostream";
+import { parseFrame, serializeFrame } from "culpeostream";
 import type {
   ConfirmedStreamDeclaration,
   InitAckFrame,
@@ -110,7 +107,10 @@ function parseWsMessage(
       : data instanceof ArrayBuffer
         ? Buffer.from(data)
         : Buffer.concat(data as Buffer[]);
-    return parseFrame(new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength), "binary");
+    return parseFrame(
+      new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength),
+      "binary",
+    );
   }
   return parseFrame(
     Buffer.isBuffer(data) ? data.toString("utf-8") : String(data),
@@ -213,13 +213,16 @@ interface TestContext {
 }
 
 async function createTestContext(
-  optionOverrides: Partial<Omit<CulpeoServerOptions, "authenticate" | "handler">> = {},
+  optionOverrides: Partial<
+    Omit<CulpeoServerOptions, "authenticate" | "handler">
+  > = {},
 ): Promise<TestContext> {
   const port = await getFreePort();
   const store = new InMemorySessionStore();
 
-  const authenticate = vi.fn<[string], Promise<boolean>>(async (token) =>
-    token === VALID_TOKEN,
+  const authenticate = vi.fn(
+    async (token: string, _sessionId?: string): Promise<boolean> =>
+      token === VALID_TOKEN,
   );
 
   const handler = {
@@ -380,11 +383,11 @@ describe("CulpeoServer — authentication", () => {
     await sleep(50);
   });
 
-  it("calls authenticate with the Authorization header value", async () => {
+  it("calls authenticate with the Authorization header value and no sessionId for new sessions", async () => {
     const { ws } = await connectAndHandshake(ctx.port, {
       token: VALID_TOKEN,
     });
-    expect(ctx.authenticate).toHaveBeenCalledWith(VALID_TOKEN);
+    expect(ctx.authenticate).toHaveBeenCalledWith(VALID_TOKEN, undefined);
     ws.close();
     await sleep(50);
   });
@@ -454,10 +457,16 @@ describe("CulpeoServer — media frame routing", () => {
   });
 
   it("routes incoming media frames to onMedia handler", async () => {
-    const received: Array<{ streamId: string; data: Uint8Array; offset: bigint }> = [];
-    ctx.handler.onMedia.mockImplementation(async (_, streamId, data, offset) => {
-      received.push({ streamId, data, offset });
-    });
+    const received: Array<{
+      streamId: string;
+      data: Uint8Array;
+      offset: bigint;
+    }> = [];
+    ctx.handler.onMedia.mockImplementation(
+      async (_, streamId, data, offset) => {
+        received.push({ streamId, data, offset });
+      },
+    );
 
     const { ws, ack } = await connectAndHandshake(ctx.port);
     await tick();
@@ -490,9 +499,11 @@ describe("CulpeoServer — media frame routing", () => {
 
   it("routes a second media frame with the correct sequential offset", async () => {
     const offsets: bigint[] = [];
-    ctx.handler.onMedia.mockImplementation(async (_, _streamId, _data, offset) => {
-      offsets.push(offset);
-    });
+    ctx.handler.onMedia.mockImplementation(
+      async (_, _streamId, _data, offset) => {
+        offsets.push(offset);
+      },
+    );
 
     const { ws, ack } = await connectAndHandshake(ctx.port);
     await tick();
@@ -1055,10 +1066,7 @@ describe("CulpeoServer — protocol error handling", () => {
       ws.on("message", (data, isBinary) => {
         try {
           const frame = parseWsMessage(data, isBinary);
-          if (
-            frame.kind === "control" &&
-            frame.event === "culpeo.init-error"
-          ) {
+          if (frame.kind === "control" && frame.event === "culpeo.init-error") {
             resolve((frame as InitErrorFrame).headers.code);
           }
         } catch (err) {
@@ -1100,10 +1108,7 @@ describe("CulpeoServer — protocol error handling", () => {
       ws.on("message", (data, isBinary) => {
         try {
           const frame = parseWsMessage(data, isBinary);
-          if (
-            frame.kind === "control" &&
-            frame.event === "culpeo.init-error"
-          ) {
+          if (frame.kind === "control" && frame.event === "culpeo.init-error") {
             resolve((frame as InitErrorFrame).headers.code);
           }
         } catch (err) {
@@ -1148,5 +1153,148 @@ describe("CulpeoServer — createCulpeoServer factory", () => {
     ws.close();
     await sleep(50);
     await server.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TS-P3-002 — Handler errors surface via onError, session stays alive
+// ---------------------------------------------------------------------------
+
+describe("CulpeoServer — handler error routing (TS-P3-002)", () => {
+  let ctx: TestContext;
+
+  beforeEach(async () => {
+    ctx = await createTestContext();
+  });
+
+  afterEach(async () => {
+    await teardownTestContext(ctx);
+  });
+
+  it("calls handler.onError when onMedia throws, session stays alive", async () => {
+    const testError = new Error("deliberate media handler error");
+    ctx.handler.onMedia.mockRejectedValueOnce(testError);
+
+    const onErrorCalls: Array<{ session: IServerSession; error: unknown }> = [];
+    (ctx.handler as ICulpeoStreamHandler).onError = vi.fn(
+      async (session: IServerSession, error: unknown) => {
+        onErrorCalls.push({ session, error });
+      },
+    );
+
+    const { ws, ack } = await connectAndHandshake(ctx.port);
+    await tick();
+
+    const streamId = ack.body.streams[0]?.id;
+    expect(streamId).toBeTruthy();
+
+    const payload = new Uint8Array([1, 2, 3]);
+    ws.send(
+      serializeFrame({
+        kind: "media",
+        headers: { streamId: streamId!, offset: 0, contentType: "audio/opus" },
+        body: payload,
+      }).data,
+    );
+    await sleep(80);
+
+    // onError must have been called with the thrown error.
+    expect(onErrorCalls).toHaveLength(1);
+    expect(onErrorCalls[0]?.error).toBe(testError);
+
+    // Session must still be alive — send a second media frame successfully.
+    ctx.handler.onMedia.mockResolvedValueOnce(undefined);
+    ws.send(
+      serializeFrame({
+        kind: "media",
+        headers: { streamId: streamId!, offset: 1, contentType: "audio/opus" },
+        body: payload,
+      }).data,
+    );
+    await sleep(80);
+
+    // WebSocket should still be open.
+    expect(ws.readyState).toBe(WebSocket.OPEN);
+
+    ws.close();
+    await sleep(50);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TS-P3-003 — LRU eviction in InMemorySessionStore
+// ---------------------------------------------------------------------------
+
+describe("InMemorySessionStore — LRU eviction (TS-P3-003)", () => {
+  const makeSnapshot = (id: string) => ({
+    sessionId: id,
+    version: "0.3" as const,
+    bufferWindowMs: 5000,
+    streams: [
+      {
+        id: "s1",
+        type: "input" as const,
+        content_type: "audio/opus",
+        offset_type: "message" as const,
+      },
+    ],
+  });
+
+  it("evicts the LRU session (not the oldest inserted) when at capacity", async () => {
+    const store = new InMemorySessionStore({ maxSessions: 2 });
+
+    await store.save(makeSnapshot("a"));
+    await store.save(makeSnapshot("b"));
+
+    // Access "a" so it becomes more-recently-used than "b".
+    await store.load("a");
+
+    // Saving "c" should evict "b" (LRU), not "a" (recently accessed).
+    await store.save(makeSnapshot("c"));
+
+    expect(await store.load("a")).not.toBeNull(); // a was recently accessed — kept
+    expect(await store.load("b")).toBeNull(); // b was LRU — evicted
+    expect(await store.load("c")).not.toBeNull(); // c is new — kept
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SEC-020 — authenticate receives sessionId on resumption
+// ---------------------------------------------------------------------------
+
+describe("CulpeoServer — authenticate receives sessionId on resumption (SEC-020)", () => {
+  let ctx: TestContext;
+
+  beforeEach(async () => {
+    ctx = await createTestContext({ pingIntervalMs: 0 });
+  });
+
+  afterEach(async () => {
+    await teardownTestContext(ctx);
+  });
+
+  it("passes the session ID to authenticate when the client resumes", async () => {
+    // First connection — establish and record the session ID.
+    const { ws: ws1, ack: ack1 } = await connectAndHandshake(ctx.port);
+    const sessionId = ack1.headers.sessionId;
+    await tick();
+
+    await new Promise<void>((resolve) => {
+      ws1.once("close", () => resolve());
+      ws1.close();
+    });
+    await sleep(50);
+
+    // Clear the call history so the second call is unambiguous.
+    ctx.authenticate.mockClear();
+
+    // Second connection — resume with the stored session ID.
+    const { ws: ws2 } = await connectAndHandshake(ctx.port, { sessionId });
+
+    // authenticate should have been called with (token, sessionId).
+    expect(ctx.authenticate).toHaveBeenCalledWith(VALID_TOKEN, sessionId);
+
+    ws2.close();
+    await sleep(50);
   });
 });

@@ -33,8 +33,13 @@ export interface ISessionStore {
 export interface InMemorySessionStoreOptions {
   /**
    * Maximum number of sessions to hold simultaneously.
-   * When the limit is reached the oldest entry is evicted.
+   * When the limit is reached the LRU (least-recently-used) entry is evicted.
    * Default: 1000.
+   *
+   * SECURITY (SEC-022): To prevent session-eviction DoS attacks from high-volume
+   * clients, set this to at least (expected_peak_concurrent_sessions × safety_factor).
+   * Per-identity session quotas require a custom ISessionStore implementation that
+   * tracks identity → session mappings; this built-in store does not implement them.
    */
   maxSessions?: number;
 
@@ -50,12 +55,16 @@ interface StoredEntry {
   snapshot: SessionSnapshot;
   /** Absolute epoch-ms after which this entry is considered stale, or undefined for no expiry. */
   expiresAt: number | undefined;
+  /** Monotonically increasing access counter — used for LRU eviction (avoids Date.now() precision issues). */
+  lastAccessedAt: number;
 }
 
 export class InMemorySessionStore implements ISessionStore {
   private readonly sessions = new Map<string, StoredEntry>();
   private readonly maxSessions: number;
   private readonly ttlMs: number | undefined;
+  /** Monotonically increasing counter; incremented on every save/load to track LRU order. */
+  private accessCounter = 0;
 
   public constructor(options?: InMemorySessionStoreOptions) {
     this.maxSessions = options?.maxSessions ?? 1_000;
@@ -67,17 +76,34 @@ export class InMemorySessionStore implements ISessionStore {
       !this.sessions.has(snapshot.sessionId) &&
       this.sessions.size >= this.maxSessions
     ) {
-      // Evict the oldest entry (Map preserves insertion order).
-      const oldest = this.sessions.keys().next().value;
-      if (oldest !== undefined) {
-        this.sessions.delete(oldest);
+      // Evict the LRU (least-recently-used) entry instead of the oldest-inserted.
+      let lruKey: string | undefined;
+      let lruTime = Infinity;
+      for (const [k, v] of this.sessions) {
+        if (v.lastAccessedAt < lruTime) {
+          lruTime = v.lastAccessedAt;
+          lruKey = k;
+        }
+      }
+      if (lruKey !== undefined) {
+        this.sessions.delete(lruKey);
+        console.warn(
+          "[culpeostream-server] InMemorySessionStore: evicted LRU session to stay within maxSessions=%d. " +
+            "If active sessions are being evicted, increase maxSessions or implement a custom ISessionStore " +
+            "with per-identity quotas.",
+          this.maxSessions,
+        );
       }
     }
 
     const expiresAt =
       this.ttlMs !== undefined ? Date.now() + this.ttlMs : undefined;
 
-    this.sessions.set(snapshot.sessionId, { snapshot, expiresAt });
+    this.sessions.set(snapshot.sessionId, {
+      snapshot,
+      expiresAt,
+      lastAccessedAt: ++this.accessCounter,
+    });
   }
 
   public async load(sessionId: string): Promise<SessionSnapshot | null> {
@@ -89,6 +115,8 @@ export class InMemorySessionStore implements ISessionStore {
       this.sessions.delete(sessionId);
       return null;
     }
+    // Update lastAccessedAt so this session is not the next LRU victim.
+    entry.lastAccessedAt = ++this.accessCounter;
     return entry.snapshot;
   }
 

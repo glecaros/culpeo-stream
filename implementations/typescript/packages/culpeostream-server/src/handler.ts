@@ -110,4 +110,14 @@ export interface ICulpeoStreamHandler {
    * @param reason  A human-readable reason string.
    */
   onDisconnected(session: IServerSession, reason: string): Promise<void>;
+
+  /**
+   * Optional error hook called when onMedia or onEvent throws.
+   * If not provided, a console.warn is emitted instead.
+   * The session remains alive after the error.
+   *
+   * @param session The active session at the time of the error.
+   * @param error   The thrown value (any type — do not log auth tokens).
+   */
+  onError?: (session: IServerSession, error: unknown) => Promise<void>;
 }

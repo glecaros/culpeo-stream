@@ -207,7 +207,16 @@ struct SessionCallbacks {
 
 class Session {
 public:
-    // Construct a fresh session (no prior state — server-side for new connections).
+    /// Construct a session (server-side, for new or resuming connections).
+    ///
+    /// @param transport   Transport used for all outgoing frames.
+    ///                    MUST outlive this Session instance.
+    ///                    Typical usage: destroy Session before transport
+    ///                    in the WebSocket close handler — see uws_adapter.hpp
+    ///                    for the required shutdown sequence.
+    /// @param callbacks   Application-provided event hooks.
+    /// @param config      Protocol configuration (timeouts, sizes, etc.).
+    /// @param prior_state Optional persisted state for session resumption.
     explicit Session(
         ITransport& transport,
         SessionCallbacks callbacks = {},

@@ -385,3 +385,105 @@ Use `JsonObject` (from `culpeostream`) for `IServerSession.sendEvent` and `ICulp
 
 ### Spec Reference
 Section 6 (application event frames)
+
+## TS-P3-001 — WebSocket listener teardown on connection close
+**Date:** 2026-05-31
+**Phase:** Phase 3 (review fixes)
+**Status:** Decided
+
+### Context
+`ServerConnection` registered `message`, `close`, and `error` listeners on the `ws.WebSocket` in its constructor but never explicitly removed them in `handleWsClose()`. Even after the socket reaches the `CLOSED` state, the `ws` library's internal listener arrays hold references to the closures, preventing garbage-collection of the `ServerConnection` instance and its associated session state.
+
+### Decision
+At the end of `handleWsClose()`, after calling `onClose()`, explicitly call `this.ws.removeAllListeners('message')`, `this.ws.removeAllListeners('close')`, and `this.ws.removeAllListeners('error')`.
+
+### Tradeoffs
+Has no effect on correctness (the socket is already closed by this point) but ensures deterministic GC of per-session state. Small extra code; zero risk.
+
+### Spec Reference
+N/A (implementation quality / memory management)
+
+## TS-P3-002 — Handler errors surface via optional onError callback
+**Date:** 2026-05-31
+**Phase:** Phase 3 (review fixes)
+**Status:** Decided
+
+### Context
+Previously, exceptions thrown by `handler.onMedia` and `handler.onEvent` were silently swallowed with a comment. Application developers had no way to observe these errors without patching the handler themselves.
+
+### Decision
+Add optional `onError?(session, error): Promise<void>` to `ICulpeoStreamHandler`. In the `media` and `application-event` catch blocks of `handleNotification()`, call `handler.onError` if provided, or fall back to `console.warn`. The session is never closed as a result — handler errors are non-fatal.
+
+### Tradeoffs
+Opt-in design keeps existing handlers valid (backward compatible). The fallback `console.warn` ensures operator visibility when `onError` is absent. Auth tokens must not appear in the thrown error — documented.
+
+### Spec Reference
+N/A (server API surface)
+
+## TS-P3-003 — LRU eviction replaces insertion-order eviction in InMemorySessionStore
+**Date:** 2026-05-31
+**Phase:** Phase 3 (review fixes)
+**Status:** Decided
+
+### Context
+The original store evicted the oldest-inserted entry when at capacity. An active high-traffic session inserted early could be evicted while recently-established but idle sessions were kept, violating the principle of least-recently-used fairness.
+
+### Decision
+Replace insertion-order eviction with LRU: add a `lastAccessedAt` field (monotonic integer counter, not `Date.now()` — avoids ms-precision ties) to each `StoredEntry`; increment it on every `save()` and `load()`; evict the entry with the lowest counter when at capacity. Emit a `console.warn` on eviction to alert operators.
+
+### Tradeoffs
+O(n) scan per eviction — acceptable for the expected session count (≤1000 default). Using a counter instead of timestamps avoids clock-skew and sub-millisecond collisions. A proper LRU cache with O(1) eviction (doubly-linked list + hash map) is not warranted at this scale.
+
+### Spec Reference
+N/A (server implementation quality / SEC-022)
+
+## SEC-020 — Authenticate callback receives sessionId for ownership verification
+**Date:** 2026-05-31
+**Phase:** Phase 3 (review fixes)
+**Status:** Decided
+
+### Context
+Any authenticated user could resume an arbitrary session by supplying a valid token plus a known session ID. The `authenticate(authorization)` callback had no way to verify ownership because it did not receive the session ID being resumed.
+
+### Decision
+Change the `authenticate` option signature to `(authorization: string, sessionId?: string) => Promise<boolean>`. The server passes `frame.headers.sessionId` (which may be `undefined` for new sessions) as the second argument. JSDoc documents that implementations SHOULD verify ownership when `sessionId` is provided.
+
+### Tradeoffs
+The change is backward-compatible (second parameter is optional). Existing handlers that ignore it are still valid. Full enforcement requires the application layer to implement the ownership check — this cannot be done in the library without opaque token introspection, which would violate the security invariant of not logging tokens.
+
+### Spec Reference
+Section 7 (session resumption); SEC-020
+
+## SEC-021 — Per-session rate limit on auth-refresh challenges
+**Date:** 2026-05-31
+**Phase:** Phase 3 (review fixes)
+**Status:** Decided
+
+### Context
+`ServerSessionImpl.requestAuthRefresh()` forwarded every call directly to the core session with no rate limiting. A buggy timer or adversarial server code could flood a client with challenges, causing excessive token-refresh work on the client side.
+
+### Decision
+Add `minAuthRefreshIntervalMs?: number` to `CulpeoServerOptions` (default: `30_000`). `ServerSessionImpl` tracks `lastAuthRefreshAt` (epoch ms) and silently drops calls that arrive within the cooldown window. When `minAuthRefreshIntervalMs` is set to `0`, rate limiting is disabled.
+
+### Tradeoffs
+Silently dropping is preferred over throwing because the caller (typically a timer) should not need to handle the error. A warning log was considered but omitted to avoid log noise in normal operation; the rate-limit is a soft cap, not an error condition.
+
+### Spec Reference
+Section 8.3 (auth-refresh); SEC-021
+
+## SEC-022 — LRU eviction warning; per-identity quotas documented
+**Date:** 2026-05-31
+**Phase:** Phase 3 (review fixes)
+**Status:** Decided
+
+### Context
+FIFO eviction in InMemorySessionStore could allow a high-volume client to fill the store and evict all other identities' sessions. Full per-identity quota enforcement requires `SessionSnapshot` to carry an `identity` field and the auth callback to surface the identity — both cross-cutting changes to the core package.
+
+### Decision
+Implement the minimal viable fix: LRU eviction (see TS-P3-003) reduces but does not eliminate the DoS window; a `console.warn` is emitted on every eviction to alert operators; and `maxSessions` JSDoc advises setting it to `(expected_peak_concurrent_sessions × safety_factor)`. Full per-identity quotas require a custom `ISessionStore` implementation, documented in code.
+
+### Tradeoffs
+Does not fully prevent a single identity from monopolising the store. Accepted because full identity tracking requires changes to the core protocol types and the authenticate callback contract, which would be a larger breaking change. Documented in DECISIONS.md and code comments so a custom store author has clear guidance.
+
+### Spec Reference
+N/A; SEC-022

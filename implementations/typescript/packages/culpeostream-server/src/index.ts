@@ -13,12 +13,7 @@
  */
 
 export type { ICulpeoStreamHandler, IServerSession } from "./handler.js";
-export {
-  CulpeoServer,
-  createCulpeoServer,
-} from "./server.js";
+export { CulpeoServer, createCulpeoServer } from "./server.js";
 export type { CulpeoServerOptions } from "./server.js";
-export {
-  InMemorySessionStore,
-} from "./store.js";
+export { InMemorySessionStore } from "./store.js";
 export type { ISessionStore, InMemorySessionStoreOptions } from "./store.js";

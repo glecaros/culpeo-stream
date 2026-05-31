@@ -459,3 +459,126 @@ Changed `ContentTypeUtilities` and its associated `ParsedContentType` record fro
 
 ### Spec Reference
 §6.2
+
+## Atomics-first concurrency policy
+**Date:** 2026-05-31
+**Phase:** Cross-cutting
+**Status:** Decided
+
+### Context
+Multiple phases introduced concurrent-access guards (ConnectAsync double-call prevention, send serialization). There was a tendency to reach for `SemaphoreSlim` as a general-purpose mutex, even for simple state flags where no async wait is needed.
+
+### Decision
+Prefer `Interlocked.CompareExchange` / `Interlocked.Exchange` for state flags and "already started" guards. Only use `SemaphoreSlim(1,1)` when the critical section genuinely spans an `await` boundary (e.g., `_sendLock` serializing frame serialization + `SendAsync`). Never use `lock` around async code.
+
+### Tradeoffs
+Atomics are non-blocking, allocation-free, and naturally compose with async code. The trade-off is that compound multi-field operations still require a lock — atomics cannot atomically update two fields simultaneously. Use the simplest correct primitive.
+
+### Spec Reference
+N/A (implementation policy)
+
+## CS-P3-001: ConnectAsync concurrent-call serialization via _connectLock
+**Date:** 2026-05-30
+**Phase:** Phase 3 — Client Library (review fixes)
+**Status:** Decided
+
+### Context
+Two concurrent callers of `ConnectAsync` could both pass the `if (_loopTask is not null)` check before either set it, resulting in two independent background loops running on the same client instance. The original guard was a simple null check without synchronization.
+
+### Decision
+Added `SemaphoreSlim _connectLock = new(1, 1)`. `ConnectAsync` acquires it before entering the null check and releases it in the `finally` block after setting `_loopTask`. The second concurrent caller blocks until the first completes the check, then sees a non-null `_loopTask` and throws.
+
+### Tradeoffs
+Adds one heap allocation (the semaphore) per client instance. Blocking the second caller until the first finishes its full handshake is acceptable because `ConnectAsync` is not expected to be called frequently; it is a one-shot operation per client lifetime.
+
+### Spec Reference
+N/A (implementation safety)
+
+## CS-P3-002: Bounded event channel with configurable capacity
+**Date:** 2026-05-30
+**Phase:** Phase 3 — Client Library (review fixes)
+**Status:** Decided
+
+### Context
+`Channel.CreateUnbounded` lets the channel grow without limit. If the consumer (`ReceiveAsync`) falls behind, the receive loop would continue writing frames, eventually consuming unbounded memory.
+
+### Decision
+Replaced `CreateUnbounded` with `Channel.CreateBounded` (capacity configurable via `CulpeoStreamClientOptions.EventChannelCapacity`, default 1024) with `FullMode = Wait`. This exerts back-pressure on the receive loop rather than silently dropping frames. `SingleWriter = true` is set because only the receive loop writes; `SingleReader = false` permits defensive use. The channel is initialized in the constructor (not as a field initializer) so it can pick up the configured capacity from options.
+
+### Tradeoffs
+A full channel blocks the receive loop. Consumers MUST drain `ReceiveAsync` continuously. This is documented in the XML doc on the property. The alternative (DropOldest/DropNewest) would silently lose frames, which is worse for a protocol where every frame carries advancing offsets.
+
+### Spec Reference
+N/A (implementation safety)
+
+## CS-P3-003: DisposeAsync awaits loop before disposing WebSocket
+**Date:** 2026-05-30
+**Phase:** Phase 3 — Client Library (review fixes)
+**Status:** Decided
+
+### Context
+The original `DisposeAsync` cancelled the CTS and then immediately disposed `_ws`. The reconnect loop (running concurrently) could create a new `_ws` after the dispose, leaking the new instance. The fix is to await `_loopTask` to completion before touching `_ws`.
+
+### Decision
+Moved `_ws?.Dispose()` to after `await _loopTask`. Cancelling the CTS signals the loop to stop; awaiting it ensures the loop has exited and no new WebSocket can be created. `_eventChannel.Writer.TryComplete()` is also moved to after the loop exits to avoid racing with any final channel writes inside the loop.
+
+### Tradeoffs
+`DisposeAsync` now waits for the loop to exit, which may take up to the current backoff delay (max `MaxBackoff`). This is acceptable because dispose is a shutdown operation.
+
+### Spec Reference
+N/A (implementation safety)
+
+## CS-P3-004: SendOffset mutation inside _sendLock
+**Date:** 2026-05-30
+**Phase:** Phase 3 — Client Library (review fixes)
+**Status:** Decided
+
+### Context
+`SendMediaAsync` read `stream.SendOffset`, built a frame, called `SendFrameAsync` (which acquired `_sendLock` internally), and then updated `stream.SendOffset` outside the lock. Two concurrent sends could both read the same offset, both build frames with that offset, and both write the same value back — producing duplicate offsets and incorrect resume state.
+
+### Decision
+The offset read, frame serialization, WebSocket send, and offset increment are all performed inside `_sendLock`. `SendFrameAsync` is no longer called from `SendMediaAsync`; instead the send is inlined to keep the atomic read-send-increment inside one lock acquisition.
+
+### Tradeoffs
+Serialization now happens inside the lock, which is slightly less parallel. However, because frames must be sent in offset order anyway, there is no benefit to serializing outside the lock. The net effect is correct, contiguous offsets under concurrent sends.
+
+### Spec Reference
+§7.2 (offset monotonicity)
+
+## SEC-018: GetToken always called on connect and reconnect
+**Date:** 2026-05-30
+**Phase:** Phase 3 — Client Library (review fixes)
+**Status:** Decided
+
+### Context
+Every `culpeo.init` on reconnect used the static `_options.Authorization` string. If the token had expired between the first connect and a reconnect, all reconnect attempts would fail even though `GetToken` could provide a fresh one.
+
+### Decision
+Added `GetCurrentTokenAsync(CancellationToken)` helper. When `GetToken` is non-null it is called on every invocation of `PerformHandshakeAsync` (initial connect and every reconnect). When `GetToken` is null, the static `Authorization` is used. `Authorization` is now nullable; the constructor validates that at least one of `Authorization` / `GetToken` is non-null.
+
+### Tradeoffs
+Making `Authorization` no longer `required` is a source-breaking change for any callers that relied on the compiler-enforced initializer. The validation is deferred to the constructor, which is still an immediate failure. The benefit is that short-lived tokens work correctly across reconnects without any caller changes.
+
+### Spec Reference
+§3.2 (Authorization header), §8 (session resumption)
+
+## SEC-019: Server-supplied resume_offset validated in ProcessInitAck
+**Date:** 2026-05-30
+**Phase:** Phase 3 — Client Library (review fixes)
+**Status:** Decided
+
+### Context
+`ProcessInitAck` applied the server-supplied `resume_offset` to stream cursors without bounds checks. A malicious or buggy server could send negative values (e.g., -1) or values far exceeding what the client has sent (e.g., `Int64.MaxValue`), corrupting the client's offset tracking.
+
+### Decision
+Added two checks in `ProcessInitAck` per stream:
+1. `confirmedOffset < 0` → throws `CulpeoProtocolException("protocol-error", ...)`
+2. For send streams: `confirmedOffset > existing.SendOffset` → throws `CulpeoProtocolException("protocol-error", ...)`
+
+`CulpeoProtocolException` is caught in the reconnect loop and treated as a non-resumable failure: `_sessionId` and all stream offsets are cleared, and the next attempt will be a fresh connect.
+
+### Tradeoffs
+An overly-strict server that sends a `resume_offset` equal to the client's send offset (a legitimate confirmation of all data received) is accepted. Only values strictly greater than the tracked offset are rejected. If the server legitimately confirms less than the client sent (normal case), it is accepted and the cursor is rewound — this is the intended resumption semantics.
+
+### Spec Reference
+§8.2 (session resumption, confirmed offsets)

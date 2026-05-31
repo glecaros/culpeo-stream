@@ -30,18 +30,21 @@ public sealed class CulpeoStreamClient : IAsyncDisposable
     private readonly CulpeoStreamClientOptions _options;
 
     // ── Event channel: bridges receive loop → ReceiveAsync ───────────────────
+    // Bounded with back-pressure (Wait mode). Callers MUST consume ReceiveAsync
+    // continuously to avoid blocking the receive loop. See CS-P3-002.
 
-    private readonly Channel<CulpeoClientEvent> _eventChannel =
-        Channel.CreateUnbounded<CulpeoClientEvent>(new UnboundedChannelOptions
-        {
-            SingleWriter = false,
-            SingleReader = true,
-            AllowSynchronousContinuations = false
-        });
+    private readonly Channel<CulpeoClientEvent> _eventChannel;
 
     // ── Send serialization ────────────────────────────────────────────────────
 
     private readonly SemaphoreSlim _sendLock = new(1, 1);
+
+    // ── Connect guard (CS-P3-001) ─────────────────────────────────────────────
+    // Prevents two concurrent ConnectAsync callers from both passing the _loopTask null-check
+    // and both starting a reconnect loop. 0 = idle, 1 = connecting/connected.
+    // CAS is sufficient here — no async wait needed; second caller should fail fast, not queue.
+
+    private int _connectState = 0;
 
     // ── Session state (read/written only from ConnectAsync and the loop task) ─
 
@@ -81,6 +84,22 @@ public sealed class CulpeoStreamClient : IAsyncDisposable
         {
             throw new ArgumentException("At least one stream must be declared.", nameof(options));
         }
+
+        // SEC-018: require at least one auth source
+        if (options.Authorization is null && options.GetToken is null)
+        {
+            throw new ArgumentException(
+                "At least one of Authorization or GetToken must be non-null.", nameof(options));
+        }
+
+        // CS-P3-002: bounded channel with configurable capacity
+        _eventChannel = Channel.CreateBounded<CulpeoClientEvent>(
+            new BoundedChannelOptions(options.EventChannelCapacity)
+            {
+                FullMode = BoundedChannelFullMode.Wait,
+                SingleReader = false,
+                SingleWriter = true
+            });
     }
 
     /// <summary>Current connection state.</summary>
@@ -101,40 +120,47 @@ public sealed class CulpeoStreamClient : IAsyncDisposable
     /// </summary>
     public async Task ConnectAsync(Uri serverUri, CancellationToken cancellationToken = default)
     {
-        if (_loopTask is not null)
-        {
+        // CS-P3-001: atomic guard — second caller fails immediately, no queuing.
+        // Reset to 0 on failure so the caller can retry with a new attempt.
+        if (Interlocked.CompareExchange(ref _connectState, 1, 0) != 0)
             throw new InvalidOperationException("ConnectAsync has already been called.");
-        }
-
-        // SEC: enforce wss:// by default (§3.1)
-        if (!_options.AllowInsecureConnections
-            && string.Equals(serverUri.Scheme, "ws", StringComparison.OrdinalIgnoreCase))
+        try
         {
-            throw new InvalidOperationException(
-                "Insecure WebSocket connections (ws://) are not allowed by default. " +
-                "Set AllowInsecureConnections = true in CulpeoStreamClientOptions to allow " +
-                "this in local development environments only.");
+            // SEC: enforce wss:// by default (§3.1)
+            if (!_options.AllowInsecureConnections
+                && string.Equals(serverUri.Scheme, "ws", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    "Insecure WebSocket connections (ws://) are not allowed by default. " +
+                    "Set AllowInsecureConnections = true in CulpeoStreamClientOptions to allow " +
+                    "this in local development environments only.");
+            }
+
+            _serverUri = serverUri;
+            _state = CulpeoClientState.Connecting;
+
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lifetimeCts.Token);
+
+            // ── First connect (synchronous from caller's perspective) ─────────────
+            _ws = await CreateWebSocketAsync(serverUri, linkedCts.Token).ConfigureAwait(false);
+
+            bool isResumption = false;
+            await PerformHandshakeAsync(_ws, isResumption, linkedCts.Token).ConfigureAwait(false);
+
+            _state = CulpeoClientState.Established;
+
+            // ── Emit SessionEstablished before starting the loop ──────────────────
+            await _eventChannel.Writer.WriteAsync(new SessionEstablished(_sessionId!), linkedCts.Token)
+                .ConfigureAwait(false);
+
+            // ── Start background loop (using lifetime token, not caller's) ────────
+            _loopTask = Task.Run(() => RunReceiveLoopAsync(_lifetimeCts.Token), CancellationToken.None);
         }
-
-        _serverUri = serverUri;
-        _state = CulpeoClientState.Connecting;
-
-        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lifetimeCts.Token);
-
-        // ── First connect (synchronous from caller's perspective) ─────────────
-        _ws = await CreateWebSocketAsync(serverUri, linkedCts.Token).ConfigureAwait(false);
-
-        bool isResumption = false;
-        await PerformHandshakeAsync(_ws, isResumption, linkedCts.Token).ConfigureAwait(false);
-
-        _state = CulpeoClientState.Established;
-
-        // ── Emit SessionEstablished before starting the loop ──────────────────
-        await _eventChannel.Writer.WriteAsync(new SessionEstablished(_sessionId!), linkedCts.Token)
-            .ConfigureAwait(false);
-
-        // ── Start background loop (using lifetime token, not caller's) ────────
-        _loopTask = Task.Run(() => RunReceiveLoopAsync(_lifetimeCts.Token), CancellationToken.None);
+        catch
+        {
+            Interlocked.Exchange(ref _connectState, 0); // allow retry on failure
+            throw;
+        }
     }
 
     /// <summary>
@@ -197,18 +223,37 @@ public sealed class CulpeoStreamClient : IAsyncDisposable
                 $"Stream '{streamId}' is an output stream; client cannot send media on it.");
         }
 
-        var offset = stream.SendOffset;
-        var frame = new CulpeoMessage(
-            CulpeoMessageKind.Media,
-            data,
-            contentType: stream.ContentType,
-            streamId: streamId,
-            offset: offset);
+        // CS-P3-004: read offset, serialize, send, and advance offset all inside _sendLock
+        // so that concurrent callers cannot interleave their offset reads and updates.
+        // We serialize with the real offset (read inside the lock) to ensure the frame
+        // carries the correct, contiguous position.
+        await _sendLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var offset = stream.SendOffset;
 
-        await SendFrameAsync(frame, cancellationToken).ConfigureAwait(false);
+            var frame = new CulpeoMessage(
+                CulpeoMessageKind.Media,
+                data,
+                contentType: stream.ContentType,
+                streamId: streamId,
+                offset: offset);
 
-        // Advance offset after successful send
-        stream.SendOffset = offset + ComputeOffsetIncrement(stream, data.Length);
+            var frameBytes = await _serializer.SerializeAsync(frame, cancellationToken).ConfigureAwait(false);
+
+            if (_ws is { State: WebSocketState.Open })
+            {
+                await _ws.SendAsync(frameBytes.AsMemory(), WebSocketMessageType.Binary,
+                    endOfMessage: true, cancellationToken).ConfigureAwait(false);
+            }
+
+            // Advance offset only after successful send
+            stream.SendOffset = offset + ComputeOffsetIncrement(stream, data.Length);
+        }
+        finally
+        {
+            _sendLock.Release();
+        }
     }
 
     /// <summary>
@@ -264,8 +309,10 @@ public sealed class CulpeoStreamClient : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        // CS-P3-003: cancel first, then await the loop to full completion before touching _ws.
+        // The loop may create a new _ws on reconnect; awaiting it guarantees no new WebSocket
+        // can be created after we dispose.
         _lifetimeCts.Cancel();
-        _eventChannel.Writer.TryComplete();
 
         if (_loopTask is not null)
         {
@@ -273,9 +320,11 @@ public sealed class CulpeoStreamClient : IAsyncDisposable
             catch { /* suppress */ }
         }
 
+        // Loop has stopped — it is now safe to dispose the current WebSocket
         _ws?.Dispose();
         _sendLock.Dispose();
         _lifetimeCts.Dispose();
+        _eventChannel.Writer.TryComplete();
     }
 
     // ── Background receive loop ───────────────────────────────────────────────
@@ -612,6 +661,17 @@ public sealed class CulpeoStreamClient : IAsyncDisposable
                     stream.ServerId = stream.ServerId; // keep structure
                 }
             }
+            catch (CulpeoProtocolException)
+            {
+                // SEC-019: non-resumable protocol error (e.g. invalid resume_offset from server)
+                // — clear stored session and offsets so next attempt is a fresh connect.
+                _sessionId = null;
+                foreach (var stream in _streamStates.Values)
+                {
+                    stream.SendOffset = 0;
+                    stream.ReceiveOffset = 0;
+                }
+            }
             catch (OperationCanceledException)
             {
                 break;
@@ -633,17 +693,33 @@ public sealed class CulpeoStreamClient : IAsyncDisposable
     // ── Handshake ─────────────────────────────────────────────────────────────
 
     /// <summary>
+    /// Returns the current bearer token, preferring <see cref="CulpeoStreamClientOptions.GetToken"/>
+    /// over the static <see cref="CulpeoStreamClientOptions.Authorization"/> field so that
+    /// reconnects always use a fresh token rather than a potentially-expired static one (SEC-018).
+    /// </summary>
+    private async Task<string> GetCurrentTokenAsync(CancellationToken ct)
+    {
+        if (_options.GetToken is not null)
+            return await _options.GetToken(ct).ConfigureAwait(false);
+        return _options.Authorization ?? string.Empty;
+    }
+
+    /// <summary>
     /// Performs the <c>culpeo.init</c> → <c>culpeo.init-ack</c> handshake.
     /// On success updates <see cref="_sessionId"/> and <see cref="_streamStates"/>.
     /// </summary>
     private async Task PerformHandshakeAsync(WebSocket ws, bool isResumption, CancellationToken cancellationToken)
     {
+        // SEC-018: always fetch a fresh token via GetCurrentTokenAsync so reconnects do not
+        // reuse a static (potentially-expired) Authorization string.
+        var token = await GetCurrentTokenAsync(cancellationToken).ConfigureAwait(false);
+
         var initBody = BuildInitBody(isResumption);
         var initFrame = new CulpeoMessage(
             CulpeoMessageKind.Control,
             Encoding.UTF8.GetBytes(initBody),
             @event: "culpeo.init",
-            authorization: _options.Authorization,
+            authorization: token,
             contentType: "application/json",
             sessionId: isResumption ? _sessionId : null,
             bufferWindow: _options.BufferWindowMs);
@@ -740,6 +816,24 @@ public sealed class CulpeoStreamClient : IAsyncDisposable
             if (isResumption && streamEl.TryGetProperty("resume_offset", out var roProp))
             {
                 var confirmedOffset = roProp.GetInt64();
+
+                // SEC-019: validate server-supplied offset; a malicious or buggy server must
+                // not be able to push our cursor to a negative or future position.
+                if (confirmedOffset < 0)
+                {
+                    throw new CulpeoProtocolException("protocol-error",
+                        $"Server sent negative resume_offset ({confirmedOffset}) for stream '{serverId}'.");
+                }
+
+                // For send streams: the confirmed offset must not exceed what we have sent.
+                if ((streamType is CulpeoStreamType.Input or CulpeoStreamType.Duplex)
+                    && existing is not null
+                    && confirmedOffset > existing.SendOffset)
+                {
+                    throw new CulpeoProtocolException("protocol-error",
+                        $"Server resume_offset {confirmedOffset} exceeds client tracked send offset {existing.SendOffset} for stream '{serverId}'.");
+                }
+
                 // For send streams: server's confirmed receive offset is our new send cursor
                 if (streamType is CulpeoStreamType.Input or CulpeoStreamType.Duplex)
                 {

@@ -128,6 +128,26 @@ Implement an HTTP/2 transport adapter to prove the transport-agnostic design is 
 - Sanitizer-clean: builds must pass under AddressSanitizer and UndefinedBehaviorSanitizer
 - Fuzz testing for the frame parser using libFuzzer — the parser must handle arbitrary byte sequences without crashing or undefined behavior
 
+## Concurrency Guidelines
+
+**Prefer atomics over locks.** Only use `std::mutex` when the problem genuinely cannot be solved with atomic operations:
+
+- **Use `std::atomic<T>`** for state flags, reference counting, shutdown guards, and "already initialized" checks. Prefer `std::memory_order_acquire/release` over `seq_cst` unless you specifically need total order.
+- **Use `std::mutex`** only when you must hold the lock across non-atomic compound operations (e.g. sending a frame where serialization + write must be uninterrupted).
+- **Never hold a mutex across a blocking I/O call** — use a staging buffer, release the lock, then dispatch.
+- Document the reason for each mutex in a comment. If you can't explain why an atomic wouldn't suffice, use an atomic.
+
+Examples:
+```cpp
+// ✅ Atomic — shutdown guard, non-blocking
+std::shared_ptr<std::atomic<bool>> alive = std::make_shared<std::atomic<bool>>(true);
+if (!alive->load(std::memory_order_acquire)) return; // fast-path, no lock
+
+// ✅ Mutex — compound read-modify-write on multiple fields
+std::lock_guard lock(mu_);
+// serialize frame into buffer, update sequence number, enqueue — must be atomic
+```
+
 ## Performance Targets
 
 Design decisions must not preclude reaching these targets in a future optimization pass:

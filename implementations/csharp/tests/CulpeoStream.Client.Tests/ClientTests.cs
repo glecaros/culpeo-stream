@@ -844,7 +844,356 @@ public sealed class ClientTests
         await serverTask;
     }
 
-    // ── Private helpers ───────────────────────────────────────────────────────
+    // ── CS-P3-001: ConnectAsync concurrent-call race ──────────────────────────
+
+    [Fact]
+    public async Task ConnectAsync_ConcurrentCalls_SecondThrows()
+    {
+        // Two concurrent callers: once one is connected, the second must throw
+        // InvalidOperationException rather than silently starting a second loop.
+        var pair = WebSocketPair.Create();
+        var opts = DefaultOptions();
+        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+
+        await using var client = new CulpeoStreamClient(opts)
+        {
+            WebSocketFactory = (_, ct) => Task.FromResult(pair.Client)
+        };
+
+        // Complete the first connection
+        var serverTask = Task.Run(() => pair.ServerHandleInitAsync(ct: cts.Token));
+        await client.ConnectAsync(new Uri("wss://localhost"), cts.Token);
+        await serverTask;
+
+        // A second call after connection is established must throw
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => client.ConnectAsync(new Uri("wss://localhost"), cts.Token));
+
+        Assert.Contains("already", ex.Message, StringComparison.OrdinalIgnoreCase);
+
+        await client.DisconnectAsync();
+    }
+
+    // ── CS-P3-002: Bounded event channel — EventChannelCapacity option ────────
+
+    [Fact]
+    public void Options_DefaultEventChannelCapacity_Is1024()
+    {
+        var opts = new CulpeoStreamClientOptions
+        {
+            Authorization = "Bearer token",
+            Streams = [new StreamDeclaration { ContentType = "audio/opus", Type = CulpeoStreamType.Input, OffsetType = OffsetType.Message }]
+        };
+        Assert.Equal(1024, opts.EventChannelCapacity);
+    }
+
+    [Fact]
+    public void Options_CustomEventChannelCapacity_IsPreserved()
+    {
+        var opts = new CulpeoStreamClientOptions
+        {
+            Authorization = "Bearer token",
+            Streams = [new StreamDeclaration { ContentType = "audio/opus", Type = CulpeoStreamType.Input, OffsetType = OffsetType.Message }],
+            EventChannelCapacity = 256
+        };
+        Assert.Equal(256, opts.EventChannelCapacity);
+    }
+
+    // ── CS-P3-003: DisposeAsync awaits loop before disposing WebSocket ─────────
+
+    [Fact]
+    public async Task DisposeAsync_AwaitsLoopBeforeDisposingWebSocket()
+    {
+        // This test verifies that DisposeAsync does not race with the reconnect loop.
+        // We connect, start a receive loop, then call DisposeAsync and verify it completes
+        // cleanly (no ObjectDisposedException from the loop creating a new ws after dispose).
+        var (client, pair) = CreatePair(DefaultOptions(autoReconnect: false));
+        using var _ = pair;
+
+        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+
+        var serverTask = Task.Run(async () =>
+        {
+            await pair.ServerHandleInitAsync(ct: cts.Token);
+            // Close immediately to let the receive loop exit
+            await pair.ServerSendCloseAsync(ct: cts.Token);
+        });
+
+        await client.ConnectAsync(new Uri("wss://localhost"), cts.Token);
+        await serverTask;
+
+        // DisposeAsync should complete without throwing
+        await client.DisposeAsync();
+    }
+
+    // ── CS-P3-004: SendOffset mutation inside _sendLock ──────────────────────
+
+    [Fact]
+    public async Task SendMediaAsync_ConcurrentSends_OffsetsAreContiguous()
+    {
+        // Fire 10 concurrent sends; the resulting offsets (message-type) must form a
+        // contiguous sequence 0..9 with no duplicates or gaps.
+        var opts = new CulpeoStreamClientOptions
+        {
+            Authorization = "Bearer token",
+            Streams = [new StreamDeclaration { ContentType = "audio/opus", Type = CulpeoStreamType.Input, OffsetType = OffsetType.Message }],
+            AutoReconnect = false,
+            AllowInsecureConnections = true
+        };
+
+        var pair = WebSocketPair.Create();
+        await using var client = new CulpeoStreamClient(opts)
+        {
+            WebSocketFactory = (_, ct) => Task.FromResult(pair.Client)
+        };
+
+        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        const int frameCount = 10;
+        string streamId = "";
+
+        var serverTask = Task.Run(async () =>
+        {
+            var (_, _, streams) = await pair.ServerHandleInitAsync(ct: cts.Token);
+            streamId = streams[0].ServerId;
+            var frames = new List<CulpeoMessage>();
+            for (int i = 0; i < frameCount; i++)
+            {
+                frames.Add(await pair.ServerReceiveAsync(cts.Token));
+            }
+            return frames;
+        });
+
+        await client.ConnectAsync(new Uri("wss://localhost"), cts.Token);
+        await ReadNextEventAsync(client, cts.Token); // SessionEstablished
+
+        // Wait for server to be ready and stream ID known
+        await Task.Delay(50, cts.Token);
+
+        // Fire concurrent sends
+        var sends = Enumerable.Range(0, frameCount)
+            .Select(_ => client.SendMediaAsync(streamId, new byte[1], cts.Token))
+            .ToArray();
+        await Task.WhenAll(sends);
+
+        var receivedFrames = await serverTask;
+
+        // Each offset must appear exactly once and all values 0..frameCount-1 must be present
+        var offsets = receivedFrames.Select(f => f.Offset ?? -1).OrderBy(x => x).ToArray();
+        var expected = Enumerable.Range(0, frameCount).Select(i => (long)i).ToArray();
+        Assert.Equal(expected, offsets);
+
+        await client.DisconnectAsync();
+    }
+
+    // ── SEC-018: GetToken called on reconnect instead of static Authorization ─
+
+    [Fact]
+    public async Task ConnectAsync_UsesGetToken_WhenProvided()
+    {
+        // When GetToken is set, PerformHandshakeAsync must call it even on the first connect.
+        var tokenCallCount = 0;
+        var opts = new CulpeoStreamClientOptions
+        {
+            // Authorization deliberately omitted (null) — only GetToken provided
+            GetToken = async ct =>
+            {
+                Interlocked.Increment(ref tokenCallCount);
+                await Task.Yield();
+                return "Bearer fresh-token";
+            },
+            Streams = [new StreamDeclaration { ContentType = "audio/opus", Type = CulpeoStreamType.Input, OffsetType = OffsetType.Message }],
+            AutoReconnect = false,
+            AllowInsecureConnections = true
+        };
+
+        var pair = WebSocketPair.Create();
+        await using var client = new CulpeoStreamClient(opts)
+        {
+            WebSocketFactory = (_, ct) => Task.FromResult(pair.Client)
+        };
+
+        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        CulpeoMessage? initFrame = null;
+
+        var serverTask = Task.Run(async () =>
+        {
+            // ServerHandleInitAsync reads the init frame, sends ack, and returns the init frame
+            var (frame, _, _) = await pair.ServerHandleInitAsync(ct: cts.Token);
+            initFrame = frame;
+        });
+
+        await client.ConnectAsync(new Uri("wss://localhost"), cts.Token);
+        await serverTask;
+
+        Assert.Equal(1, tokenCallCount);
+        Assert.Equal("Bearer fresh-token", initFrame?.Authorization);
+
+        await client.DisconnectAsync();
+    }
+
+    [Fact]
+    public void Constructor_NeitherAuthorizationNorGetToken_Throws()
+    {
+        var ex = Assert.Throws<ArgumentException>(() =>
+            new CulpeoStreamClient(new CulpeoStreamClientOptions
+            {
+                Authorization = null,
+                GetToken = null,
+                Streams = [new StreamDeclaration { ContentType = "audio/opus", Type = CulpeoStreamType.Input, OffsetType = OffsetType.Message }]
+            }));
+        Assert.Contains("Authorization", ex.Message);
+        Assert.Contains("GetToken", ex.Message);
+    }
+
+    // ── SEC-019: Server-supplied resume_offset validation ─────────────────────
+
+    [Fact]
+    public async Task Reconnect_NegativeResumeOffset_ClosesNonResumably()
+    {
+        // Server sends a negative resume_offset — client must treat it as a protocol error
+        // and clear session state (non-resumable failure).
+        var pair1 = WebSocketPair.Create();
+        var pair2 = WebSocketPair.Create();
+        int connectCount = 0;
+
+        var opts = new CulpeoStreamClientOptions
+        {
+            Authorization = "Bearer token",
+            Streams = [new StreamDeclaration { ContentType = "audio/opus", Type = CulpeoStreamType.Input, OffsetType = OffsetType.Message }],
+            AutoReconnect = true,
+            MaxReconnectAttempts = 2,
+            InitialBackoff = TimeSpan.FromMilliseconds(20),
+            MaxBackoff = TimeSpan.FromMilliseconds(50),
+            AllowInsecureConnections = true
+        };
+
+        await using var client = new CulpeoStreamClient(opts)
+        {
+            WebSocketFactory = (_, ct) =>
+            {
+                var c = Interlocked.Increment(ref connectCount);
+                return Task.FromResult(c == 1 ? pair1.Client : pair2.Client);
+            }
+        };
+
+        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        string? sessionIdOnRetry = null;
+
+        // First connection: establish, then close to trigger reconnect
+        var first = Task.Run(async () =>
+        {
+            await pair1.ServerHandleInitAsync(sessionIdToReply: "sess-1", ct: cts.Token);
+            await pair1.Server.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", cts.Token);
+        });
+
+        await client.ConnectAsync(new Uri("wss://localhost"), cts.Token);
+        await ReadNextEventAsync(client, cts.Token); // SessionEstablished
+        await first;
+
+        // Second connection: send init-ack with negative resume_offset
+        var second = Task.Run(async () =>
+        {
+            var initFrame = await pair2.ServerReceiveAsync(cts.Token);
+            sessionIdOnRetry = initFrame.SessionId;
+
+            // Reply with a malicious negative resume_offset
+            var bodyStr = "{\"version\":\"0.3\",\"streams\":[{\"id\":\"s1\",\"content_type\":\"audio/opus\",\"type\":\"input\",\"offset_type\":\"message\",\"resume_offset\":-99}]}";
+            var ack = new CulpeoMessage(
+                CulpeoMessageKind.Control,
+                System.Text.Encoding.UTF8.GetBytes(bodyStr),
+                @event: "culpeo.init-ack",
+                contentType: "application/json",
+                sessionId: "sess-1",
+                bufferWindow: 5000);
+            await pair2.ServerSendControlAsync(ack, cts.Token);
+
+            // Eventually the client will give up — just drain until closure
+            try { await pair2.ServerReceiveAsync(cts.Token); } catch { }
+        });
+
+        // Client should eventually disconnect
+        using var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+        await foreach (var evt in client.ReceiveAsync(readCts.Token))
+        {
+            if (evt is Disconnected) break;
+        }
+
+        await second;
+
+        // On the reconnect attempt, session-id was sent (resumption was attempted)
+        Assert.Equal("sess-1", sessionIdOnRetry);
+    }
+
+    [Fact]
+    public async Task Reconnect_ResumeOffsetExceedsTracked_ClosesNonResumably()
+    {
+        // Server sends a resume_offset greater than the client's tracked send offset —
+        // client must treat this as a protocol error and not blindly advance its cursor.
+        var pair1 = WebSocketPair.Create();
+        var pair2 = WebSocketPair.Create();
+        int connectCount = 0;
+
+        var opts = new CulpeoStreamClientOptions
+        {
+            Authorization = "Bearer token",
+            Streams = [new StreamDeclaration { ContentType = "audio/opus", Type = CulpeoStreamType.Input, OffsetType = OffsetType.Message }],
+            AutoReconnect = true,
+            MaxReconnectAttempts = 2,
+            InitialBackoff = TimeSpan.FromMilliseconds(20),
+            MaxBackoff = TimeSpan.FromMilliseconds(50),
+            AllowInsecureConnections = true
+        };
+
+        await using var client = new CulpeoStreamClient(opts)
+        {
+            WebSocketFactory = (_, ct) =>
+            {
+                var c = Interlocked.Increment(ref connectCount);
+                return Task.FromResult(c == 1 ? pair1.Client : pair2.Client);
+            }
+        };
+
+        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+
+        // First connection: establish (send 0 frames so tracked offset = 0), then close
+        var first = Task.Run(async () =>
+        {
+            await pair1.ServerHandleInitAsync(sessionIdToReply: "sess-x", ct: cts.Token);
+            await pair1.Server.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", cts.Token);
+        });
+
+        await client.ConnectAsync(new Uri("wss://localhost"), cts.Token);
+        await ReadNextEventAsync(client, cts.Token);
+        await first;
+
+        // Second connection: send init-ack with resume_offset > tracked (0) — e.g. 9999
+        var second = Task.Run(async () =>
+        {
+            await pair2.ServerReceiveAsync(cts.Token); // consume init
+
+            var bodyStr = "{\"version\":\"0.3\",\"streams\":[{\"id\":\"s2\",\"content_type\":\"audio/opus\",\"type\":\"input\",\"offset_type\":\"message\",\"resume_offset\":9999}]}";
+            var ack = new CulpeoMessage(
+                CulpeoMessageKind.Control,
+                System.Text.Encoding.UTF8.GetBytes(bodyStr),
+                @event: "culpeo.init-ack",
+                contentType: "application/json",
+                sessionId: "sess-x",
+                bufferWindow: 5000);
+            await pair2.ServerSendControlAsync(ack, cts.Token);
+
+            try { await pair2.ServerReceiveAsync(cts.Token); } catch { }
+        });
+
+        using var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+        await foreach (var evt in client.ReceiveAsync(readCts.Token))
+        {
+            if (evt is Disconnected) break;
+        }
+
+        await second;
+        // Test passes if no unhandled exception was thrown and client reached Disconnected
+        Assert.Equal(CulpeoClientState.Disconnected, client.State);
+    }
 
     private static async Task<CulpeoClientEvent> ReadNextEventAsync(
         CulpeoStreamClient client,

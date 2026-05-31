@@ -13,20 +13,33 @@
 //
 // Usage (inside a uWS .open handler):
 //
-//   app.ws<SessionData>("/*", {
+//   struct UserData {
+//       std::unique_ptr<culpeo::session::Session>    session;
+//       std::unique_ptr<culpeo::transport::WsTransport> transport;
+//       std::shared_ptr<std::atomic<bool>>           alive;  // from make_uws_transport
+//   };
+//
+//   app.ws<UserData>("/*", {
 //       .open = [](auto* ws) {
-//           auto transport = culpeo::transport::make_uws_transport(ws);
-//           ws->getUserData()->transport = std::move(transport);
-//           ws->getUserData()->session =
-//               std::make_unique<culpeo::session::Session>(
-//                   *ws->getUserData()->transport, callbacks, config);
+//           auto [transport, alive] = culpeo::transport::make_uws_transport(ws);
+//           auto* d = ws->getUserData();
+//           d->alive     = alive;          // store so .close can reach it
+//           d->transport = std::move(transport);
+//           d->session   = std::make_unique<culpeo::session::Session>(
+//               *d->transport, callbacks, config);
 //       },
 //       .message = [](auto* ws, std::string_view msg, uWS::OpCode op) {
 //           // Parse CulpeoStream frame from msg, then feed to session
 //       },
+//       // REQUIRED shutdown sequence (CPP-P3-001):
+//       //   1. Set alive = false  → stops any in-flight defer() callbacks
+//       //   2. session.reset()    → destroys Session (which may call transport)
+//       //   3. transport.reset()  → destroys WsTransport (safe: all defers see alive=false)
 //       .close = [](auto* ws, int /*code*/, std::string_view /*reason*/) {
-//           ws->getUserData()->session.reset();
-//           ws->getUserData()->transport.reset();
+//           auto* d = ws->getUserData();
+//           d->alive->store(false, std::memory_order_release); // stop deferred sends
+//           d->session.reset();    // destroy Session BEFORE transport (CPP-P3-004)
+//           d->transport.reset();  // then transport
 //       }
 //   });
 //
@@ -46,6 +59,20 @@
 // For latency-critical applications that always call Session::send_media()
 // from within uWS callbacks (i.e. always on the loop thread), you can
 // replace the defer() wrappers below with direct ws->send() calls.
+//
+// Shutdown safety (CPP-P3-001)
+// ────────────────────────────
+// Loop::defer() captures a raw uWS::Loop* and a raw uWS::WebSocket*.  If the
+// event-loop shuts down or the socket is destroyed before a deferred callback
+// fires, invoking the stale pointer is UB/crash.
+//
+// The alive flag (shared_ptr<atomic<bool>>) solves this:
+//   • Every defer() lambda captures alive and checks it before touching ws.
+//   • The .close handler sets alive=false BEFORE resetting Session/Transport.
+//   • Any lambda that fires after alive=false is a no-op.
+//
+// The alive flag is returned from make_uws_transport() and MUST be stored in
+// UserData and set to false at the start of the .close handler.
 
 #include "culpeo/transport_ws.hpp"
 
@@ -53,12 +80,21 @@
 #include <App.h>
 #include <Loop.h>
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
 
 namespace culpeo::transport {
+
+/// Result of make_uws_transport().
+/// Store `alive` in your UserData; set it to false at the start of the
+/// WebSocket .close handler BEFORE resetting session or transport.
+struct UwsTransportResult {
+    std::unique_ptr<WsTransport>           transport;
+    std::shared_ptr<std::atomic<bool>>     alive;
+};
 
 /// Create a WsTransport that wraps a uWebSockets WebSocket* handle.
 ///
@@ -67,44 +103,64 @@ namespace culpeo::transport {
 ///               The pointer MUST remain valid for the lifetime of the
 ///               returned WsTransport (i.e. until the .close callback fires).
 ///
+/// Returns a UwsTransportResult containing:
+///   - transport: the WsTransport to hand to Session.
+///   - alive:     a shared flag that MUST be stored in UserData and set to
+///                false at the VERY START of the .close handler to prevent
+///                use-after-free on the WebSocket* and Loop* after shutdown.
+///
 /// The returned transport is safe to use from any thread.  Sends from
 /// off-loop threads are posted via uWS::Loop::defer().
 template <bool SSL>
-std::unique_ptr<WsTransport>
+UwsTransportResult
 make_uws_transport(uWS::WebSocket<SSL, true, void*>* ws) {
+    // Shared liveness flag: set to false in the .close handler to ensure
+    // no deferred lambda touches a freed WebSocket* or Loop* (CPP-P3-001).
+    auto alive = std::make_shared<std::atomic<bool>>(true);
+
     // Capture the loop so we can defer off-thread sends.
     uWS::Loop* loop = uWS::Loop::get();
 
-    auto send_text = [ws, loop](std::span<const std::byte> frame) {
+    auto send_text = [ws, loop, alive](std::span<const std::byte> frame) {
+        // Guard before posting — loop might already be gone.
+        if (!alive->load(std::memory_order_acquire)) return;
         // Copy the data — the span may be gone by the time defer() fires.
         std::vector<std::byte> buf(frame.begin(), frame.end());
-        loop->defer([ws, buf = std::move(buf)]() {
+        loop->defer([ws, buf = std::move(buf), alive]() {
+            // Guard again inside the callback — socket may have closed.
+            if (!alive->load(std::memory_order_acquire)) return;
             ws->send(
                 std::string_view(reinterpret_cast<const char*>(buf.data()), buf.size()),
                 uWS::OpCode::TEXT);
         });
     };
 
-    auto send_binary = [ws, loop](std::span<const std::byte> frame) {
+    auto send_binary = [ws, loop, alive](std::span<const std::byte> frame) {
+        if (!alive->load(std::memory_order_acquire)) return;
         std::vector<std::byte> buf(frame.begin(), frame.end());
-        loop->defer([ws, buf = std::move(buf)]() {
+        loop->defer([ws, buf = std::move(buf), alive]() {
+            if (!alive->load(std::memory_order_acquire)) return;
             ws->send(
                 std::string_view(reinterpret_cast<const char*>(buf.data()), buf.size()),
                 uWS::OpCode::BINARY);
         });
     };
 
-    auto close_fn = [ws, loop](int code, std::string_view reason) {
+    auto close_fn = [ws, loop, alive](int code, std::string_view reason) {
+        if (!alive->load(std::memory_order_acquire)) return;
         std::string reason_copy(reason);
-        loop->defer([ws, code, reason_copy = std::move(reason_copy)]() {
+        loop->defer([ws, code, reason_copy = std::move(reason_copy), alive]() {
+            if (!alive->load(std::memory_order_acquire)) return;
             ws->end(code, reason_copy);
         });
     };
 
-    return std::make_unique<WsTransport>(
+    auto transport = std::make_unique<WsTransport>(
         std::move(send_text),
         std::move(send_binary),
         std::move(close_fn));
+
+    return UwsTransportResult{std::move(transport), std::move(alive)};
 }
 
 }  // namespace culpeo::transport

@@ -604,3 +604,65 @@ Existing users of `ITransport` must update their `close()` override (one-line ch
 
 ### Spec Reference
 RFC 6455 §7.4.1; Addendum B §B.3; C++ agent instructions Phase 3
+
+## Atomics-first concurrency policy
+**Date:** 2026-05-31
+**Phase:** Cross-cutting
+**Status:** Decided
+
+### Context
+Phase 3 introduced concurrency requirements in the transport layer (WsTransport mutex, uws_adapter shutdown flag). There was a tendency to use `std::mutex` broadly, even for simple boolean shutdown guards where a `std::atomic<bool>` suffices.
+
+### Decision
+Prefer `std::atomic<T>` for state flags, shutdown guards, and "already initialized" checks. Only use `std::mutex` when holding it across compound operations that must be uninterrupted (e.g. serializing a frame and appending it to a send queue atomically). Document the reason for each mutex at the declaration site.
+
+### Tradeoffs
+Atomics are cheaper (no kernel involvement, no contention sleep), but cannot atomically update two fields together. For single-field guards or flags, atomics are strictly superior. Mutexes remain appropriate for protecting multi-field invariants.
+
+### Spec Reference
+N/A (implementation policy)
+
+## Phase 3 review fixes: alive flag, exception swallowing, close-code mapping, reason sanitization
+**Date:** 2026-05-31
+**Phase:** Phase 3 — Transport Adapter
+**Status:** Decided
+
+### Context
+Phase 3 review (CPP-P3-001 through CPP-P3-004, SEC-017) identified five issues in `libculpeo-transport-ws`:
+
+1. **CPP-P3-001** — All `loop->defer()` lambdas in `uws_adapter.hpp` captured raw `uWS::Loop*` and `uWS::WebSocket*` without guarding against the socket/loop being destroyed before the deferred callback fired (use-after-free / UB on shutdown).
+2. **CPP-P3-002** — `std::function` callbacks invoked in `send_text`, `send_binary`, `close` could throw, causing an unhandled exception to propagate out of `ITransport` method calls, potentially crashing the event-loop thread.
+3. **CPP-P3-003** — `to_ws_close_code()` mapped `"server-shutdown"` and `"idle-timeout"` to RFC 6455 code 1002 (Protocol Error) rather than 1001 (Going Away), which misrepresents the close reason to the peer.
+4. **CPP-P3-004** — `Session` constructor and `uws_adapter.hpp` usage comment did not document the requirement that `ITransport` must outlive the `Session` instance, causing subtle lifetime bugs if the teardown order was wrong.
+5. **SEC-017** — `WsTransport::close()` passed the reason string directly to the callback without enforcing RFC 6455 §5.5.1 constraints: reason ≤ 123 bytes and no ASCII control characters.
+
+### Decision
+
+**CPP-P3-001 (`uws_adapter.hpp`):**
+`make_uws_transport()` now creates a `shared_ptr<atomic<bool>> alive` flag (initialized `true`) and captures it in every lambda. Each lambda guards with `alive->load(acquire)` before calling `loop->defer()`, and the inner defer lambda guards again before touching `ws`. The flag is returned to the caller as `UwsTransportResult::alive`. The `.close` handler MUST store it and call `alive->store(false, release)` at the very start, BEFORE resetting session or transport. The usage example in the file header was updated with the complete, correct shutdown sequence.
+
+**CPP-P3-002 (`transport_ws.cpp`):**
+All three `WsTransport` methods now wrap their callback invocations in `try { ... } catch (...) {}`. Transport-level exceptions are non-fatal: logging would require a logger dependency; silencing is safe because the session layer already has a best-effort close contract.
+
+**CPP-P3-003 (`session.cpp` `to_ws_close_code`):**
+Added a new branch before the catch-all `return 1002`:
+```cpp
+if (culpeo_code == "server-shutdown" || culpeo_code == "idle-timeout") return 1001;
+```
+
+**CPP-P3-004 (`session.hpp`, `uws_adapter.hpp`):**
+Added a Doxygen `@param transport` comment to the `Session` constructor explaining the lifetime requirement. Updated `uws_adapter.hpp` usage example to document the required Session-before-Transport teardown order.
+
+**SEC-017 (`transport_ws.cpp` `WsTransport::close`):**
+Before invoking the close callback:
+1. Truncate reason to 123 bytes if longer (RFC 6455 §5.5.1: max payload 125 bytes minus 2-byte status code).
+2. Replace all bytes with `unsigned char < 0x20` (except `\t`) with `'?'` to neutralise `\r\n` injection and other control characters.
+Full UTF-8 validation was not added in this pass (the RFC does not prohibit multi-byte sequences with values ≥ 0x80; stripping control bytes is the minimum required fix). A follow-up can add a proper UTF-8 validator.
+
+### Tradeoffs
+- The `UwsTransportResult` struct is a breaking API change vs. the original `std::unique_ptr<WsTransport>` return type, but no production callers exist yet and the change forces correct shutdown discipline on all future users.
+- Swallowing all exceptions in send/close loses observability but avoids crashing the event-loop thread; higher-level health monitoring (e.g. session on_error callback) is the correct place to surface errors.
+- Truncating the close reason at 123 bytes is lossy but safe; long reasons are usually diagnostic text where the first 123 bytes retain context.
+
+### Spec Reference
+RFC 6455 §5.5.1, §7.4.1; CPP-P3-001 through CPP-P3-004; SEC-017

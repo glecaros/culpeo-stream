@@ -109,6 +109,28 @@ Implement an HTTP/2 transport to validate the transport-agnostic design with a s
 - `CulpeoStream.AspNetCore` may depend on `Microsoft.AspNetCore.*`
 - All session IDs and auth nonces must use `RandomNumberGenerator.GetBytes()`
 
+## Concurrency Guidelines
+
+**Prefer atomics over locks.** Only reach for `SemaphoreSlim`, `lock`, or other blocking primitives when the problem genuinely cannot be solved with atomic operations:
+
+- **Use `Interlocked.CompareExchange` / `Interlocked.Exchange`** for state flags, "already started" guards, and reference swaps. These are non-blocking, allocation-free, and compose well with `async` code.
+- **Use `SemaphoreSlim(1,1)`** only when you need to serialize a critical section that spans `await` boundaries (e.g. `_sendLock` where frame serialization and send must be atomic across an async call).
+- **Never use `lock` around async code** — it cannot be awaited and will deadlock or block threadpool threads.
+- Document the reason for each lock/semaphore in a comment. If you can't explain why an atomic wouldn't suffice, use an atomic.
+
+Examples:
+```csharp
+// ✅ Atomic — fast, non-blocking, correct for "prevent double-connect"
+private int _connectState = 0;
+if (Interlocked.CompareExchange(ref _connectState, 1, 0) != 0)
+    throw new InvalidOperationException("Already connected.");
+
+// ✅ SemaphoreSlim — needed because the critical section spans an await
+await _sendLock.WaitAsync(ct); // serialize frame write + network send
+try { ... await _ws.SendAsync(...); }
+finally { _sendLock.Release(); }
+```
+
 ## Security Requirements
 
 Work closely with the Security Agent. Specifically:
