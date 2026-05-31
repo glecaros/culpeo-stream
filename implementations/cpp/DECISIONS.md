@@ -666,3 +666,27 @@ Full UTF-8 validation was not added in this pass (the RFC does not prohibit mult
 
 ### Spec Reference
 RFC 6455 §5.5.1, §7.4.1; CPP-P3-001 through CPP-P3-004; SEC-017
+
+## C++20 coroutines for transport interface — deferred to Phase 4
+**Date:** 2026-05-31
+**Phase:** Phase 4 — HTTP/2 Transport
+**Status:** Deferred (decision required in Phase 4)
+
+### Context
+The current `ITransport` interface is synchronous and void-returning. `WsTransport` uses `mutex` + `loop->defer()` to marshal sends onto the uWS event loop, with `try/catch` swallowing callback exceptions. This works but has two structural weaknesses: no backpressure (callers cannot know when a send completes) and no error propagation from sends.
+
+HTTP/2 is the natural point to evaluate coroutines: stream multiplexing, flow control, and HEADERS-before-DATA sequencing all map better to `co_await` chains than to nested callbacks.
+
+### Options considered
+1. **Stay callback-based** — extend the existing pattern to HTTP/2. Works, but callback graphs for H2 stream lifecycle become complex.
+2. **C++20 coroutines with Asio** (`asio::awaitable<T>`) — mature executor, `FetchContent`-friendly, good nghttp2 integration examples.
+3. **Minimal custom awaitables** — no new dependency, but significant boilerplate for a correct executor.
+
+### Decision
+Deferred. The WebSocket transport does not need to change. Phase 4 agent MUST evaluate options 2 and 3, pick one, and record the decision. If coroutines are adopted for `H2Transport`, introduce a parallel `IAsyncTransport` interface rather than modifying the existing `ITransport` — the WebSocket transport can opt in later.
+
+### Tradeoffs
+Coroutines eliminate the mutex/defer dance and give natural backpressure and error propagation. The cost is a scheduler dependency (Asio) and more complex mock patterns in tests. Callbacks are simpler to test but harder to reason about under complex async sequences (H2 flow control, GOAWAY, RST_STREAM).
+
+### Spec Reference
+Addendum C (HTTP/2 binding)
