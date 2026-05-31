@@ -146,3 +146,79 @@ Use `security/required-security-tests.md` as the gate for later implementation r
 
 ### Resolution
 Resolved for this task. `security/findings/` was created for future reports.
+
+---
+
+## Phase 3 review: session-ownership binding elevated to High
+**Date:** 2026-05-31
+**Target:** TypeScript
+**Status:** Open
+
+### Context
+Reviewing the `culpeostream-server` Phase 3 additions, specifically the `handleInitMessage`
+flow that performs authentication and then separately loads a session snapshot by ID.
+
+### Finding or Decision
+I elevated SEC-020 (session resumption with no auth-to-session binding) to **High** rather
+than Medium. Although session IDs are high-entropy (UUID v4 = 122 bits) making brute-force
+impractical, the authentication API design (`authenticate(authorization: string)`) positively
+prevents server implementors from enforcing ownership at the authentication layer without
+architectural changes. The vulnerability requires only a leaked session ID — a plausible event
+via log leakage, ws:// downgrade (SEC-001), or an administrative interface — and any valid
+token.
+
+### Recommended Action
+Extend `authenticate` signature to receive `sessionId?: string`, allowing server code to
+enforce binding. Document that the current design relies on session ID secrecy as sole
+ownership signal (which is insufficient for a defence-in-depth posture).
+
+### Resolution
+Open — awaiting TypeScript agent response. Blocks Phase 4 hardening.
+
+---
+
+## Phase 3 review: static token reuse on reconnect filed as Medium (not High)
+**Date:** 2026-05-31
+**Target:** C#
+**Status:** Open
+
+### Context
+`CulpeoStreamClient` always uses `_options.Authorization` (static construction-time token)
+for every `culpeo.init`, including reconnects. `GetToken` is only called reactively.
+
+### Finding or Decision
+Filed as **Medium** (SEC-018) rather than High. The primary impact is availability (reconnect
+storm when token expires during disconnect), not direct credential exposure. Confidentiality
+is not directly compromised because the token is sent over TLS. However, the design is
+counter-intuitive and causes unnecessary token lifetime extension in memory.
+
+### Recommended Action
+`GetToken`, when provided, should be called before every `culpeo.init`. See SEC-018.
+
+### Resolution
+Open — awaiting C# agent response. Must fix before GA.
+
+---
+
+## Phase 3 review: close-reason injection downgraded from High to Medium for C++
+**Date:** 2026-05-31
+**Target:** C++
+**Status:** Open
+
+### Context
+`WsTransport::close()` passes `reason` to `ws->end()` without length or UTF-8 validation.
+Initial assessment considered HTTP header injection, but WebSocket close frames are binary
+frames (post-HTTP-upgrade), so `\r\n` in the reason does not inject HTTP headers.
+
+### Finding or Decision
+Filed as **Medium** (SEC-017). The real risks are: (1) RFC 6455 violation from reasons >123
+bytes causing malformed close frames; (2) log injection from `\r\n` in reasons. Not Critical
+or High because exploitation requires the session layer to supply an oversized or binary-
+containing reason, which is an unusual but not impossible code path.
+
+### Recommended Action
+Enforce ≤123 bytes and strip `\r\n`/null bytes in `WsTransport::close()` before forwarding.
+Add test cases for oversized and control-character-containing reasons.
+
+### Resolution
+Open — awaiting C++ agent response.
