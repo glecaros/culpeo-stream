@@ -690,3 +690,125 @@ Coroutines eliminate the mutex/defer dance and give natural backpressure and err
 
 ### Spec Reference
 Addendum C (HTTP/2 binding)
+
+## Phase 4: Coroutine executor choice — Asio standalone
+**Date:** 2026-06-01
+**Phase:** Phase 4 — HTTP/2 Transport
+**Status:** Decided
+
+### Context
+Phase 4 requires an async model for the HTTP/2 transport. Evaluated three options:
+1. **Asio standalone** (`asio::awaitable<T>`) — header-only, Apache 2.0, battle-tested, `asio::ssl::stream` for TLS, `asio::experimental::channel` for async queues, FetchContent or system-package friendly.
+2. **libcoro / cppcoro** — lighter, but cppcoro is unmaintained and libcoro is not widely deployed; FetchContent would be required.
+3. **Roll minimal awaitables** — avoids deps but is ~500 LOC of coroutine machinery with no ecosystem leverage.
+
+System package `libasio-dev 1.28.1` is already installed on the build host; spec tag is `asio-1-30-2` via FetchContent. Using the system package (version 1.28.1) avoids a git clone in CI and satisfies all required features (`asio::awaitable`, `asio::ssl`, `asio::experimental::channel`, strands). The version mismatch (1.28 vs 1.30) is immaterial for the features used here.
+
+### Decision
+Use **Asio standalone 1.28.1** (system package via `find_path`) as the async executor. `IAsyncTransport` uses `asio::awaitable<T>` throughout. `H2Transport` uses an `asio::strand<asio::any_io_executor>` for send serialization — this replaces the mutex+defer pattern from `WsTransport`.
+
+uWebSockets uses its own libuv-based event loop. `H2Transport`'s Asio executor runs on a **separate `asio::io_context`** managed by the caller; the two loops never share a thread or touch each other's sockets. No integration conflict.
+
+### Tradeoffs
+- Gained: natural backpressure, error propagation from sends, readable H2 stream lifecycle as `co_await` chains.
+- Gave up: zero new compile-time dependencies (asio is header-only so link-time cost is nil; but headers do add ~0.5s to a cold build).
+- Risk accepted: `asio::experimental::channel` is in the experimental namespace; API could change in future asio versions. Acceptable for Phase 4.
+
+### Spec Reference
+Addendum C, agent instructions Phase 4 (coroutine executor choice)
+
+## Phase 4: IAsyncTransport — parallel interface, no modification of ITransport
+**Date:** 2026-06-01
+**Phase:** Phase 4 — HTTP/2 Transport
+**Status:** Decided
+
+### Context
+The existing `ITransport` is synchronous/callback-based and used by `libculpeo-session`. Modifying it would break all existing consumers.
+
+### Decision
+Introduce `IAsyncTransport` as a **parallel, independent interface** in `libculpeo-transport-h2`. It adds `receive_frame()` beyond the three send/close methods from the instructions, because `ISessionHandler::handle(IAsyncTransport&)` needs bidirectional access — a handler that can only send cannot implement the echo test or any real session lifecycle. Documented deviation from the literal interface specification.
+
+`H2Transport` implements `IAsyncTransport` (including `receive_frame()`). `WsTransport` is **not modified**; it continues implementing `ITransport` only.
+
+### Tradeoffs
+Adding `receive_frame()` to `IAsyncTransport` makes the interface bidirectional and removes the need to `dynamic_cast` in every handler. The cost: `IAsyncTransport` is now slightly wider than the instructions specify. A future WS async adapter would need a different receive mechanism (WS uses push callbacks) but could provide a channel-backed `receive_frame()` as a compatibility shim.
+
+### Spec Reference
+Agent instructions Phase 4 (IAsyncTransport variant)
+
+## Phase 4: nghttp2 integration — API/callback mode with mem_send
+**Date:** 2026-06-01
+**Phase:** Phase 4 — HTTP/2 Transport
+**Status:** Decided
+
+### Context
+nghttp2 has two I/O modes: transport mode (own callbacks for send/recv) and API mode (`nghttp2_session_mem_send` / `nghttp2_session_mem_recv`). For Asio integration, API mode is cleaner: nghttp2 returns byte slices synchronously, and we write them asynchronously.
+
+### Decision
+Use **API mode** (`nghttp2_session_mem_send` / `nghttp2_session_mem_recv`). The read loop:
+1. `co_await async_read_some(buf)` — get TCP/TLS bytes
+2. `nghttp2_session_mem_recv(ng_, buf, n)` — feed nghttp2 (callbacks fire synchronously)
+3. `drain_to_wire()` — call `nghttp2_session_mem_send()` in a loop, accumulate bytes, `co_await async_write()`
+
+For DATA sending, `nghttp2_submit_data()` with a streaming `read_callback` is required (no alternative API). The `read_callback` is backed by a per-stream deque of pending send buffers. When the deque is empty the callback returns `NGHTTP2_ERR_DEFERRED`; `nghttp2_session_resume_data()` is called after enqueueing new data.
+
+### Tradeoffs
+- Gained: clean separation of sync state machine from async I/O. No nghttp2 send_callback needed.
+- Risk: if flow control window is exhausted, `drain_to_wire()` produces fewer bytes than expected, and the read loop must continue reading (to receive WINDOW_UPDATE) before the deferred DATA can proceed. This is handled correctly by the design: the read loop always drains after every read.
+
+### Spec Reference
+Addendum C §C.4 (frame boundaries), §C.5 (TLS)
+
+## Phase 4: CulpeoStream H2 framing order — length-first per spec
+**Date:** 2026-06-01
+**Phase:** Phase 4 — HTTP/2 Transport
+**Status:** Decided
+
+### Context
+The agent instructions bullet points list type byte before length field. Spec §C.4 diagram shows length field first, and explicitly states "length of the following frame (type octet + header block + body)".
+
+### Decision
+Follow **spec §C.4**: framing is `[4-byte BE length][1-byte type][N-byte culpeostream frame]`. Length field includes the type byte (so `length = 1 + culpeostream_frame_bytes`). This matches the spec diagram exactly.
+
+### Tradeoffs
+The agent instructions order differs; noting the discrepancy here. The spec is authoritative.
+
+### Spec Reference
+Addendum C §C.4
+
+## Phase 4: nghttp2 system package vs FetchContent
+**Date:** 2026-06-01
+**Phase:** Phase 4 — HTTP/2 Transport
+**Status:** Decided
+
+### Context
+Instructions specify nghttp2 v1.62.1 via FetchContent. System has `libnghttp2-dev 1.59.0` installed.
+
+### Decision
+Use **system package** (`find_package(PkgConfig)` + `pkg_check_modules(NGHTTP2 REQUIRED libnghttp2)`) to avoid a 30-second git clone in CI. Version 1.59.0 supports all APIs used (mem_send, mem_recv, submit_request, submit_response, submit_data, resume_data, experimental channels). If the system package is absent, the CMakeLists falls back to FetchContent v1.62.1 automatically.
+
+### Tradeoffs
+- Gained: fast CI builds, no network dependency.
+- Risk: if a deployment environment lacks libnghttp2-dev, the fallback FetchContent will trigger a build from source which takes ~2 minutes. Acceptable.
+
+### Spec Reference
+Agent instructions Phase 4 (nghttp2 integration)
+
+## Phase 4: Cleartext h2c for tests (AllowCleartext opt-in)
+**Date:** 2026-06-01
+**Phase:** Phase 4 — HTTP/2 Transport
+**Status:** Decided
+
+### Context
+Spec §C.5 requires TLS in production. Tests need to work without certificate management. The instructions explicitly say to add `AllowCleartext` for tests.
+
+### Decision
+`CulpeoH2Client` and `CulpeoH2Server` accept an `allow_cleartext` flag (default false). When set, they skip TLS and use direct HTTP/2 "Prior Knowledge" connections (RFC 7540 §3.4) — the client sends the 24-byte PRI preface directly over TCP. nghttp2 handles this transparently.
+
+All unit tests use `allow_cleartext = true`. TLS path is exercised by the `AllowCleartext=false` code path but not in automated tests (cert management is out of scope for CI).
+
+### Tradeoffs
+Cleartext tests are not as thorough as TLS tests. The TLS code path (ALPN negotiation, certificate validation) would require a certificate fixture; deferred to integration testing.
+
+### Spec Reference
+Addendum C §C.5, agent instructions Phase 4 (Cleartext mode)

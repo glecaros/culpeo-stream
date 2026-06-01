@@ -487,3 +487,71 @@ Does not fully prevent a single identity from monopolising the store. Accepted b
 
 ### Spec Reference
 N/A; SEC-022
+
+## HTTP/2 Transport Package Structure
+**Date:** 2025-07-14
+**Phase:** Phase 4
+**Status:** Decided
+
+### Context
+Phase 4 requires a new `culpeostream-http2` package implementing the Addendum C binding. The package must share no runtime dependencies with the server's `ws` transport and must be usable independently. Design options were: (a) add HTTP/2 support to `culpeostream-server`, or (b) create a separate package.
+
+### Decision
+Create a standalone `packages/culpeostream-http2/` package with its own `package.json`, `tsconfig.json`, and Vitest configuration. It depends on `culpeostream` (core) for frame serialization but has zero runtime dependencies beyond Node.js built-ins (`node:http2`).
+
+### Tradeoffs
+Extra package means one more `npm install` step, but the transport-agnostic design goal demands clean separation. Sharing the `ISessionStore` and `ICulpeoStreamHandler` interfaces as a future dependency on `culpeostream-server` is deferred (they would add a circular dependency risk since both are siblings).
+
+### Spec Reference
+Addendum C; TypeScript agent Phase 4 requirements
+
+## HTTP/2 Frame Envelope Byte Order
+**Date:** 2025-07-14
+**Phase:** Phase 4
+**Status:** Decided
+
+### Context
+The CulpeoStream spec (Addendum C, §C.4) shows the frame envelope as `[4-byte length][type octet + payload]` — i.e. the length prefix comes first and includes the type octet in the payload. The task interface specifies `[type: 1][length: 4 big-endian][payload: N]` — type comes first, and the length covers only the payload (not the type octet).
+
+### Decision
+Follow the task interface specification: `[type:1][length:4][payload:N]`. The `encodeFrame` / `decodeFrame` functions use this layout. Both client and server use the same functions, so all CulpeoStream-HTTP/2 traffic within this implementation is consistent regardless of the spec ordering discrepancy.
+
+### Tradeoffs
+Deviates from the literal byte diagram in Addendum C §C.4. However, since this is a TypeScript-internal transport and interop is validated against the same codebase, the wire format is self-consistent. A note is left in `framing.ts` and here for future implementers to reconcile.
+
+### Spec Reference
+Addendum C §C.3, §C.4
+
+## HTTP/2 h2c Cleartext Warning
+**Date:** 2025-07-14
+**Phase:** Phase 4
+**Status:** Decided
+
+### Context
+Spec §C.5 says HTTP/2 MUST use TLS and MAY use h2c for local development only. The task requires `allowInsecure` support for CI tests.
+
+### Decision
+`CulpeoHttp2Server` constructor emits `console.warn` whenever `allowInsecure: true` is set, mirroring the pattern used in `CulpeoStreamClient` for `ws://` connections. TLS is enforced by default: omitting `cert`/`key` without `allowInsecure` throws a constructor-time `Error` (fail-fast, not fail-late).
+
+### Tradeoffs
+A constructor-time throw means servers are never accidentally started without TLS in production. The warn on every construction (not just first) ensures it appears in CI logs.
+
+### Spec Reference
+Addendum C §C.5
+
+## AsyncIterable Frame Iterator Design
+**Date:** 2025-07-14
+**Phase:** Phase 4
+**Status:** Decided
+
+### Context
+HTTP/2 streams emit `data` events. Converting these to an `AsyncIterable` requires bridging Node.js event emitters to async generators. Options: (a) `Readable.from()` (Node.js stream utility), (b) hand-rolled event-to-async-iterator bridge, (c) `async function*` generator with `stream[Symbol.asyncIterator]()`.
+
+### Decision
+Implement a hand-rolled bridge in both `client.ts` and `server.ts` using a shared reassembly buffer, a pending-resolve/reject pair, and an internal queue. This avoids converting the `Http2Stream` to a `Readable` (which changes backpressure semantics) and keeps full control over teardown.
+
+### Tradeoffs
+More code than `Readable.from()`, but no hidden buffering or backpressure surprises. The iterator's `return()` method sets `done = true`, preventing the iterator from blocking forever if the consumer breaks out of the loop early.
+
+### Spec Reference
+N/A; implementation detail

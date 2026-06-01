@@ -28,6 +28,10 @@ Makefile
 *.so
 *.dylib
 
+# C++ build directories (all CMake presets and sanitizer variants)
+implementations/cpp/build/
+implementations/cpp/build-*/
+
 # .NET
 *.nupkg
 *.snupkg

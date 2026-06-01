@@ -1,3 +1,108 @@
+## HTTP/2 frame envelope byte order (type-first vs length-first)
+**Date:** 2026-05-27
+**Phase:** Phase 4 — HTTP/2 Transport
+**Status:** Decided
+
+### Context
+Spec Addendum C.4 describes the HTTP/2 framing envelope as `[4-byte-length][type-octet + payload]` (length first, then type is the first byte of the payload). The Phase 4 task instructions specify `[type:1][length:4-BE][payload:N]` (type first, then length). These two orderings are incompatible.
+
+### Decision
+Implemented `[type:1][length:4-BE][payload:N]` as stated in the task instructions. The type octet identifies the CulpeoStream frame kind (0 = control, 1 = media). The 4-byte big-endian length is the payload byte count, excluding both the type octet and the length field itself.
+
+### Tradeoffs
+This deviates from the literal Addendum C.4 wording. The task instructions are treated as authoritative for the implementation. If the spec wording is later clarified, the framing layer (`Http2FrameWriter`/`Http2FrameReader`) can be updated in isolation since it is fully encapsulated.
+
+### Spec Reference
+Addendum C.4
+
+---
+
+## HTTP/2 request-body streaming via `RequestBodyContent`
+**Date:** 2026-05-27
+**Phase:** Phase 4 — HTTP/2 Transport
+**Status:** Decided
+
+### Context
+The CulpeoStream HTTP/2 transport uses a long-lived HTTP/2 POST: the request body is the client→server frame stream and the response body is the server→client frame stream. `HttpClient` sends the request body via an `HttpContent` subclass. The challenge: `ConnectAsync` must obtain the live request-body `Stream` (from inside `SerializeToStreamAsync`) AND must also wait for `SendAsync(ResponseHeadersRead)` to complete before handing the connection to the caller.
+
+Several approaches were considered:
+1. **`StreamContent(PipeReader.AsStream())`** — immediately cancelled when `ResponseHeadersRead` fires.
+2. **`DuplexPipeContent` (Pipe-based)** — `SerializeToStreamAsync` pours the pipe reader into the network; writes via `PipeWriter` from outside. Never worked because `SendAsync` blocked.
+3. **`RequestBodyContent` (TCS-based stream capture)** — `SerializeToStreamAsync` sets a `TaskCompletionSource<Stream>` with the raw HTTP/2 stream and then awaits a `_doneTcs` to keep the request alive. `ConnectAsync` awaits `StreamAvailableTask` after `SendAsync` returns.
+
+### Decision
+Used `RequestBodyContent` (option 3). `SerializeToStreamAsync` captures the provided `Stream` via `TaskCompletionSource<Stream>`, then awaits `_doneTcs` which is signalled only when the connection is disposed. This keeps the request body open for the full session lifetime. `DisposeAsync` on `CulpeoHttp2Connection` calls `_requestContent.Complete()` to trigger END_STREAM.
+
+### Tradeoffs
+The connection is live until `DisposeAsync` is called — no half-close on the request side. This is correct for the protocol (either party closing the connection ends the session). The TCS pattern adds a small allocation per connection but is a one-time cost.
+
+### Spec Reference
+Addendum C
+
+---
+
+## Kestrel h2c `SendAsync(ResponseHeadersRead)` deadlock — fix via `FlushAsync`
+**Date:** 2026-05-27
+**Phase:** Phase 4 — HTTP/2 Transport
+**Status:** Decided
+
+### Context
+When using cleartext HTTP/2 (h2c) with Kestrel, calling `ctx.Response.StartAsync()` inside a `MapPost` endpoint handler does not immediately flush the 200 OK HEADERS frame to the wire. `HttpClient.SendAsync(request, ResponseHeadersRead)` blocks until either (a) the server endpoint handler completes, or (b) actual DATA is flushed to the response body. For a long-lived session handler this would mean `SendAsync` never returns until the session ends — making `ConnectAsync` unusable.
+
+Approaches considered:
+1. **Use TLS in tests** — ALPN h2 would not exhibit this issue, but adds cert management complexity to tests.
+2. **Fire handler as `Task.Run` + keepalive TCS** — endpoint handler returns quickly, background task holds response alive.
+3. **`ctx.Response.Body.FlushAsync()` after `StartAsync()`** — forces Kestrel to emit an empty DATA frame (or at minimum the HEADERS frame) to the wire, unblocking the client's `ResponseHeadersRead` completion.
+
+### Decision
+Used option 3: after `await ctx.Response.StartAsync(ct)`, immediately call `await ctx.Response.Body.FlushAsync(ct)`. This is the minimal invasive change and works reliably with Kestrel h2c. The endpoint handler continues to run for the full session duration (correct semantics — `ctx.RequestAborted` is scoped to the endpoint lifetime).
+
+### Tradeoffs
+Relies on Kestrel flushing the HEADERS frame when `FlushAsync` is called with no DATA yet written. This is documented Kestrel behavior (an explicit flush always writes buffered headers + any pending DATA). If a future Kestrel version changes this, the diagnostic test `Diagnostic_SendAsync_ReturnsOnceServerHandlerYields` will catch it. Two diagnostic tests are retained in the test suite for this reason.
+
+### Spec Reference
+Addendum C.3 (transport connection establishment)
+
+---
+
+## Kestrel MinRequestBodyDataRate disabled for streaming connections
+**Date:** 2026-05-27
+**Phase:** Phase 4 — HTTP/2 Transport
+**Status:** Decided
+
+### Context
+Kestrel's default `MinRequestBodyDataRate` is 240 bytes/second with a 5-second grace period. For CulpeoStream sessions (long-lived, bursty audio streams) this would terminate connections that have been silent for more than ~5 seconds between audio frames. This is incorrect behavior for the protocol.
+
+### Decision
+In `MapCulpeoHttp2`, immediately upon entering the endpoint handler, we disable the rate limit via `IHttpMinRequestBodyDataRateFeature.MinDataRate = null`. This is done before `StartAsync()` so it takes effect for the entire request.
+
+### Tradeoffs
+Disabling the rate limit removes a denial-of-service defence against clients that open connections and then send nothing. The server should rely on its own idle-timeout mechanism (session-level ping/pong or a connection-level timeout) to close truly inactive sessions.
+
+### Spec Reference
+Section 6 (ping/pong keepalive)
+
+---
+
+## HTTP/2 cleartext (`Http2UnencryptedSupport`) opt-in
+**Date:** 2026-05-27
+**Phase:** Phase 4 — HTTP/2 Transport
+**Status:** Decided
+
+### Context
+`System.Net.Http.SocketsHttpHandler` requires the process-wide `Http2UnencryptedSupport` AppContext switch to allow h2c (HTTP/2 without TLS). By default, .NET 6+ rejects cleartext HTTP/2 connections to mitigate downgrade attacks.
+
+### Decision
+`CulpeoHttp2ClientOptions.AllowCleartextHttp2` (default `false`) controls whether the client sets this switch. When `true`, `CulpeoHttp2Client.ConnectAsync` calls `AppContext.SetSwitch("System.Net.Http.SocketsHttpHandler.Http2UnencryptedSupport", true)` before connecting. The switch is process-wide and cannot be un-set; this is documented in the option's XML comment.
+
+### Tradeoffs
+The switch is process-wide and irreversible within a process lifetime. If a production application mistakenly sets `AllowCleartextHttp2 = true`, all HTTP/2 connections in the process could use cleartext. The option is named explicitly to make its security implication obvious. No compiler warning is emitted (unlike the requirement for WebSocket `ws://`) because .NET does not provide a `[Obsolete]`-based warning path for runtime switches; the option documentation serves as the warning.
+
+### Spec Reference
+Security requirements (wss:// / TLS enforcement)
+
+---
+
 ## Span-based frame parsing
 **Date:** 2026-05-26
 **Phase:** Phase 1 — Core Library
