@@ -44,15 +44,26 @@ public static class Http2FrameReader
         await ReadExactlyAsync(stream, header, 0, 5, ct).ConfigureAwait(false);
 
         var typeOctet = header[0];
-        var payloadLength = (int)BinaryPrimitives.ReadUInt32BigEndian(header.AsSpan(1));
 
-        if (payloadLength > maxPayloadBytes)
+        // SEC-024 fix: read as uint first, then bounds-check using uint arithmetic.
+        // Casting to int before the comparison allows values >= 0x80000000 to appear
+        // negative, bypassing the check and crashing or allocating 2 GiB.
+        // maxPayloadBytes is a non-negative int, so (uint)maxPayloadBytes is safe.
+        if (maxPayloadBytes < 0)
+            throw new ArgumentOutOfRangeException(nameof(maxPayloadBytes),
+                "maxPayloadBytes must be non-negative.");
+
+        var rawLength = BinaryPrimitives.ReadUInt32BigEndian(header.AsSpan(1));
+
+        if (rawLength > (uint)maxPayloadBytes)
         {
             throw new CulpeoProtocolException(
                 "frame-too-large",
-                $"Frame payload length {payloadLength} bytes exceeds the configured maximum of {maxPayloadBytes} bytes.");
+                $"Frame payload {rawLength} bytes exceeds limit {maxPayloadBytes}");
         }
 
+        // Safe: rawLength <= maxPayloadBytes <= int.MaxValue
+        var payloadLength = (int)rawLength;
         var payload = new byte[payloadLength];
         if (payloadLength > 0)
         {

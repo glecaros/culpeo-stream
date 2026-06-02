@@ -9,6 +9,10 @@ using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
+// Suppress CS0618 for AllowHttp2Cleartext throughout this test file:
+// these tests intentionally exercise the cleartext h2c code path.
+#pragma warning disable CS0618
+
 namespace CulpeoStream.Http2.Tests;
 
 /// <summary>

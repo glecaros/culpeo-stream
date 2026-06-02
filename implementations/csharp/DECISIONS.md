@@ -687,3 +687,51 @@ An overly-strict server that sends a `resume_offset` equal to the client's send 
 
 ### Spec Reference
 §8.2 (session resumption, confirmed offsets)
+
+---
+
+## SEC-024: uint bounds-check in Http2FrameReader
+**Date:** 2026-05-28
+**Phase:** Phase 4 — HTTP/2 Transport (security fix)
+**Status:** Decided
+
+### Context
+The original `ReadFrameAsync` read the 4-byte big-endian length as `uint` via `BinaryPrimitives.ReadUInt32BigEndian`, then immediately cast to `int` before the bounds comparison. Any value ≥ 0x80000000 (2 GiB) became a negative `int`. A negative `int` always passes `payloadLength > maxPayloadBytes` as false (negative < any positive), bypassing the check entirely. The subsequent `new byte[payloadLength]` would then throw `OverflowException` or allocate 2 GiB depending on the runtime build.
+
+Options considered:
+1. Cast to `long` first, then compare against `(long)maxPayloadBytes`
+2. Stay in `uint` for the comparison; cast to `int` only after the check is known safe
+
+### Decision
+Perform the bounds check using `uint` arithmetic: compare `rawLength > (uint)maxPayloadBytes`. Since `maxPayloadBytes` is a non-negative `int` (validated before use), `(uint)maxPayloadBytes` is safe. Only after the check passes is the value cast to `int` (safe because rawLength ≤ maxPayloadBytes ≤ int.MaxValue). Added an explicit guard that rejects negative `maxPayloadBytes` values with `ArgumentOutOfRangeException`.
+
+### Tradeoffs
+Using `uint` for the comparison is self-documenting and requires no intermediate `long` allocation. Casting to `long` would also work but adds unnecessary width. The `ArgumentOutOfRangeException` guard on `maxPayloadBytes < 0` prevents a subtle second bypass where a caller passes a negative limit.
+
+### Spec Reference
+Addendum C.4 (frame framing); SEC-024
+
+---
+
+## SEC-031: AllowHttp2Cleartext warning and obsolete attribute
+**Date:** 2026-05-28
+**Phase:** Phase 4 — HTTP/2 Transport (security fix)
+**Status:** Decided
+
+### Context
+`AppContext.SetSwitch("System.Net.Http.SocketsHttpHandler.Http2UnencryptedSupport", true)` is process-wide and irreversible. The original code set it silently with only an XML doc comment as a warning. A developer could accidentally enable it in production with no runtime feedback.
+
+Options considered:
+1. Throw `InvalidOperationException` when not in development (too brittle — no reliable detection of "production")
+2. `[Obsolete(error: true)]` — breaks all existing test code
+3. `[Obsolete(error: false)]` + `Console.Error.WriteLine` at runtime — visible at both compile-time (warning) and runtime (stderr message)
+4. `ILogger` instead of `Console.Error` — requires DI injection plumbing in a constructor that currently takes no `ILogger`
+
+### Decision
+Applied `[Obsolete(error: false)]` on `CulpeoHttp2ClientOptions.AllowHttp2Cleartext` so every call-site gets a CS0618 warning at compile time. Added `Console.Error.WriteLine` in the `CulpeoHttp2Client` constructor when the switch is activated — visible even when log infrastructure is not yet configured. Internal usages within `CulpeoHttp2Client.cs` are suppressed with `#pragma warning disable CS0618`. Test files that test the cleartext path explicitly use `#pragma warning disable CS0618` or file-level suppression.
+
+### Tradeoffs
+`Console.Error` is always available; `ILogger` would require changing the constructor signature or adding an optional `ILoggerFactory` parameter — deferred to a future DI-integration PR. `[Obsolete(error: false)]` preserves backward compatibility for test code while surfacing the warning at the call site.
+
+### Spec Reference
+§5.1 (TLS requirement); SEC-031

@@ -106,7 +106,13 @@ public sealed class CulpeoHttp2ClientOptions
     /// <remarks>
     /// When set to <see langword="true"/>, the client calls
     /// <c>AppContext.SetSwitch("System.Net.Http.SocketsHttpHandler.Http2UnencryptedSupport", true)</c>.
+    /// This switch is process-wide and irreversible for the lifetime of the process.
     /// </remarks>
+    // SEC-031: produce a compile-time warning at every call site that sets this property.
+    [Obsolete(
+        "AllowHttp2Cleartext must not be used in production. " +
+        "Set this property only in development/test environments.",
+        error: false)]
     public bool AllowHttp2Cleartext { get; init; } = false;
 
     /// <summary>Maximum payload size accepted from the server. Default: 16 MiB.</summary>
@@ -253,6 +259,7 @@ public sealed class CulpeoHttp2Client : IAsyncDisposable
     /// <c>Http2UnencryptedSupport</c> switch.
     /// </remarks>
 #pragma warning disable CA2000  // handler lifetime managed by HttpClient
+#pragma warning disable CS0618  // AllowHttp2Cleartext: internal implementation access — [Obsolete] targets call sites
     public CulpeoHttp2Client(CulpeoHttp2ClientOptions options)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
@@ -263,6 +270,13 @@ public sealed class CulpeoHttp2Client : IAsyncDisposable
             AppContext.SetSwitch(
                 "System.Net.Http.SocketsHttpHandler.Http2UnencryptedSupport",
                 true);
+
+            // SEC-031: warn visibly — this switch is process-wide, irreversible,
+            // and must never be set in production.
+            Console.Error.WriteLine(
+                "[CulpeoStream] WARNING: Http2UnencryptedSupport is enabled. " +
+                "Cleartext HTTP/2 must only be used in local development. " +
+                "This switch is process-wide and cannot be reverted.");
         }
 
         var handler = new SocketsHttpHandler
@@ -280,6 +294,7 @@ public sealed class CulpeoHttp2Client : IAsyncDisposable
 
         _httpClient = new HttpClient(handler);
     }
+#pragma warning restore CS0618
 #pragma warning restore CA2000
 
     /// <summary>
@@ -299,6 +314,7 @@ public sealed class CulpeoHttp2Client : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(endpoint);
 
+#pragma warning disable CS0618  // AllowHttp2Cleartext: internal implementation access
         if (!_options.AllowHttp2Cleartext &&
             string.Equals(endpoint.Scheme, "http", StringComparison.OrdinalIgnoreCase))
         {
@@ -306,6 +322,7 @@ public sealed class CulpeoHttp2Client : IAsyncDisposable
                 "CulpeoStream HTTP/2 transport requires HTTPS. " +
                 "Set AllowHttp2Cleartext = true to allow plain-text HTTP/2 (development only).");
         }
+#pragma warning restore CS0618
 
         // RequestBodyContent captures the raw HTTP/2 request-body stream via
         // a TaskCompletionSource inside SerializeToStreamAsync.  This avoids
