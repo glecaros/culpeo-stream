@@ -72,6 +72,11 @@ public:
     asio::awaitable<std::pair<uint8_t, std::vector<std::byte>>>
     receive_frame() override;
 
+    /// Return a captured HTTP/2 request header value.
+    /// SEC-028: exposes "authorization", "content-type", etc.
+    /// @param name  Lowercase header name.
+    std::string request_header(std::string_view name) const override;
+
 private:
     std::shared_ptr<H2Session> session_;
     int32_t stream_id_;

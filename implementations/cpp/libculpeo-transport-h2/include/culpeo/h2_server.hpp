@@ -53,13 +53,26 @@ public:
     virtual asio::awaitable<void> handle(IAsyncTransport& transport) = 0;
 };
 
+/// Configuration options for CulpeoH2Server.
+struct CulpeoH2ServerOptions {
+    /// Maximum number of concurrent HTTP/2 streams per connection.
+    /// Sent as SETTINGS_MAX_CONCURRENT_STREAMS; also enforced server-side
+    /// against clients that ignore SETTINGS (SEC-025).
+    uint32_t max_concurrent_streams{100};
+
+    /// TLS handshake timeout in seconds.
+    /// If a client completes TCP but stalls the TLS handshake for longer
+    /// than this, the connection is dropped (SEC-029).
+    uint32_t handshake_timeout_seconds{10};
+};
+
 /// HTTP/2 CulpeoStream server.
 class CulpeoH2Server {
 public:
     /// Tag type enabling cleartext (h2c) mode (for tests).
     struct AllowCleartext {};
 
-    /// Construct a TLS server.
+    /// Construct a TLS server with default options.
     /// @param ioc      io_context.
     /// @param tls      SSL context (caller loads certificate and private key).
     /// @param port     TCP port to listen on.
@@ -69,11 +82,25 @@ public:
                    uint16_t port,
                    std::shared_ptr<ISessionHandler> handler);
 
+    /// Construct a TLS server with explicit options.
+    CulpeoH2Server(asio::io_context& ioc,
+                   asio::ssl::context& tls,
+                   uint16_t port,
+                   std::shared_ptr<ISessionHandler> handler,
+                   CulpeoH2ServerOptions opts);
+
     /// Construct a cleartext server (for tests / local development).
     CulpeoH2Server(asio::io_context& ioc,
                    AllowCleartext,
                    uint16_t port,
                    std::shared_ptr<ISessionHandler> handler);
+
+    /// Construct a cleartext server with explicit options.
+    CulpeoH2Server(asio::io_context& ioc,
+                   AllowCleartext,
+                   uint16_t port,
+                   std::shared_ptr<ISessionHandler> handler,
+                   CulpeoH2ServerOptions opts);
 
     ~CulpeoH2Server();
 

@@ -96,6 +96,22 @@ public:
     virtual asio::awaitable<std::pair<uint8_t, std::vector<std::byte>>>
     receive_frame() = 0;
 
+    /// Return the value of an HTTP-level request header captured during the
+    /// initial HEADERS frame exchange.
+    ///
+    /// SEC-028: exposes security-relevant headers (e.g. "authorization",
+    /// "content-type") so application handlers can authenticate requests at
+    /// the transport layer.
+    ///
+    /// The default implementation returns an empty string; H2Transport
+    /// overrides this to expose headers captured from the HTTP/2 HEADERS frame.
+    ///
+    /// @param name  Lowercase header name (e.g. "authorization").
+    /// @return Header value, or empty string if not available.
+    virtual std::string request_header(std::string_view /*name*/) const {
+        return {};
+    }
+
 protected:
     IAsyncTransport() = default;
 };

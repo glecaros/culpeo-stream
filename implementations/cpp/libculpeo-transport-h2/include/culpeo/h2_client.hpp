@@ -85,6 +85,16 @@ public:
     /// Equivalent to transport().receive_frame().
     asio::awaitable<std::pair<uint8_t, std::vector<std::byte>>> receive_frame();
 
+    /// Open an additional HTTP/2 stream on the same TCP connection.
+    ///
+    /// Returns a new H2Transport for the additional stream, or nullptr if the
+    /// server refused the stream (e.g., SETTINGS_MAX_CONCURRENT_STREAMS limit
+    /// was reached per SEC-025).
+    ///
+    /// @param path  Request path (e.g., "/").
+    asio::awaitable<std::shared_ptr<H2Transport>> open_additional_stream(
+        std::string path);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

@@ -37,11 +37,15 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <span>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace culpeo::h2 {
@@ -51,13 +55,32 @@ namespace culpeo::h2 {
 inline constexpr uint8_t kTypeControl = 0x01;
 inline constexpr uint8_t kTypeMedia   = 0x02;
 
+// ─── H2 frame size constants ──────────────────────────────────────────────────
+
+// Maximum CulpeoStream frame size we'll accept/send (1 MiB, per spec §C.4).
+// Defined here (before encode_h2_envelope) so the send-side size guard
+// can reference it without a forward declaration.
+inline constexpr uint32_t kH2MaxFrameSize = 1u << 20;
+
 // ─── H2 framing helpers ────────────────────────────────────────────────────────
 
 /// Build a CulpeoStream H2 envelope: [4-byte BE length][1-byte type][payload].
 /// length = 1 (type byte) + payload.size()
+///
+/// SEC-033: Throws std::invalid_argument if payload.size() >= kH2MaxFrameSize,
+/// which would either overflow the 4-byte length prefix on very large payloads
+/// or violate the per-frame size cap enforced on the receive path.
 inline std::vector<uint8_t> encode_h2_envelope(uint8_t type_byte,
                                                 std::span<const std::byte> payload)
 {
+    // SEC-033: guard against payload exceeding the maximum envelope size.
+    // kH2MaxFrameSize is 1 MiB (1 byte = type octet, rest = payload).
+    // Payloads >= kH2MaxFrameSize cannot fit in the length field with the type
+    // byte, and would be rejected by the receiver's kMaxFrameSize check anyway.
+    if (payload.size() >= static_cast<std::size_t>(kH2MaxFrameSize)) {
+        throw std::invalid_argument(
+            "encode_h2_envelope: payload exceeds maximum frame size (kH2MaxFrameSize)");
+    }
     uint32_t len = 1u + static_cast<uint32_t>(payload.size());
     std::vector<uint8_t> out;
     out.reserve(5 + payload.size());
@@ -144,9 +167,6 @@ private:
 
 // ─── H2 receive reassembly buffer (public for testing) ───────────────────────
 
-// Maximum CulpeoStream frame size we'll accept (1 MiB, per spec §C.4).
-inline constexpr uint32_t kH2MaxFrameSize = 1u << 20;
-
 /// Accumulates raw DATA bytes and parses out complete CulpeoStream frames.
 /// Format: [4-byte BE length][1-byte type][N-byte payload]
 /// where length = 1 (type) + N (payload bytes).
@@ -173,7 +193,12 @@ public:
     // Frame channel capacity (per stream).
     static constexpr std::size_t kChannelCapacity = 256;
 
-    explicit H2Session(std::unique_ptr<ISocketStream> socket, Mode mode);
+    /// Default maximum number of concurrent streams per session.
+    /// Exposed as a setting via SETTINGS_MAX_CONCURRENT_STREAMS (SEC-025).
+    static constexpr uint32_t kDefaultMaxConcurrentStreams = 100;
+
+    explicit H2Session(std::unique_ptr<ISocketStream> socket, Mode mode,
+                       uint32_t max_concurrent_streams = kDefaultMaxConcurrentStreams);
     ~H2Session();
 
     H2Session(const H2Session&) = delete;
@@ -198,6 +223,13 @@ public:
     /// is ready (HEADERS received and 200 response submitted).
     void set_new_stream_handler(
         std::function<asio::awaitable<void>(int32_t)> cb);
+
+    /// Access a request header captured during HEADERS frame processing.
+    /// Returns the header value, or empty string if not found.
+    /// Only meaningful on server-mode sessions for server-accepted streams.
+    /// SEC-028: exposes Authorization and Content-Type for application auth.
+    /// Must be called on the session strand (from within the handler coroutine).
+    std::string get_stream_header(int32_t stream_id, std::string_view name) const;
 
     // ── Frame I/O ─────────────────────────────────────────────────────────────
 
@@ -247,6 +279,11 @@ private:
         SendQueue  send;
         std::unique_ptr<FrameChannel> channel;
         bool       response_sent{false};  // server: 200 submitted
+
+        // SEC-028: HTTP request headers captured during HEADERS frame processing.
+        std::string authorization;    // "Authorization" header value
+        std::string content_type;     // "content-type" header value
+        std::string proto_version;    // "culpeostream-version" header value
     };
 
     // ─── Fields ────────────────────────────────────────────────────────────────
@@ -257,7 +294,14 @@ private:
     asio::strand<asio::any_io_executor> strand_;
     std::atomic<bool> closed_{false};
 
+    // SEC-025: maximum concurrent streams enforced via SETTINGS and guard.
+    uint32_t max_concurrent_streams_;
+
     std::map<int32_t, StreamState> streams_;
+
+    // SEC-025: stream IDs refused due to the concurrent-stream limit.
+    // Cleared in on_stream_close_callback.
+    std::set<int32_t> refused_streams_;
 
     // New-stream callback (server only)
     std::function<asio::awaitable<void>(int32_t)> new_stream_cb_;

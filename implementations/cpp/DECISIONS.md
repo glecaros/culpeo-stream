@@ -812,3 +812,91 @@ Cleartext tests are not as thorough as TLS tests. The TLS code path (ALPN negoti
 
 ### Spec Reference
 Addendum C §C.5, agent instructions Phase 4 (Cleartext mode)
+
+## SEC-023: Remove hardcoded verify_none from TLS client path
+**Date:** 2026-06-02
+**Phase:** Phase 4 — Security Hardening
+**Status:** Decided
+
+### Context
+`h2_client.cpp` unconditionally called `ssl_sock.set_verify_mode(asio::ssl::verify_none)` in the TLS connect path, overriding the caller's SSL context regardless of its verify policy. This silently defeated certificate validation for all production callers.
+
+### Decision
+Deleted the `set_verify_mode` call entirely. The caller's `asio::ssl::context` carries the verify mode. Test fixtures that need `verify_none` configure it on their own context. A new TLS integration test (SEC-023) verifies that a client using `verify_peer` + a self-signed CA certificate completes a handshake with the matching server certificate.
+
+### Tradeoffs
+Tests now require TLS certificate fixtures (`test_cert.pem`, `test_key.pem`) for the TLS path. Generated once with OpenSSL; stored in `tests/`.
+
+### Spec Reference
+SEC-023 security finding
+
+## SEC-025: SETTINGS_MAX_CONCURRENT_STREAMS and server-side guard
+**Date:** 2026-06-02
+**Phase:** Phase 4 — Security Hardening
+**Status:** Decided
+
+### Context
+`init_nghttp2()` submitted an empty SETTINGS frame, advertising no limit on concurrent streams. `get_or_create_stream()` had no cap. A single connection could allocate unbounded memory by opening streams rapidly.
+
+### Decision
+1. `init_nghttp2()` now submits `SETTINGS_MAX_CONCURRENT_STREAMS` (default 100, configurable via `CulpeoH2ServerOptions::max_concurrent_streams`).
+2. `on_begin_headers_callback` enforces a server-side guard: if `streams_.size() >= max_concurrent_streams_`, a `RST_STREAM(REFUSED_STREAM)` is sent and the stream ID is added to `refused_streams_` (a `std::set<int32_t>`).
+3. `refused_streams_` is cleaned up in `on_stream_close_callback`. All callbacks (`on_frame_recv`, `on_data_chunk_recv`) skip refused stream IDs.
+4. `H2Session` constructor accepts `max_concurrent_streams` parameter, forwarded from `CulpeoH2Server` options.
+
+### Tradeoffs
+The guard uses `streams_.size()` which counts all tracked streams. "Half-closed (local)" streams (server sent END_STREAM, client hasn't) remain in `streams_` until `on_stream_close_callback` fires (both sides END_STREAM). This is conservative: the guard may occasionally refuse streams slightly below the true limit. Chosen over complex state tracking.
+
+### Spec Reference
+SEC-025 security finding; RFC 9113 §6.5.2
+
+## SEC-028: Authorization and Content-Type header capture
+**Date:** 2026-06-02
+**Phase:** Phase 4 — Security Hardening
+**Status:** Decided
+
+### Context
+`on_header_callback` discarded all incoming headers. `Authorization`, `Content-Type`, and `Culpeostream-Version` were never extracted.
+
+### Decision
+`on_header_callback` now captures `authorization`, `content-type`, and `culpeostream-version` into new `StreamState` fields. `on_frame_recv_callback` validates `content-type` after HEADERS are complete: requests with an unrecognised content-type get `RST_STREAM(INTERNAL_ERROR)`. `H2Session::get_stream_header()` exposes the captured values. `H2Transport::request_header()` wraps this and is declared on `IAsyncTransport` with a default empty-string implementation (backward-compatible).
+
+### Tradeoffs
+`Content-Type` validation accepts `application/culpeostream`, `application/octet-stream`, and empty (for cleartext tests). The empty allowance is intentional for tests; production clients should always send the correct content-type.
+
+### Spec Reference
+SEC-028 security finding; Addendum C
+
+## SEC-029: TLS handshake timeout
+**Date:** 2026-06-02
+**Phase:** Phase 4 — Security Hardening
+**Status:** Decided
+
+### Context
+The TLS handshake `co_await` had no timeout. An attacker could stall the handshake indefinitely, accumulating coroutine frames and file descriptors.
+
+### Decision
+`h2_server.cpp::run()` wraps the `async_handshake` call with `asio::experimental::awaitable_operators::||` and an `asio::steady_timer`. If the timer fires first (`result.index() == 1`), the socket is closed and the coroutine returns. Timeout defaults to 10 seconds; configurable via `CulpeoH2ServerOptions::handshake_timeout_seconds`. Uses Asio 1.28.1's `experimental/awaitable_operators.hpp`.
+
+### Tradeoffs
+The `||` awaitable operator cancels the losing side automatically. No explicit cancellation token needed. Asio 1.28.1 is the minimum; `cancel_after` (Asio 1.30+) is not available on the current system.
+
+### Spec Reference
+SEC-029 security finding
+
+## SEC-033: encode_h2_envelope send-side size check
+**Date:** 2026-06-02
+**Phase:** Phase 4 — Security Hardening
+**Status:** Decided
+
+### Context
+`encode_h2_envelope` cast `payload.size()` (64-bit) to `uint32_t` without a bounds check. Payloads >= UINT32_MAX bytes would wrap to a tiny length prefix, corrupting framing. `send_frame` had no corresponding check.
+
+### Decision
+`encode_h2_envelope` checks `payload.size() >= kH2MaxFrameSize` and throws `std::invalid_argument`. `kH2MaxFrameSize` (1 MiB) is enforced on both send and receive, making the limit symmetric. `send_frame` also checks before calling `encode_h2_envelope`. The constant is moved before `encode_h2_envelope` in `h2_session.hpp` to eliminate the forward reference.
+
+### Tradeoffs
+Using `kH2MaxFrameSize` (1 MiB) rather than `UINT32_MAX-1` (4 GiB) is stricter but matches the receiver's limit. Any payload that would have triggered the UINT32_MAX overflow is also above the 1 MiB practical limit.
+
+### Spec Reference
+SEC-033 security finding; spec §C.4

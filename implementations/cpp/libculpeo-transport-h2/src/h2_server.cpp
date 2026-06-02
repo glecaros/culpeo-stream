@@ -7,10 +7,12 @@
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
 #include <asio/dispatch.hpp>
+#include <asio/experimental/awaitable_operators.hpp>
 #include <asio/ip/tcp.hpp>
 #include <asio/post.hpp>
 #include <asio/ssl/context.hpp>
 #include <asio/ssl/stream.hpp>
+#include <asio/steady_timer.hpp>
 #include <asio/use_awaitable.hpp>
 
 #include <stdexcept>
@@ -30,21 +32,24 @@ struct CulpeoH2Server::Impl {
     bool cleartext{false};
     uint16_t port{0};
     std::shared_ptr<ISessionHandler> handler;
+    CulpeoH2ServerOptions opts;
 
     asio::ip::tcp::acceptor acceptor;
     uint16_t actual_port{0};
 
     Impl(asio::io_context& ioc, asio::ssl::context& ctx, uint16_t p,
-         std::shared_ptr<ISessionHandler> h)
+         std::shared_ptr<ISessionHandler> h, CulpeoH2ServerOptions o)
         : ioc(ioc), tls(&ctx), cleartext(false), port(p)
         , handler(std::move(h))
+        , opts(std::move(o))
         , acceptor(ioc)
     {}
 
     Impl(asio::io_context& ioc, bool, uint16_t p,
-         std::shared_ptr<ISessionHandler> h)
+         std::shared_ptr<ISessionHandler> h, CulpeoH2ServerOptions o)
         : ioc(ioc), cleartext(true), port(p)
         , handler(std::move(h))
+        , opts(std::move(o))
         , acceptor(ioc)
     {}
 
@@ -66,7 +71,19 @@ CulpeoH2Server::CulpeoH2Server(asio::io_context& ioc,
                                 asio::ssl::context& tls,
                                 uint16_t port,
                                 std::shared_ptr<ISessionHandler> handler)
-    : impl_(std::make_unique<Impl>(ioc, tls, port, std::move(handler)))
+    : impl_(std::make_unique<Impl>(ioc, tls, port, std::move(handler),
+                                   CulpeoH2ServerOptions{}))
+{
+    impl_->start_listen();
+}
+
+CulpeoH2Server::CulpeoH2Server(asio::io_context& ioc,
+                                asio::ssl::context& tls,
+                                uint16_t port,
+                                std::shared_ptr<ISessionHandler> handler,
+                                CulpeoH2ServerOptions opts)
+    : impl_(std::make_unique<Impl>(ioc, tls, port, std::move(handler),
+                                   std::move(opts)))
 {
     impl_->start_listen();
 }
@@ -75,7 +92,19 @@ CulpeoH2Server::CulpeoH2Server(asio::io_context& ioc,
                                 AllowCleartext,
                                 uint16_t port,
                                 std::shared_ptr<ISessionHandler> handler)
-    : impl_(std::make_unique<Impl>(ioc, /*cleartext*/true, port, std::move(handler)))
+    : impl_(std::make_unique<Impl>(ioc, /*cleartext*/true, port, std::move(handler),
+                                   CulpeoH2ServerOptions{}))
+{
+    impl_->start_listen();
+}
+
+CulpeoH2Server::CulpeoH2Server(asio::io_context& ioc,
+                                AllowCleartext,
+                                uint16_t port,
+                                std::shared_ptr<ISessionHandler> handler,
+                                CulpeoH2ServerOptions opts)
+    : impl_(std::make_unique<Impl>(ioc, /*cleartext*/true, port, std::move(handler),
+                                   std::move(opts)))
 {
     impl_->start_listen();
 }
@@ -99,7 +128,10 @@ void CulpeoH2Server::stop()
 
 asio::awaitable<void> CulpeoH2Server::run()
 {
+    using namespace asio::experimental::awaitable_operators;
+
     auto& ioc = impl_->ioc;
+    const auto& opts = impl_->opts;
 
     while (true) {
         asio::ip::tcp::socket raw_sock(ioc);
@@ -117,7 +149,8 @@ asio::awaitable<void> CulpeoH2Server::run()
             // Cleartext h2c
             auto session = std::make_shared<H2Session>(
                 std::make_unique<TcpSocketStream>(std::move(raw_sock)),
-                H2Session::Mode::Server);
+                H2Session::Mode::Server,
+                opts.max_concurrent_streams);
 
             auto handler_ptr = impl_->handler;
 
@@ -155,21 +188,44 @@ asio::awaitable<void> CulpeoH2Server::run()
             auto ssl_sock = std::make_shared<SslSocket>(std::move(raw_sock), *impl_->tls);
 
             auto handler_ptr = impl_->handler;
+            const uint32_t hs_timeout = opts.handshake_timeout_seconds;
+            const uint32_t max_streams = opts.max_concurrent_streams;
 
             asio::co_spawn(ioc,
-                [ssl_sock, handler_ptr, &ioc]() -> asio::awaitable<void> {
-                    // ALPN: server side
-                    // (SSL context must have ALPN protos set by caller)
-                    try {
-                        co_await ssl_sock->async_handshake(
-                            asio::ssl::stream_base::server, asio::use_awaitable);
-                    } catch (...) {
-                        co_return; // TLS handshake failed; drop connection
+                [ssl_sock, handler_ptr, &ioc, hs_timeout, max_streams]() -> asio::awaitable<void> {
+                    // SEC-029: wrap the TLS handshake with a deadline timer.
+                    // An attacker that completes TCP but stalls the TLS handshake
+                    // is dropped after handshake_timeout_seconds.
+                    {
+                        asio::steady_timer hs_timer(ioc);
+                        hs_timer.expires_after(
+                            std::chrono::seconds(hs_timeout));
+
+                        try {
+                            auto result = co_await (
+                                ssl_sock->async_handshake(
+                                    asio::ssl::stream_base::server,
+                                    asio::use_awaitable)
+                                || hs_timer.async_wait(asio::use_awaitable));
+
+                            if (result.index() == 1) {
+                                // Timer won — drop the stalled connection.
+                                asio::error_code close_ec;
+                                ssl_sock->lowest_layer().close(close_ec);
+                                co_return;
+                            }
+                            // Handshake succeeded — cancel the timer.
+                            hs_timer.cancel();
+                        } catch (...) {
+                            // Handshake failed with an error; drop the connection.
+                            co_return;
+                        }
                     }
 
                     auto session = std::make_shared<H2Session>(
                         std::make_unique<TlsSocketStream>(std::move(*ssl_sock)),
-                        H2Session::Mode::Server);
+                        H2Session::Mode::Server,
+                        max_streams);
 
                     std::weak_ptr<H2Session> weak = session;
 

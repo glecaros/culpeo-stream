@@ -132,6 +132,13 @@ if(CULPEO_BUILD_TESTS)
                 -Wno-unused-parameter>
     )
 
+    # SEC-023 / SEC-029: point the test binary at the directory containing
+    # test_cert.pem and test_key.pem (generated once by openssl in tests/).
+    target_compile_definitions(h2_transport_tests
+        PRIVATE
+            "TEST_CERT_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/tests/\""
+    )
+
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
         target_compile_options(h2_transport_tests PRIVATE -fcoroutines)
     endif()

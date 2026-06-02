@@ -41,4 +41,9 @@ H2Transport::receive_frame()
     co_return co_await session_->receive_frame(stream_id_);
 }
 
+std::string H2Transport::request_header(std::string_view name) const
+{
+    return session_->get_stream_header(stream_id_, name);
+}
+
 } // namespace culpeo::h2

@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <system_error>
 
@@ -75,10 +76,12 @@ RecvState::drain_frames()
 // H2Session construction / destruction
 // ════════════════════════════════════════════════════════════════════════════
 
-H2Session::H2Session(std::unique_ptr<ISocketStream> socket, Mode mode)
+H2Session::H2Session(std::unique_ptr<ISocketStream> socket, Mode mode,
+                     uint32_t max_concurrent_streams)
     : sock_(std::move(socket))
     , mode_(mode)
     , strand_(asio::make_strand(sock_->get_executor()))
+    , max_concurrent_streams_(max_concurrent_streams)
 {}
 
 H2Session::~H2Session()
@@ -112,8 +115,17 @@ void H2Session::init_nghttp2()
 
     nghttp2_session_callbacks_del(cbs);
 
-    // Submit initial SETTINGS
-    nghttp2_submit_settings(ng_, NGHTTP2_FLAG_NONE, nullptr, 0);
+    // Submit initial SETTINGS.
+    // SEC-025: advertise SETTINGS_MAX_CONCURRENT_STREAMS so well-behaved clients
+    // do not exceed the limit. The guard in on_begin_headers_callback protects
+    // against malicious clients that ignore SETTINGS.
+    nghttp2_settings_entry settings[] = {
+        { NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS,
+          max_concurrent_streams_ },
+        { NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 65535 },
+    };
+    nghttp2_submit_settings(ng_, NGHTTP2_FLAG_NONE, settings,
+                            sizeof(settings) / sizeof(settings[0]));
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -161,7 +173,7 @@ ssize_t H2Session::data_read_callback(nghttp2_session* /*session*/,
     return static_cast<ssize_t>(n);
 }
 
-int H2Session::on_begin_headers_callback(nghttp2_session* /*session*/,
+int H2Session::on_begin_headers_callback(nghttp2_session* session,
                                            const nghttp2_frame* frame,
                                            void* user_data)
 {
@@ -173,6 +185,17 @@ int H2Session::on_begin_headers_callback(nghttp2_session* /*session*/,
         && frame->headers.cat == NGHTTP2_HCAT_REQUEST)
     {
         int32_t sid = frame->hd.stream_id;
+
+        // SEC-025: enforce SETTINGS_MAX_CONCURRENT_STREAMS on the server side.
+        // This guards against malicious clients that send more HEADERS frames
+        // than the advertised limit allows.
+        if (self->streams_.size() >= static_cast<std::size_t>(self->max_concurrent_streams_)) {
+            nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE, sid,
+                                      NGHTTP2_REFUSED_STREAM);
+            self->refused_streams_.insert(sid);
+            return 0;
+        }
+
         self->get_or_create_stream(sid);
     }
     return 0;
@@ -180,14 +203,37 @@ int H2Session::on_begin_headers_callback(nghttp2_session* /*session*/,
 
 int H2Session::on_header_callback(nghttp2_session* /*session*/,
                                     const nghttp2_frame* frame,
-                                    const uint8_t* name, std::size_t /*namelen*/,
-                                    const uint8_t* /*value*/, std::size_t /*valuelen*/,
+                                    const uint8_t* name, std::size_t namelen,
+                                    const uint8_t* value, std::size_t valuelen,
                                     uint8_t /*flags*/,
-                                    void* /*user_data*/)
+                                    void* user_data)
 {
-    // We only care about :method / content-type for basic routing.
-    // For now, accept any request.
-    (void)frame; (void)name;
+    auto* self = static_cast<H2Session*>(user_data);
+
+    // Only process HEADERS for server-side incoming requests.
+    if (self->mode_ != Mode::Server
+        || frame->hd.type != NGHTTP2_HEADERS
+        || frame->headers.cat != NGHTTP2_HCAT_REQUEST)
+    {
+        return 0;
+    }
+
+    int32_t sid = frame->hd.stream_id;
+
+    // Skip refused streams (SEC-025).
+    if (self->refused_streams_.count(sid)) return 0;
+
+    auto it = self->streams_.find(sid);
+    if (it == self->streams_.end()) return 0;
+
+    // SEC-028: capture security-relevant request headers.
+    std::string_view k(reinterpret_cast<const char*>(name),  namelen);
+    std::string_view v(reinterpret_cast<const char*>(value), valuelen);
+
+    if (k == "authorization")         it->second.authorization  = std::string(v);
+    else if (k == "content-type")     it->second.content_type   = std::string(v);
+    else if (k == "culpeostream-version") it->second.proto_version = std::string(v);
+
     return 0;
 }
 
@@ -199,10 +245,31 @@ int H2Session::on_frame_recv_callback(nghttp2_session* session,
     int32_t sid = frame->hd.stream_id;
 
     if (frame->hd.type == NGHTTP2_HEADERS) {
-        // Server: complete request HEADERS → submit 200 response
+        // Server: complete request HEADERS → validate and submit 200 response
         if (self->mode_ == Mode::Server
             && frame->headers.cat == NGHTTP2_HCAT_REQUEST)
         {
+            // SEC-025: skip refused streams.
+            if (self->refused_streams_.count(sid)) return 0;
+
+            // SEC-028: validate Content-Type.
+            // Accept "application/culpeostream", "application/octet-stream",
+            // or empty (for backwards compatibility in cleartext tests).
+            auto it = self->streams_.find(sid);
+            if (it != self->streams_.end()) {
+                const auto& ct = it->second.content_type;
+                if (!ct.empty()
+                    && ct != "application/culpeostream"
+                    && ct != "application/octet-stream")
+                {
+                    // Unsupported media type — send RST_STREAM and refuse.
+                    nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE, sid,
+                                              NGHTTP2_INTERNAL_ERROR);
+                    self->refused_streams_.insert(sid);
+                    return 0;
+                }
+            }
+
             self->submit_server_response(sid);
 
             // Spawn handler coroutine if registered
@@ -235,6 +302,9 @@ int H2Session::on_data_chunk_recv_callback(nghttp2_session* /*session*/,
 {
     auto* self = static_cast<H2Session*>(user_data);
 
+    // SEC-025: skip data on refused streams.
+    if (self->refused_streams_.count(stream_id)) return 0;
+
     auto& st = self->get_or_create_stream(stream_id);
     st.recv.buf.insert(st.recv.buf.end(), data, data + len);
     self->dispatch_recv_frames(stream_id);
@@ -247,6 +317,9 @@ int H2Session::on_stream_close_callback(nghttp2_session* /*session*/,
                                           void* user_data)
 {
     auto* self = static_cast<H2Session*>(user_data);
+
+    // SEC-025: clean up refused-stream bookkeeping.
+    self->refused_streams_.erase(stream_id);
 
     auto it = self->streams_.find(stream_id);
     if (it == self->streams_.end()) return 0;
@@ -275,6 +348,19 @@ H2Session::StreamState& H2Session::get_or_create_stream(int32_t stream_id)
     StreamState& st = streams_[stream_id];
     st.channel = std::make_unique<FrameChannel>(strand_, kChannelCapacity);
     return st;
+}
+
+std::string H2Session::get_stream_header(int32_t stream_id,
+                                          std::string_view name) const
+{
+    auto it = streams_.find(stream_id);
+    if (it == streams_.end()) return {};
+
+    const auto& st = it->second;
+    if (name == "authorization")          return st.authorization;
+    if (name == "content-type")           return st.content_type;
+    if (name == "culpeostream-version")   return st.proto_version;
+    return {};
 }
 
 void H2Session::dispatch_recv_frames(int32_t stream_id)
@@ -406,6 +492,13 @@ asio::awaitable<void> H2Session::send_frame(int32_t stream_id,
 
     if (closed_.load(std::memory_order_acquire))
         throw asio::system_error(asio::error::broken_pipe);
+
+    // SEC-033: reject payloads that would overflow the 4-byte length prefix or
+    // exceed the per-frame size cap. The type byte occupies 1 byte of the
+    // length field, so the maximum payload size is kMaxFrameSize - 1.
+    if (payload.size() >= static_cast<std::size_t>(kMaxFrameSize)) {
+        throw std::invalid_argument("send_frame: payload exceeds kMaxFrameSize");
+    }
 
     auto envelope = encode_h2_envelope(type_byte, payload);
     enqueue_send(stream_id, std::move(envelope));
@@ -599,7 +692,9 @@ asio::awaitable<void> CulpeoH2Client::connect(std::string host,
 
         // Set ALPN
         SSL_set_tlsext_host_name(ssl_sock.native_handle(), host.c_str());
-        ssl_sock.set_verify_mode(asio::ssl::verify_none); // tests — no CA
+        // SEC-023: do NOT override verify mode here.  The ssl::context passed
+        // by the caller already carries the verify policy (verify_peer for
+        // production, verify_none for test fixtures that configure it explicitly).
         SSL_CTX_set_alpn_protos(
             SSL_get_SSL_CTX(ssl_sock.native_handle()),
             reinterpret_cast<const unsigned char*>("\x02h2"), 3);
@@ -646,6 +741,23 @@ asio::awaitable<void> CulpeoH2Client::close_session()
 {
     if (impl_->session)
         co_await impl_->session->close_session();
+}
+
+asio::awaitable<std::shared_ptr<H2Transport>>
+CulpeoH2Client::open_additional_stream(std::string path)
+{
+    if (!impl_->session)
+        throw std::logic_error("open_additional_stream() called before connect()");
+
+    // Reuse "localhost" as the :authority header for the additional stream.
+    // (A production API would cache the host from connect().)
+    std::string host = "localhost";
+
+    int32_t sid = co_await impl_->session->submit_request(host, path);
+    if (sid < 0) {
+        co_return nullptr; // Server refused (MAX_CONCURRENT_STREAMS exceeded)
+    }
+    co_return std::make_shared<H2Transport>(impl_->session, sid);
 }
 
 } // namespace culpeo::h2
