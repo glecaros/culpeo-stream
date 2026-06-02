@@ -555,3 +555,71 @@ More code than `Readable.from()`, but no hidden buffering or backpressure surpri
 
 ### Spec Reference
 N/A; implementation detail
+
+## SEC-026: Wrapping decodeFrame RangeError in Client frames() Iterator
+**Date:** 2025-07-14
+**Phase:** Phase 4
+**Status:** Decided
+
+### Context
+`decodeFrame` throws `RangeError` when a frame's length prefix exceeds `maxPayloadBytes`. In the client's `frames()` async iterator the `data` handler called `flush()` — which calls `decodeFrame` — without a `try/catch`. An oversized frame (e.g. length field = 0xFFFF_FFFF) would escape the event listener and hit Node.js's uncaught exception handler, crashing the process. The server already had a correct `try/catch` pattern; the client was inconsistent.
+
+### Decision
+Wrap the `flush()` call in the client `data` handler with `try/catch`. On any error, call `stream.destroy(err)` — this emits the `'error'` event, which the existing error handler catches and surfaces as a rejection on the next `next()` call. Also added `let error: unknown = null` state and updated `next()` to `Promise.reject(error)` when `done && error !== null`, matching the server's pattern.
+
+### Tradeoffs
+`stream.destroy(err)` sends `RST_STREAM` to the peer, which is visible as `ERR_HTTP2_STREAM_ERROR` on the server side. In tests using a raw server, we suppress this with a no-op `stream.on('error', () => {})`. The tradeoff is acceptable: proper error propagation to the consumer is more important than a clean teardown from a malformed frame.
+
+### Spec Reference
+SEC-026 (security finding); §C.5 (transport error handling)
+
+## SEC-027: TLS rejectUnauthorized=false Warning in Client Constructor
+**Date:** 2025-07-14
+**Phase:** Phase 4
+**Status:** Decided
+
+### Context
+`CulpeoHttp2Server` already emits `console.warn` when `allowInsecure: true`. The client silently accepted `rejectUnauthorized: false` with no indication that TLS certificate verification was disabled, creating a security asymmetry and no audit trail.
+
+### Decision
+Emit `console.warn` once in the `CulpeoHttp2Client` constructor (not per `connect()` call) when `rejectUnauthorized === false`. Warning text is consistent with the server's allowInsecure warning.
+
+### Tradeoffs
+Warning once at construction (not per reconnect) avoids log spam but means the warning will not appear if the options object is assembled lazily. Accepted: construction is the canonical point for option validation.
+
+### Spec Reference
+SEC-027 (security finding)
+
+## SEC-030: Content-Type Validation on Server
+**Date:** 2025-07-14
+**Phase:** Phase 4
+**Status:** Decided
+
+### Context
+The server accepted any POST request regardless of `Content-Type`. A sender not speaking CulpeoStream (e.g. a misconfigured proxy, a fuzzer) would have its data forwarded to the application handler, potentially causing parse errors or unexpected handler behaviour. Rejecting at the HTTP layer is cheaper and clearer.
+
+### Decision
+Check `headers['content-type']` before dispatching to the handler. Respond HTTP 415 (Unsupported Media Type) and `stream.end()` if the header is absent or does not include `application/culpeostream`. Using `String.includes()` allows for content-type parameters (e.g. `application/culpeostream; version=1`). The client already sends `application/culpeostream`; no client changes were required.
+
+### Tradeoffs
+Strict content-type checking may reject proxies that strip or normalise headers. Accepted: such proxies are not expected in a CulpeoStream deployment, and failing fast is preferable to silently processing garbage.
+
+### Spec Reference
+SEC-030 (security finding); §C.2
+
+## SEC-032: Unknown Type Octet Rejection
+**Date:** 2025-07-14
+**Phase:** Phase 4
+**Status:** Decided
+
+### Context
+`decodeFrame` was type-agnostic — it decoded and returned any type octet, including undefined values like `0x99`. Application code received frames it did not understand and had to defensively check the octet. The spec says implementations MUST close with a protocol error on unknown type octets.
+
+### Decision
+Add a type octet check inside both the client and server `flush()` helpers (the inner loops that consume the reassembly buffer). If `typeOctet !== CONTROL_FRAME && typeOctet !== MEDIA_FRAME`, throw an `Error` naming the hex value. In the client this feeds into the SEC-026 `try/catch` → `stream.destroy(err)` path. In the server it feeds into the existing `try/catch` → `done = true, reject(err)` path.
+
+### Tradeoffs
+Placing the check in `flush()` rather than `decodeFrame` keeps `framing.ts` transport-agnostic (it has no concept of valid type octets in its current role as a generic envelope codec). The cost is duplicated logic in two files; the benefit is that both client and server enforce the constraint at the point where they decide what to do with a frame.
+
+### Spec Reference
+SEC-032 (security finding); §3.1 (frame type enumeration)

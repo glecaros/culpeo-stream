@@ -124,6 +124,19 @@ class Http2ServerConnectionImpl implements CulpeoHttp2Connection {
           while (buf.length >= 5) {
             const result = decodeFrame(buf, maxPayloadBytes);
             if (result === null) break;
+            // SEC-032: Unknown type octets are a protocol error.  The spec
+            // requires implementations to close with protocol-error when an
+            // unrecognised type octet is received.  Throwing here feeds into
+            // the try/catch in the 'data' handler so the iterator terminates
+            // cleanly without forwarding the unknown frame to the handler.
+            if (
+              result.typeOctet !== CONTROL_FRAME &&
+              result.typeOctet !== MEDIA_FRAME
+            ) {
+              throw new Error(
+                `Unknown frame type octet 0x${result.typeOctet.toString(16).padStart(2, "0")}`,
+              );
+            }
             buf = buf.subarray(result.bytesConsumed);
             queue.push({
               typeOctet: result.typeOctet,
@@ -308,6 +321,16 @@ export class CulpeoHttp2Server {
 
         if (typeof reqPath === "string" && reqPath !== path && path !== "/") {
           stream.respond({ ":status": 404 });
+          stream.end();
+          return;
+        }
+
+        // SEC-030: Reject requests whose Content-Type is not the CulpeoStream
+        // framing type.  Any other value indicates the sender is not speaking
+        // the protocol we expect and the request must be refused with 415.
+        const contentType = headers["content-type"];
+        if (!contentType || !contentType.includes("application/culpeostream")) {
+          stream.respond({ ":status": 415 });
           stream.end();
           return;
         }

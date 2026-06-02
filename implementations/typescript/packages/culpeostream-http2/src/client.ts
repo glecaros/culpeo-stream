@@ -93,11 +93,23 @@ class Http2ConnectionImpl implements CulpeoHttp2Connection {
         let reject: ((err: unknown) => void) | null = null;
         const queue: { typeOctet: number; payload: Buffer }[] = [];
         let done = false;
+        // SEC-026: store the first error so next() can surface it even after the
+        // event handlers have already fired.
+        let error: unknown = null;
 
+        // SEC-032: validate type octet; unknown types are a protocol error.
         function flush() {
           while (buf.length >= 5) {
             const result = decodeFrame(buf);
             if (result === null) break;
+            if (
+              result.typeOctet !== CONTROL_FRAME &&
+              result.typeOctet !== MEDIA_FRAME
+            ) {
+              throw new Error(
+                `Unknown frame type octet 0x${result.typeOctet.toString(16).padStart(2, "0")}`,
+              );
+            }
             buf = buf.subarray(result.bytesConsumed);
             queue.push({
               typeOctet: result.typeOctet,
@@ -111,7 +123,15 @@ class Http2ConnectionImpl implements CulpeoHttp2Connection {
             ? chunk
             : Buffer.from(chunk as string);
           buf = Buffer.concat([buf, data]);
-          flush();
+          // SEC-026: catch RangeError (oversized frame) and SEC-032: unknown type
+          // octet.  Destroy the stream so the 'error' event fires and the
+          // async iterator surfaces a clean rejection to the consumer.
+          try {
+            flush();
+          } catch (err) {
+            stream.destroy(err instanceof Error ? err : new Error(String(err)));
+            return;
+          }
           if (resolve !== null && queue.length > 0) {
             const item = queue.shift()!;
             const res = resolve;
@@ -139,6 +159,10 @@ class Http2ConnectionImpl implements CulpeoHttp2Connection {
 
         stream.on("error", (err: unknown) => {
           done = true;
+          // SEC-026: store error so next() can reject even if called after the
+          // event has already fired (e.g. when the consumer is processing a
+          // queued frame and the error arrives between two next() calls).
+          error = err;
           if (reject !== null) {
             const rej = reject;
             resolve = null;
@@ -155,6 +179,9 @@ class Http2ConnectionImpl implements CulpeoHttp2Connection {
               return Promise.resolve({ value: queue.shift()!, done: false });
             }
             if (done) {
+              // SEC-026: surface the stored error rather than returning
+              // {done:true}, so the consumer sees a clean rejection.
+              if (error !== null) return Promise.reject(error);
               return Promise.resolve({
                 value: undefined as unknown as {
                   typeOctet: number;
@@ -215,6 +242,15 @@ export class CulpeoHttp2Client {
   private session: http2.ClientHttp2Session | null = null;
 
   constructor(options: CulpeoHttp2ClientOptions) {
+    // SEC-027: Warn once at construction time when TLS verification is disabled.
+    // SECURITY: Must only be used in local development/testing — never in production.
+    if (options.rejectUnauthorized === false) {
+      console.warn(
+        "[culpeostream-http2] WARNING: rejectUnauthorized is false. " +
+          "TLS certificate verification is disabled. " +
+          "This must only be used in local development/testing.",
+      );
+    }
     this.options = {
       authority: options.authority,
       path: options.path ?? "/",

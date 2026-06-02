@@ -15,9 +15,12 @@
  *  14. interop: culpeostream core serializes culpeo.init, sent over HTTP/2, received and parseable
  */
 
+// Import http2 for raw-level tests (SEC-026, SEC-030, SEC-032)
+import * as http2 from "node:http2";
+
 import { afterEach, describe, expect, it } from "vitest";
 
-import { CONTROL_FRAME, MEDIA_FRAME } from "../src/framing.js";
+import { CONTROL_FRAME, MEDIA_FRAME, encodeFrame } from "../src/framing.js";
 import { CulpeoHttp2Client } from "../src/client.js";
 import { CulpeoHttp2Server } from "../src/server.js";
 import type { CulpeoHttp2Connection } from "../src/connection.js";
@@ -392,6 +395,145 @@ describe("CulpeoHttp2Client ↔ CulpeoHttp2Server (h2c, insecure)", () => {
     expect(parsed.kind).toBe("control");
     if (parsed.kind === "control") {
       expect(parsed.event).toBe("culpeo.init");
+    }
+  });
+
+  // -----------------------------------------------------------------------
+  // SEC-026: Corrupted frame length prefix — frames() iterator ends cleanly
+  // -----------------------------------------------------------------------
+  it("SEC-026: corrupted oversized frame length prefix causes frames() iterator to reject cleanly", async () => {
+    // Use a raw HTTP/2 server so we can inject arbitrary bytes (bypassing
+    // the CulpeoHttp2Connection framing helpers).
+    const port = allocPort();
+    const rawServer = http2.createServer();
+
+    rawServer.on("stream", (rawStream, headers) => {
+      if (headers[":method"] === "POST") {
+        rawStream.respond({ ":status": 200 });
+        // Craft a frame whose 4-byte length field is 0xFFFF_FFFF (~4 GiB),
+        // which exceeds the default 16 MiB limit and triggers RangeError.
+        const corruptedBuf = Buffer.allocUnsafe(5);
+        corruptedBuf.writeUInt8(CONTROL_FRAME, 0);
+        corruptedBuf.writeUInt32BE(0xffffffff, 1);
+        rawStream.write(corruptedBuf);
+        // Suppress expected RST_STREAM error when the client disconnects.
+        rawStream.on("error", () => {});
+      }
+    });
+
+    await new Promise<void>((resolve) => rawServer.listen(port, resolve));
+
+    const client = new CulpeoHttp2Client({
+      authority: `http://localhost:${port}`,
+      rejectUnauthorized: false,
+    });
+
+    try {
+      const conn = await client.connect();
+      let threw = false;
+      try {
+        for await (const _frame of conn.frames()) {
+          // Should never yield a frame
+        }
+      } catch (err) {
+        threw = true;
+        expect(err).toBeInstanceOf(Error);
+        // Must surface the payload-too-large message, not crash the process
+        expect((err as Error).message).toMatch(/frame payload length/i);
+      }
+      expect(threw).toBe(true);
+      conn.close();
+    } finally {
+      client.close();
+      await new Promise<void>((resolve) => rawServer.close(() => resolve()));
+    }
+  });
+
+  // -----------------------------------------------------------------------
+  // SEC-030: Wrong Content-Type → server responds 415, handler never called
+  // -----------------------------------------------------------------------
+  it("SEC-030: POST with content-type: text/plain is rejected with 415 and handler is never called", async () => {
+    let handlerCalled = false;
+    const port = allocPort();
+
+    const server = new CulpeoHttp2Server(
+      { port, allowInsecure: true },
+      async (_conn) => {
+        handlerCalled = true;
+      },
+    );
+    await server.listen();
+
+    try {
+      const session = http2.connect(`http://localhost:${port}`);
+
+      const status = await new Promise<number>((resolve, reject) => {
+        const stream = session.request({
+          ":method": "POST",
+          ":path": "/",
+          "content-type": "text/plain",
+        });
+        stream.on("response", (headers) => {
+          resolve(headers[":status"] as number);
+          stream.destroy();
+        });
+        stream.on("error", reject);
+        stream.end();
+      });
+
+      session.close();
+
+      expect(status).toBe(415);
+      expect(handlerCalled).toBe(false);
+    } finally {
+      await server.close();
+    }
+  });
+
+  // -----------------------------------------------------------------------
+  // SEC-032: Unknown type octet 0x99 — frames() iterator rejects cleanly
+  // -----------------------------------------------------------------------
+  it("SEC-032: unknown type octet 0x99 causes frames() iterator to reject cleanly", async () => {
+    const port = allocPort();
+    const rawServer = http2.createServer();
+
+    rawServer.on("stream", (rawStream, headers) => {
+      if (headers[":method"] === "POST") {
+        rawStream.respond({ ":status": 200 });
+        // Send a well-formed envelope with an unrecognised type octet.
+        const payload = Buffer.from("unknown-type-test");
+        const encoded = encodeFrame(0x99, payload);
+        rawStream.write(encoded);
+        // Suppress expected RST_STREAM error when the client disconnects.
+        rawStream.on("error", () => {});
+      }
+    });
+
+    await new Promise<void>((resolve) => rawServer.listen(port, resolve));
+
+    const client = new CulpeoHttp2Client({
+      authority: `http://localhost:${port}`,
+      rejectUnauthorized: false,
+    });
+
+    try {
+      const conn = await client.connect();
+      let threw = false;
+      try {
+        for await (const _frame of conn.frames()) {
+          // Should never yield a frame with the unknown type octet
+        }
+      } catch (err) {
+        threw = true;
+        expect(err).toBeInstanceOf(Error);
+        // Must mention the offending type octet hex value
+        expect((err as Error).message).toContain("0x99");
+      }
+      expect(threw).toBe(true);
+      conn.close();
+    } finally {
+      client.close();
+      await new Promise<void>((resolve) => rawServer.close(() => resolve()));
     }
   });
 });
