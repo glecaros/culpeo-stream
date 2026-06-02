@@ -1,0 +1,38 @@
+{
+  "name": "culpeostream-http2",
+  "version": "0.1.0",
+  "private": true,
+  "description": "HTTP/2 transport for the CulpeoStream protocol",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    }
+  },
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "format": "prettier --write 'src/**/*.ts' 'tests/**/*.ts'",
+    "format:check": "prettier --check 'src/**/*.ts' 'tests/**/*.ts'"
+  },
+  "keywords": [
+    "culpeostream",
+    "streaming",
+    "http2",
+    "transport"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "culpeostream": "file:../culpeostream"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "prettier": "^3.8.3",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.8"
+  }
+}

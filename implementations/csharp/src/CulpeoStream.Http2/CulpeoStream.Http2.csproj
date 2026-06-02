@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RollForward>Major</RollForward>
+    <AssemblyName>CulpeoStream.Http2</AssemblyName>
+    <RootNamespace>CulpeoStream.Http2</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- ASP.NET Core for server-side endpoint support -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CulpeoStream.Core\CulpeoStream.Core.csproj" />
+  </ItemGroup>
+</Project>

@@ -110,6 +110,35 @@ Implement an HTTP/2 transport adapter to prove the transport-agnostic design is 
 - Interop test: connect `CulpeoH2Client` to the WebSocket server (using the session layer directly), verify full frame exchange
 - All tests pass under ASan+UBSan
 
+#### Design decision required: C++20 coroutines for the transport interface
+
+The current `ITransport` interface (`send_text`, `send_binary`, `close`) is synchronous and void-returning — callbacks handle completions, and `WsTransport` uses `mutex` + `loop->defer()` for thread affinity. This works for WebSocket but has two weaknesses: no backpressure and no error propagation from sends.
+
+HTTP/2 is where coroutines pay off most: stream multiplexing, flow control, and HEADERS-before-DATA sequencing are naturally expressed as `co_await` chains rather than callback graphs.
+
+**You MUST evaluate and decide in Phase 4:**
+
+1. **Coroutine executor choice** — C++20 coroutines need a scheduler. Evaluate:
+   - **Asio standalone** (`asio::awaitable<T>`) — mature, widely used, `FetchContent`-friendly
+   - **libcoro** or **cppcoro** — lighter, but less maintained
+   - **Roll minimal awaitables** — avoids the dependency but is significant work
+   Document your choice in `DECISIONS.md` with rationale.
+
+2. **ITransport async variant** — consider introducing a parallel interface:
+   ```cpp
+   class IAsyncTransport {
+   public:
+       virtual asio::awaitable<void> send_text(std::span<const std::byte>) = 0;
+       virtual asio::awaitable<void> send_binary(std::span<const std::byte>) = 0;
+       virtual asio::awaitable<void> close(int code, std::string_view reason) = 0;
+   };
+   ```
+   `H2Transport` implements `IAsyncTransport`; `WsTransport` can optionally adopt it later. Document whether you unify or keep both in `DECISIONS.md`.
+
+3. **uWS interop** — if Asio is chosen, document how `H2Transport`'s Asio executor coexists with uWebSockets' own event loop (they must not share a thread without explicit coordination).
+
+The WebSocket transport does **not** need to be refactored in Phase 4 — only the HTTP/2 transport needs to adopt whatever model you choose. But the decision will determine the long-term direction of `ITransport`.
+
 ### Phase 5 — Python Bindings (`culpeostream-py`)
 
 - Use **pybind11** to expose the session and message layers (both WebSocket and HTTP/2 transports)

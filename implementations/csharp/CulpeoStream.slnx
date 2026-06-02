@@ -3,10 +3,12 @@
     <Project Path="src/CulpeoStream.Core/CulpeoStream.Core.csproj" />
     <Project Path="src/CulpeoStream.AspNetCore/CulpeoStream.AspNetCore.csproj" />
     <Project Path="src/CulpeoStream.Client/CulpeoStream.Client.csproj" />
+    <Project Path="src/CulpeoStream.Http2/CulpeoStream.Http2.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/CulpeoStream.Core.Tests/CulpeoStream.Core.Tests.csproj" />
     <Project Path="tests/CulpeoStream.AspNetCore.Tests/CulpeoStream.AspNetCore.Tests.csproj" />
     <Project Path="tests/CulpeoStream.Client.Tests/CulpeoStream.Client.Tests.csproj" />
+    <Project Path="tests/CulpeoStream.Http2.Tests/CulpeoStream.Http2.Tests.csproj" />
   </Folder>
 </Solution>
