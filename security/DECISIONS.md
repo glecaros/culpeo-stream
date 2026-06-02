@@ -222,3 +222,77 @@ Add test cases for oversized and control-character-containing reasons.
 
 ### Resolution
 Open — awaiting C++ agent response.
+
+## Phase 4 HTTP/2 transport review scope and methodology
+**Date:** 2026-06-01
+**Target:** C++ | C# | TypeScript
+**Status:** Resolved
+
+### Context
+Phase 4 adds HTTP/2 transport implementations across all three languages (Addendum C).
+Reviewed all new Phase 4 source files directly: C++ `libculpeo-transport-h2/`, C#
+`CulpeoStream.Http2/`, TypeScript `culpeostream-http2/src/`.  Also read all three
+implementations' DECISIONS.md files and the Phase 4 entries in the security decisions log.
+
+### Finding or Decision
+Reviewed all Phase 4 files directly (11 source files) rather than delegating to sub-agents.
+The scope is bounded and high-confidence direct review of C/C++ memory safety, C# arithmetic,
+and TypeScript event-handler error propagation requires reading the actual code rather than
+summaries.
+
+### Recommended Action
+File individual findings per the findings template.  Prioritize: SEC-023 (Critical TLS bypass),
+SEC-024 (High C# integer overflow), SEC-025 (High unbounded stream creation), SEC-026 (High
+TS client process crash).
+
+### Resolution
+Resolved — 11 findings filed (SEC-023 through SEC-033).
+
+## Accepting `verify_none` in C++ TLS client as a blocker
+**Date:** 2026-06-01
+**Target:** C++
+**Status:** Open
+
+### Context
+`h2_client.cpp` line 602 overrides the caller's TLS context with `verify_none`.
+The comment says "tests — no CA" but this is in the production TLS path, not a
+test fixture.  The `AllowCleartext` path is the correct mechanism for tests.
+
+### Finding or Decision
+Filed as **Critical** (SEC-023).  A hardcoded `verify_none` in the production TLS path
+fully defeats transport security — it is not a defense-in-depth gap but a complete bypass.
+This blocks all other Phase 4 security properties because the token secrecy and session
+integrity claims all depend on TLS being properly terminated.
+
+### Recommended Action
+Remove `set_verify_mode(verify_none)` from `connect()`.  The caller controls the SSL
+context and MUST set their own verify mode.  For tests, pass a context with `verify_none`
+explicitly from the test fixture.  Do not set verify mode inside the library.
+
+### Resolution
+Open — awaiting C++ agent fix.
+
+## C# signed-cast truncation: treating as High not Critical
+**Date:** 2026-06-01
+**Target:** C#
+**Status:** Open
+
+### Context
+`Http2FrameReader.ReadFrameAsync` casts `uint` to `int` before comparing to `maxPayloadBytes`.
+Values ≥ 0x80000000 yield negative `int`, bypass the check, then throw `OverflowException`
+during `new byte[payloadLength]`.
+
+### Finding or Decision
+Filed as **High** (SEC-024) rather than Critical.  The effect is per-connection DoS
+(unhandled exception terminates the handler task) rather than memory exhaustion across the
+process — each connection runs in an independent task, so the server continues serving other
+clients.  However, unauthenticated clients can reliably terminate their own connections before
+auth is checked, which could be used to exhaust connection slots if combined with a connection
+flood.
+
+### Recommended Action
+Read the length as `uint`, validate against `(uint)maxPayloadBytes`, then cast to `int`
+after the check.  One-line fix.
+
+### Resolution
+Open — awaiting C# agent fix.
