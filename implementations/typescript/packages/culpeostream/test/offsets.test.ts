@@ -5,7 +5,11 @@ import { computeOffsetIncrement, OffsetTracker } from "../src/offsets.js";
 describe("offset tracking", () => {
   it("increments PCM streams by sample count (offset_type: time)", () => {
     expect(
-      computeOffsetIncrement("time", 640, "audio/pcm;rate=16000;channels=1;bits=16"),
+      computeOffsetIncrement(
+        "time",
+        640,
+        "audio/pcm;rate=16000;channels=1;bits=16",
+      ),
     ).toBe(320);
   });
 
@@ -16,9 +20,9 @@ describe("offset tracking", () => {
   });
 
   it("requires a PCM content type when offset_type is time", () => {
-    expect(() =>
-      computeOffsetIncrement("time", 256, "audio/opus"),
-    ).toThrow(/PCM content type/);
+    expect(() => computeOffsetIncrement("time", 256, "audio/opus")).toThrow(
+      /PCM content type/,
+    );
   });
 
   it("increments encoded streams by frame count (offset_type: message)", () => {

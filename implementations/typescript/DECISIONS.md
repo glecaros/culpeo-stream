@@ -623,3 +623,145 @@ Placing the check in `flush()` rather than `decodeFrame` keeps `framing.ts` tran
 
 ### Spec Reference
 SEC-032 (security finding); §3.1 (frame type enumeration)
+
+---
+
+## Phase 5 — WASM Parser Backend: Architecture Decision
+**Date:** 2025-07-14
+**Phase:** Phase 5
+**Status:** Decided
+
+### Context
+Phase 5 requires a WebAssembly-accelerated header parser/serializer for the hot binary-frame path, with transparent fallback to the existing pure-TypeScript implementation when WASM is unavailable (SSR, old runtimes, load failure, Emscripten not compiled).
+
+The core design question: how deep should the WASM integration go?  Options were:
+1. Replace the entire `parseFrame`/`serializeFrame` API with WASM.
+2. Replace only the raw text-processing step (finding `\r\n\r\n`, splitting `key: value` lines, assembling the header byte sequence) and keep all semantic validation (limits, forbidden chars, required headers) in TypeScript.
+3. Make WASM an optional entirely separate package with no hooks into the core.
+
+### Decision
+Option 2 was chosen.  A `ParserBackend` interface is added to `culpeostream` core (`src/parser-backend.ts`) with two operations:
+
+- `parseHeaders(buf)` → ordered `[key, value]` pair array + body offset (or `null`/throws)
+- `serializeFrame(headers, body)` → `Uint8Array`
+
+`setParserBackend(backend | null)` registers an override.  All semantic validation (header count, name/value length, forbidden characters, duplicate reserved headers) is enforced in TypeScript *after* the backend produces raw pairs.  The default is `null` (pure-TS path, no behaviour change for existing callers).
+
+A new package `packages/culpeostream-wasm/` wraps the Emscripten-compiled C code and, after a successful `initWasm()`, installs itself via `setParserBackend()`.
+
+### Tradeoffs
+- **Gave up**: uniform WASM acceleration of the full semantic pipeline; duplicate-reserved-header detection relies on the ordered pair list (works correctly since the backend returns all pairs including duplicates).
+- **Gained**: all spec MUST validations remain in TypeScript (auditable, testable, no C complexity); WASM accelerates only the hot text-manipulation path; a clean plug/unplug API that is easy for the Security Agent to review.
+- **Risk accepted**: the TypeScript validation loop runs a second pass over headers already processed by C.  For typical frames (< 10 headers) this overhead is negligible.
+
+### Spec Reference
+TypeScript agent Phase 5 requirements; §3 (frame format)
+
+---
+
+## Phase 5 — ParserBackend Interface Uses Ordered Pairs, Not Record
+**Date:** 2025-07-14
+**Phase:** Phase 5
+**Status:** Decided
+
+### Context
+The `ParserBackend.parseHeaders` return type could be `Record<string, string>` (simple, but loses duplicates and order) or `ReadonlyArray<readonly [string, string]>` (preserves order and duplicates, enabling duplicate-reserved-header detection in TypeScript).
+
+The public `culpeostream-wasm` package API (for direct consumers, not the core integration) uses `Record<string, string>` as specified in the Phase 5 requirements — duplicate info is not needed there since application code typically queries headers by name.
+
+### Decision
+- **`ParserBackend` interface** (core integration): uses `ReadonlyArray<readonly [string, string]>` to preserve order and allow duplicate detection.
+- **`culpeostream-wasm` public API** (`parseHeaders()` / `serializeFrame()`): uses `Record<string, string>` for ergonomic consumer use.
+
+The wasm-loader's `createWasmParserBackend()` returns a `ParserBackend` (pair list API); the module-level `parseHeaders()` converts to `Record<string, string>` before returning to callers.
+
+### Tradeoffs
+Two representations adds a small conversion cost (one `Object.entries` / `Object.fromEntries` loop per call).  Accepted: this is dwarfed by the WASM call overhead itself.
+
+### Spec Reference
+TypeScript agent Phase 5 requirements
+
+---
+
+## Phase 5 — Stub dist Artefacts Committed to Repository
+**Date:** 2025-07-14
+**Phase:** Phase 5
+**Status:** Decided
+
+### Context
+Emscripten is not installed in the devcontainer.  The `dist/` folder needs *some* content for the TypeScript `import("../dist/culpeo_parser.js")` in `wasm-loader.ts` to resolve without a build step in CI.
+
+Options:
+1. Add `dist/` to `.gitignore` and require a build step before tests run.
+2. Commit a stub `dist/culpeo_parser.js` that presents the Emscripten module shape but returns a sentinel (`__culpeoStub: true`) so `initWasm()` resolves `false`.
+3. Bundle the compiled `.wasm` via `base64` in a TypeScript file.
+
+### Decision
+Option 2.  A stub `dist/culpeo_parser.js` is committed that:
+- Exports `createCulpeoParserModule()` (same export name as the real Emscripten glue)
+- Returns an object with `__culpeoStub: true`
+- `initWasm()` detects the sentinel and returns `false`
+
+A 8-byte stub `dist/culpeo_parser.wasm` (magic bytes + version only, no sections) is also committed.
+
+When Emscripten *is* available (`make wasm` or the Docker one-liner in `WASM_BUILD.md`), the real `.js` and `.wasm` files replace the stubs and `initWasm()` returns `true`.
+
+### Tradeoffs
+- CI always runs the TypeScript fallback path (not WASM); WASM correctness can only be verified after a real Emscripten build.  This is documented explicitly in `WASM_BUILD.md`.
+- Stub files must be kept in sync with the real Emscripten module shape (same export name, same factory function signature).
+
+### Spec Reference
+TypeScript agent Phase 5 requirements
+
+---
+
+## Phase 5 — Emscripten Version Target: 3.1.x
+**Date:** 2025-07-14
+**Phase:** Phase 5
+**Status:** Decided
+
+### Context
+Emscripten has historically had breaking changes in how it modularises output (`MODULARIZE=1`), memory growth flags, and exported runtime methods.
+
+### Decision
+Target **Emscripten 3.1.x** (specifically 3.1.74 in Docker image `emscripten/emsdk:3.1.74`).  The build flags used are:
+- `-s WASM=1` — emit WASM output
+- `-s MODULARIZE=1 -s EXPORT_NAME=createCulpeoParserModule` — ES-module-compatible factory function
+- `-s ALLOW_MEMORY_GROWTH=1` — allow heap expansion for large frames
+- `-s EXPORTED_RUNTIME_METHODS=["ccall","cwrap","HEAPU8","getValue","setValue"]` — minimal runtime surface
+
+### Tradeoffs
+Pinning to 3.1.x means we may need to update the flags if a future Emscripten release deprecates any of them.  Accepted; the Makefile and CMakeLists.txt document the exact flags.
+
+### Spec Reference
+TypeScript agent Phase 5 requirements
+
+---
+
+## Phase 5 — WASM Memory Management: All Malloc/Free in TypeScript Wrapper
+**Date:** 2025-07-14
+**Phase:** Phase 5
+**Status:** Decided
+
+### Context
+The Emscripten-compiled WASM module exposes `_malloc` and `_free`.  Two ownership models were considered:
+1. C allocates output buffers and TypeScript frees them.
+2. TypeScript allocates all buffers (input and output), passes pointers to C, TypeScript frees everything.
+
+### Decision
+Option 2: **TypeScript owns all allocations**.  For every call:
+- TypeScript calls `_malloc(size)` for input data, header struct array, and output buffer.
+- Data is copied into WASM heap via `HEAPU8.set`.
+- The C function is called with pointers.
+- TypeScript reads results directly from `HEAPU8`.
+- TypeScript calls `_free` on all pointers in a `finally` block, ensuring no leaks even on error paths.
+
+No WASM heap memory escapes a single call.
+
+### Tradeoffs
+- **Gave up**: the possibility of zero-copy input (we always copy `buf` into WASM heap).
+- **Gained**: simple ownership model with no C-side allocation; `finally`-guaranteed freeing prevents leaks; C code stays stateless with no hidden global heap state.
+- The extra copy cost is dominated by the WASM call overhead for typical frame sizes (< 2 KB headers).
+
+### Spec Reference
+TypeScript agent Phase 5 requirements; security requirements (no data persists on WASM heap between calls)

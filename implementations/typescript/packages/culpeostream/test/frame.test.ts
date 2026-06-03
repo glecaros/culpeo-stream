@@ -23,7 +23,13 @@ describe("frame parser and serializer", () => {
       },
       body: {
         version: "0.3",
-        streams: [{ content_type: "audio/opus", type: "output", offset_type: "message" }],
+        streams: [
+          {
+            content_type: "audio/opus",
+            type: "output",
+            offset_type: "message",
+          },
+        ],
       },
     };
 
