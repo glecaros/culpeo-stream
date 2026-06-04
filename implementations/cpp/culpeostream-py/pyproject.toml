@@ -1,0 +1,44 @@
+[build-system]
+requires = ["scikit-build-core>=0.9", "pybind11>=2.13"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "culpeostream"
+version = "0.1.0"
+description = "Python bindings for the CulpeoStream C++ core library"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+keywords = ["audio", "streaming", "websocket", "http2", "culpeostream"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Topic :: Internet :: WWW/HTTP",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "pytest-timeout"]
+
+[tool.scikit-build]
+# Build from this directory (culpeostream-py/); the CMakeLists.txt here handles
+# standalone builds by including sibling library source trees via add_subdirectory.
+cmake.source-dir = "."
+cmake.build-type = "Release"
+wheel.packages = []        # Extension-only wheel; no Python package directory.
+install.components = ["culpeostream"]
+
+[tool.scikit-build.cmake.define]
+# Disable test builds when invoked via pip; tests use Catch2 C++ runner.
+CULPEO_BUILD_TESTS = "OFF"
+# Disable uWebSockets header fetch (not needed for Python bindings).
+CULPEO_FETCH_UWS_HEADERS = "OFF"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 30
