@@ -831,3 +831,39 @@ The `removeAllListeners()` calls previously needed to prevent GC leaks (TS-P3-00
 
 ### Spec Reference
 Phase 3 server requirements; Security invariants (SEC-020, SEC-021 unchanged).
+
+## Phase 5 Review Findings — Async Error Handling and Memory Safety
+**Date:** 2026-06-04
+**Phase:** Phase 5 (review fixes)
+**Status:** Decided
+
+### Context
+The Phase 5 security review raised six findings across `culpeostream-client`, `culpeostream-server`, and `culpeostream-wasm`. The fixes below were applied together and all 157 tests continue to pass.
+
+### Decision
+
+**Finding 1 (HIGH): `void session.receive(frame)` fire-and-forget**
+Changed to `await session.receive(frame)` inside the existing inner `try/catch` in `runConnection()`. Errors from async session processing (auth-refresh failures, state machine violations, protocol errors) are now caught and emitted as `error` events rather than becoming unhandled promise rejections.
+
+**Finding 2 (HIGH): WASM `serializeFrameWasm` memory leak on second allocation failure**
+Restructured `serializeFrameWasm` from ad-hoc manual frees on each allocation check to a single `try/finally` block that initialises all pointers to `0` before the try and frees all non-zero pointers in `finally`. This is consistent with the existing `parseHeadersWasm` pattern. Previously, if `copyToHeap` for `bodyPtr` threw, `stringsBufPtr` was leaked.
+
+**Finding 3 (MEDIUM): `session.start()` unhandled rejection hangs `connect()` forever**
+Wrapped `session.start()` in a `try/catch` that rejects the pending `connect()` promise, closes the WebSocket with code 4002, and returns early. Without this, a `session.start()` failure left `this.pendingConnect` unsettled indefinitely.
+
+**Finding 4 (MEDIUM/Security): Server leaks `err.message` as WebSocket close reason**
+Replaced `err.message.slice(0, 123)` in the `runMessageLoop` error handler with a generic constant string `"Protocol error"` and a `console.error` on the server side. Session IDs, stream offsets, and state machine names no longer leak to the remote peer.
+
+**Finding 5 (LOW): Double `saveSnapshot()` on client-initiated close**
+Removed the explicit `await this.saveSnapshot()` call from the `"close"` notification handler in `handleNotification()`. `handleWsClose()` already calls `saveSnapshot()` unconditionally when the connection tears down, making the second call redundant for all stores and hazardous for external stores with optimistic locking.
+
+**Finding 6 (LOW): `Math.min(buf.length, buf.length)` no-op in fallback parser**
+Added `const MAX_HEADER_SCAN = 16 * 1024` (matching libculpeo-message's `header_block_max`) and used it in the `Math.min` call in `parseHeadersTs()`. This ensures the TypeScript fallback parser enforces the same scan depth limit as the WASM path and prevents O(n) scanning of arbitrarily large buffers.
+
+### Tradeoffs
+- `await session.receive(frame)` serialises receive processing per frame (no concurrent receive calls on the same session), which is the intended invariant. There is no throughput regression because a single WebSocket connection was already sequential.
+- The `MAX_HEADER_SCAN` limit of 16 KiB means frames whose header blocks exceed 16 KiB will never parse (returns `null`). This is intentional and matches the WASM path; oversized header blocks are a protocol violation.
+- The generic server error reason removes one debugging signal available to clients. Server-side logging compensates.
+
+### Spec Reference
+Section 6 (auth-refresh); Section 4 (frame parsing limits); TypeScript agent security requirements; SEC-020; SEC-021.
