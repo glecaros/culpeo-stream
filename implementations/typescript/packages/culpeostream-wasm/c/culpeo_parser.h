@@ -2,6 +2,10 @@
  * culpeo_parser.h — Public C API for the CulpeoStream header parser and
  * serializer, compiled to WebAssembly via Emscripten.
  *
+ * This header mirrors `libculpeo-message/include/culpeo/c_api.h`.
+ * When building with Emscripten the implementation comes from `c_api.cpp`
+ * in that library (backed by the C++20 `culpeo::message` parser).
+ *
  * All functions are pure (no global state) and safe to call concurrently.
  * The caller is responsible for allocating and freeing all buffers.
  */
@@ -22,8 +26,10 @@ extern "C" {
  * `culpeo_parse_headers` — they are NOT pointers to a copy.  The caller must
  * read the data from the input buffer while it is still live.
  *
- * All keys are already lower-cased and both sides are whitespace-trimmed by
- * the parser.
+ * Keys are returned in their original case — the input buffer is NOT
+ * modified.  Callers should normalise key case on their side (e.g.,
+ * `key.toLowerCase()` in JavaScript).
+ * Values are whitespace-trimmed by the parser.
  */
 struct culpeo_header {
     uint32_t key_ptr; /**< Byte offset of key start within the input buffer */
@@ -37,11 +43,15 @@ struct culpeo_header {
  *
  * Scans `buf[0..len)` for the mandatory `\r\n\r\n` terminator.  For each
  * `\r\n`-delimited line before the terminator the first `:` separates the key
- * from the value; the key is lower-cased in-place and both sides are trimmed.
+ * from the value; both sides are whitespace-trimmed.
  *
- * @param buf            Input buffer.  Modified in-place (keys are
- *                       lower-cased); must remain live until the caller has
- *                       finished reading the returned `culpeo_header` pointers.
+ * IMPORTANT: `buf` is `const` — the input buffer is NOT modified.  Keys are
+ * returned in their original case (no in-place lowercasing).  Callers should
+ * normalise key case on their side (e.g. `key.toLowerCase()` in JS).
+ *
+ * @param buf            Input buffer.  Read-only; not modified by the parser.
+ *                       Must remain live until the caller has finished reading
+ *                       the returned `culpeo_header` offsets.
  * @param len            Length of `buf` in bytes.
  * @param headers_out    Caller-allocated array of at least `max_headers`
  *                       `culpeo_header` structs.  Filled on success.
@@ -55,7 +65,7 @@ struct culpeo_header {
  *          -2  if a header line is missing a `:` separator (malformed).
  *          -3  if the number of header lines exceeds `max_headers`.
  */
-int culpeo_parse_headers(uint8_t *buf, size_t len,
+int culpeo_parse_headers(const uint8_t *buf, size_t len,
                          struct culpeo_header *headers_out, int max_headers,
                          size_t *body_offset_out);
 

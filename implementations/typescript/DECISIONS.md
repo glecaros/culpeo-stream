@@ -765,3 +765,69 @@ No WASM heap memory escapes a single call.
 
 ### Spec Reference
 TypeScript agent Phase 5 requirements; security requirements (no data persists on WASM heap between calls)
+
+---
+
+## Phase 5 — WASM backed by libculpeo-message C++ shim
+**Date:** 2025-07-15
+**Phase:** Phase 5
+**Status:** Decided
+
+### Context
+The WASM package previously compiled a standalone `c/culpeo_parser.c` that reimplemented header parsing in C99. The C++ team added an `extern "C"` shim (`c_api.cpp`) to `libculpeo-message` that exposes the same C ABI, backed by the battle-tested C++20 `culpeo::message` parser (which already had fuzz corpus, ASan/UBSan coverage, and property-based tests). Maintaining a separate C reimplementation was unnecessary duplication and missed those quality guarantees.
+
+### Decision
+Replaced `c/culpeo_parser.c` with a Makefile that compiles `libculpeo-message/src/message.cpp` + `libculpeo-message/src/c_api.cpp` using `em++` with `-std=c++20`. The `c/culpeo_parser.h` header is kept as a local documentation mirror of the C ABI but the implementation is no longer in the TypeScript tree. The `src/wasm-loader.ts` wrapper adds `.toLowerCase()` on every decoded key string because the C++ parser returns keys in their original case (no in-place lowercasing), maintaining the same normalised-key contract as the pure-TypeScript fallback.
+
+### Tradeoffs
+- **Gave up**: the ability to build WASM without checking out the C++ subtree. Docker command updated to mount the repo root so `../../../../cpp/libculpeo-message` is accessible.
+- **Gained**: single source of truth for parsing logic; automatic inheritance of fuzz-testing, ASan, and UBSan coverage; C++20 standard library (no custom string-handling).
+- Key lowercasing moved from WASM to JS layer — zero observable difference, but slightly more JS work per call. Acceptable given parsing is already WASM-bound.
+
+### Spec Reference
+TypeScript agent Phase 5 requirements; Section 4.1 (header parsing)
+
+---
+
+## Phase 2 — `@culpeo/async-ws` for WebSocket transport
+**Date:** 2025-07-15
+**Phase:** Phase 2 (revision)
+**Status:** Decided
+
+### Context
+The original `client.ts` used raw `WebSocket` event listeners (`open`, `message`, `close`, `error`) with manual cleanup via a stored `wsHandlers` object. This pattern required careful bookkeeping to remove listeners before each reconnect, and the connection lifecycle was spread across four callbacks. The `@culpeo/async-ws` library provides a promise-based `WebSocketClient` that wraps the same browser WebSocket API plus `ws` for Node.js.
+
+### Decision
+Replaced the raw WebSocket + `wsHandlers` + `cleanupWebSocket()` pattern with `@culpeo/async-ws` `WebSocketClient`. The per-connection lifecycle is now a single `async runConnection()` method: `await wsClient.connect(url)` opens the socket; `await session.start()` sends `culpeo.init`; `for await (const msg of wsClient)` is the receive loop; cleanup is implicit when the iterator ends. `connect()` and `close()` are promise-based, eliminating manual listener removal. The `CulpeoStreamClientOptions.WebSocket` constructor injection field was replaced by `wsClientFactory?: () => WsClientLike`, where `WsClientLike` is a structural interface that tests can implement directly without casting.
+
+### Tradeoffs
+- **Removed**: `WebSocketConstructor` type alias and `wsHandlers` bookkeeping; `cleanupWebSocket()` helper.
+- **Added**: runtime dependency on `@culpeo/async-ws` in `culpeostream-client` (previously zero runtime deps). This is acceptable because the client package already depends on `culpeostream` and is inherently Node.js/browser-coupled.
+- Test mocks were updated from `MockWebSocket extends EventTarget` (synchronous event dispatch) to `MockWebSocketClient implements WsClientLike` (promise-based connect, async iterator for messages). Tests remain fully deterministic — the mock resolves promises synchronously and the async iterator yields synchronously when a waiter is already pending.
+- Security invariants (token never logged, session IDs opaque, wss:// required) are all preserved in the new implementation.
+
+### Spec Reference
+TypeScript agent Phase 2 requirements; Section 9 (reconnection); Addendum A.4 (token handling)
+
+## Server per-connection handling via `@culpeo/async-ws` `fromSocket()`
+**Date:** 2026-07-14
+**Phase:** Phase 3
+**Status:** Decided
+
+### Context
+`culpeostream-server` previously handled per-connection WebSocket lifecycle by registering raw `ws.on("message"/"close"/"error")` callbacks and serialising message processing via a manual `queue` array + `drainQueue()` async mutex. This pattern is correct but verbose and forces consumers to reason about queue draining concurrency manually. `@culpeo/async-ws` v1.1.0 introduced `WebSocketClient.fromSocket(socket)` which wraps an already-open server-side socket and provides `for await...of`, `send()`, and `close()` — the same API used by the client package.
+
+### Decision
+Replace `ws.on("message"/"close"/"error")` callbacks and the `queue`/`drainQueue` mutex with `WebSocketClient.fromSocket(ws)` + `for await...of` in a `runMessageLoop()` method launched with `void this.runMessageLoop()` from the constructor. The `rawDataToBuffer()` helper is removed because `@culpeo/async-ws` normalises binary messages to `ArrayBuffer`. The `ws` package is retained for `WebSocketServer` (accepting connections) and `ws.terminate()` (force-kill path used by `CulpeoServer.close()`). The `ServerSessionImpl` and `ServerConnection` internal helper `sendText()` and `coreSession.sendFrame` callback all use `wsClient` for state checks and sends.
+
+The `removeAllListeners()` calls previously needed to prevent GC leaks (TS-P3-001) are removed because `@culpeo/async-ws` manages listener cleanup internally when the iterator ends.
+
+**Close code note:** `@culpeo/async-ws` v1.1.0 validates close codes and only accepts `1000` (normal) or application-specific codes in the range `3000–4999`. Standard protocol-error codes `1001–1015` are rejected. Code `4001` is used for `unauthorized` rejections and `4002` for protocol errors, preserving semantic distinction from normal closure (`1000`). The application-level error reason is already carried in the `culpeo.init-error` frame, so the WS close code is informational only.
+
+### Tradeoffs
+- **Gained:** Simpler concurrency model (sequential by design via async iteration), less code, consistent API with the client package.
+- **Given up:** Using standard WebSocket protocol-error close codes (1002, 1008 etc.) — replaced with 4001/4002 application-specific codes due to library validation constraints. Clients that inspect WS close codes will see 40xx instead of 10xx for rejected sessions.
+- **Risk accepted:** The `terminate()` force-close path still goes directly to the raw `ws.terminate()`, bypassing `wsClient`. This is intentional: `terminate()` is a last-resort server shutdown operation with no graceful alternative.
+
+### Spec Reference
+Phase 3 server requirements; Security invariants (SEC-020, SEC-021 unchanged).

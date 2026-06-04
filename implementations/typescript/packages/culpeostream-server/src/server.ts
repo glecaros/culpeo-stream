@@ -16,8 +16,10 @@
 import * as http from "node:http";
 import * as https from "node:https";
 
-import { WebSocket, WebSocketServer } from "ws";
+import { WebSocketServer } from "ws";
 import type WebSocketType from "ws";
+
+import { WebSocketClient } from "@culpeo/async-ws";
 
 import {
   CulpeoError,
@@ -230,7 +232,7 @@ class ServerSessionImpl implements IServerSession {
 
   public constructor(
     private readonly coreSession: CulpeoServerSession,
-    private readonly ws: WebSocketType,
+    private readonly wsClient: WebSocketClient,
     confirmedStreams: readonly ConfirmedStreamDeclaration[],
     private readonly options: CulpeoServerOptions,
   ) {
@@ -277,32 +279,13 @@ class ServerSessionImpl implements IServerSession {
 
   public async close(reason = "Session closed by server"): Promise<void> {
     await this.coreSession.close("normal", reason);
-    if (
-      this.ws.readyState === WebSocket.OPEN ||
-      this.ws.readyState === WebSocket.CONNECTING
-    ) {
-      this.ws.close(1000, reason);
-    }
+    await this.wsClient.close(1000, reason);
   }
 }
 
 // ---------------------------------------------------------------------------
 // ServerConnection — manages one WebSocket connection lifecycle
 // ---------------------------------------------------------------------------
-
-/**
- * Converts ws RawData (Buffer | ArrayBuffer | Buffer[]) to a single Buffer.
- */
-function rawDataToBuffer(data: WebSocketType.RawData): Buffer {
-  if (Buffer.isBuffer(data)) {
-    return data;
-  }
-  if (data instanceof ArrayBuffer) {
-    return Buffer.from(data);
-  }
-  // Buffer[] — concatenate chunks
-  return Buffer.concat(data);
-}
 
 /**
  * Build a serialized culpeo.init-error frame as a string (control frame).
@@ -329,11 +312,7 @@ class ServerConnection {
   private serverSession: ServerSessionImpl | undefined;
   private pingTimer: ReturnType<typeof setInterval> | undefined;
   private authRefreshTimer: ReturnType<typeof setInterval> | undefined;
-  private processing = false;
-  private readonly queue: Array<{
-    data: WebSocketType.RawData;
-    isBinary: boolean;
-  }> = [];
+  private readonly wsClient: WebSocketClient;
   private closed = false;
 
   public constructor(
@@ -342,19 +321,8 @@ class ServerConnection {
     private readonly store: ISessionStore,
     private readonly onClose: () => void,
   ) {
-    ws.on("message", (data, isBinary) => {
-      this.queue.push({ data, isBinary });
-      void this.drainQueue();
-    });
-
-    ws.on("close", () => {
-      void this.handleWsClose("WebSocket closed");
-    });
-
-    // Errors are always followed by a close event — handle reconnect/cleanup there.
-    ws.on("error", () => {
-      /* handled in close */
-    });
+    this.wsClient = WebSocketClient.fromSocket(ws);
+    void this.runMessageLoop();
   }
 
   /** Terminate the underlying WebSocket immediately (for server shutdown). */
@@ -363,59 +331,36 @@ class ServerConnection {
   }
 
   // ---------------------------------------------------------------------------
-  // Message queue — serializes all message processing
+  // Message loop — serialises all message processing via for-await-of
   // ---------------------------------------------------------------------------
 
-  private async drainQueue(): Promise<void> {
-    if (this.processing || this.queue.length === 0) return;
-    this.processing = true;
+  private async runMessageLoop(): Promise<void> {
     try {
-      while (this.queue.length > 0) {
-        const item = this.queue.shift();
-        if (item === undefined) break;
+      for await (const msg of this.wsClient) {
         try {
-          await this.handleRawMessage(item.data, item.isBinary);
+          const frameInput: string | Uint8Array = msg.binary
+            ? new Uint8Array(msg.data as ArrayBuffer)
+            : (msg.data as string);
+          const frame = parseFrame(frameInput, msg.binary ? "binary" : "text");
+
+          if (!this.initialized) {
+            this.initialized = true;
+            await this.handleInitMessage(frame);
+          } else if (this.coreSession !== undefined) {
+            await this.coreSession.receive(frame);
+          }
         } catch (err) {
-          // Protocol error — close the connection.
           const reason =
             err instanceof Error ? err.message.slice(0, 123) : "Protocol error";
-          if (this.ws.readyState === WebSocket.OPEN) {
-            this.ws.close(1002, reason);
-          }
-          // Stop processing further messages.
-          this.queue.length = 0;
+          await this.wsClient.close(4002, reason);
           break;
         }
       }
-    } finally {
-      this.processing = false;
+    } catch {
+      // Abnormal close — handled in handleWsClose below.
     }
-  }
 
-  // ---------------------------------------------------------------------------
-  // Raw message handler
-  // ---------------------------------------------------------------------------
-
-  private async handleRawMessage(
-    data: WebSocketType.RawData,
-    isBinary: boolean,
-  ): Promise<void> {
-    const buf = rawDataToBuffer(data);
-    const frameType = isBinary ? ("binary" as const) : ("text" as const);
-    const frameInput: string | Uint8Array = isBinary
-      ? new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength)
-      : buf.toString("utf-8");
-
-    const frame = parseFrame(frameInput, frameType);
-
-    if (!this.initialized) {
-      this.initialized = true;
-      await this.handleInitMessage(frame);
-    } else {
-      if (this.coreSession !== undefined) {
-        await this.coreSession.receive(frame);
-      }
-    }
+    await this.handleWsClose("WebSocket closed");
   }
 
   // ---------------------------------------------------------------------------
@@ -430,7 +375,7 @@ class ServerConnection {
       this.sendText(
         makeInitErrorText("protocol-error", "First frame must be culpeo.init."),
       );
-      this.ws.close(1002, "Protocol error");
+      await this.wsClient.close(4002, "Protocol error");
       return;
     }
 
@@ -454,7 +399,7 @@ class ServerConnection {
       this.sendText(
         makeInitErrorText("unauthorized", "Authentication failed."),
       );
-      this.ws.close(1002, "Unauthorized");
+      await this.wsClient.close(4001, "Unauthorized");
       return;
     }
 
@@ -470,8 +415,8 @@ class ServerConnection {
       resumeSnapshot,
       sendFrame: (f) => {
         const serialized = serializeFrame(f);
-        if (this.ws.readyState !== WebSocket.OPEN) return;
-        this.ws.send(serialized.data);
+        if (this.wsClient.readyState !== "open") return;
+        void this.wsClient.send(serialized.data);
       },
       onNotification: (n) => {
         void this.handleNotification(n);
@@ -487,12 +432,7 @@ class ServerConnection {
     // If init failed (session closed without establishing), close the ws now
     // that the init-error frame has been dispatched.
     if (coreSession.state === "closed" && this.serverSession === undefined) {
-      if (
-        this.ws.readyState === WebSocket.OPEN ||
-        this.ws.readyState === WebSocket.CONNECTING
-      ) {
-        this.ws.close(1002, "Init failed");
-      }
+      await this.wsClient.close(4002, "Init failed");
     }
   }
 
@@ -506,7 +446,7 @@ class ServerConnection {
         const coreSession = this.coreSession!;
         this.serverSession = new ServerSessionImpl(
           coreSession,
-          this.ws,
+          this.wsClient,
           n.frame.body.streams,
           this.options,
         );
@@ -586,12 +526,7 @@ class ServerConnection {
       case "close": {
         // Client sent culpeo.close — save state and close the WebSocket.
         await this.saveSnapshot();
-        if (
-          this.ws.readyState === WebSocket.OPEN ||
-          this.ws.readyState === WebSocket.CONNECTING
-        ) {
-          this.ws.close(1000, n.frame.headers.reason);
-        }
+        await this.wsClient.close(1000, n.frame.headers.reason);
         break;
       }
     }
@@ -620,14 +555,6 @@ class ServerConnection {
     }
 
     this.onClose();
-
-    // TS-P3-001: explicitly remove all WebSocket listeners so the JS engine can
-    // GC the ServerConnection and its session state.  (Merely closing the socket
-    // is not enough — the ws library may hold internal references to the closures
-    // we registered in the constructor until the listeners are detached.)
-    this.ws.removeAllListeners("message");
-    this.ws.removeAllListeners("close");
-    this.ws.removeAllListeners("error");
   }
 
   // ---------------------------------------------------------------------------
@@ -684,8 +611,8 @@ class ServerConnection {
   }
 
   private sendText(text: string): void {
-    if (this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(text);
+    if (this.wsClient.readyState === "open") {
+      void this.wsClient.send(text);
     }
   }
 }

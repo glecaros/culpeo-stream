@@ -48,9 +48,7 @@ const textDecoder = new TextDecoder();
  * Pure-TypeScript implementation of header parsing.
  * Used when WASM is unavailable.
  */
-function parseHeadersTs(
-  buf: Uint8Array,
-): {
+function parseHeadersTs(buf: Uint8Array): {
   headers: ReadonlyArray<readonly [string, string]>;
   bodyOffset: number;
 } | null {

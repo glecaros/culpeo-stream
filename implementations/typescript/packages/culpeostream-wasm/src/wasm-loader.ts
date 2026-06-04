@@ -79,15 +79,14 @@ function readU32(
  * or `null` if the `\r\n\r\n` terminator is absent.
  * Throws on malformed input.
  */
-function parseHeadersWasm(
-  buf: Uint8Array,
-): {
+function parseHeadersWasm(buf: Uint8Array): {
   headers: ReadonlyArray<readonly [string, string]>;
   bodyOffset: number;
 } | null {
   const mod = requireModule();
 
-  // Allocate input buffer (mutable copy — C parser lower-cases keys in-place)
+  // Allocate input buffer (read-only — the C++ parser does NOT mutate the
+  // buffer; keys are returned in their original case)
   const inputPtr = copyToHeap(mod, buf);
   // Allocate headers_out array
   const headersPtr = mod._malloc(MAX_HEADERS * HEADER_STRUCT_SIZE);
@@ -142,8 +141,9 @@ function parseHeadersWasm(
       const valPtr = readU32(mod, base, 8);
       const valLen = readU32(mod, base, 12);
 
-      // Read bytes directly from the (now lower-cased) input buffer in heap.
+      // Read bytes directly from the input buffer in heap.
       // We add inputPtr because key_ptr/val_ptr are offsets into the input.
+      // The C++ parser does NOT lowercase keys; normalise case on the JS side.
       const keyBytes = mod.HEAPU8.slice(
         inputPtr + keyPtr,
         inputPtr + keyPtr + keyLen,
@@ -153,7 +153,7 @@ function parseHeadersWasm(
         inputPtr + valPtr + valLen,
       );
 
-      const key = new TextDecoder().decode(keyBytes);
+      const key = new TextDecoder().decode(keyBytes).toLowerCase();
       const val = new TextDecoder().decode(valBytes);
       pairs.push([key, val] as const);
     }
