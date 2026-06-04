@@ -1,4 +1,5 @@
 import { CulpeoError } from "./errors.js";
+import { getParserBackend } from "./parser-backend.js";
 import type {
   ApplicationEventMessage,
   AuthRefreshFrame,
@@ -293,14 +294,10 @@ function serializeTextFrame(
 }
 
 function serializeBinaryFrame(frame: MediaMessage): SerializedBinaryFrame {
-  const headers = `${frameToHeaders(frame)
-    .map(([name, value]) => `${name}: ${value}\r\n`)
-    .join("")}\r\n`;
-  const headerBytes = encoder.encode(headers);
-  const combined = new Uint8Array(headerBytes.length + frame.body.length);
-  combined.set(headerBytes, 0);
-  combined.set(frame.body, headerBytes.length);
-  return { frameType: "binary", data: combined };
+  return {
+    frameType: "binary",
+    data: serializeRawFrame(frameToHeaders(frame), frame.body),
+  };
 }
 
 export function serializeFrame(frame: CulpeoMessage): SerializedFrame {
@@ -459,6 +456,104 @@ function parseControlFrame(
   }
 }
 
+/**
+ * Extract and validate headers from a raw frame buffer, using the active
+ * `ParserBackend` when one has been registered (e.g. the WASM backend) or
+ * the built-in pure-TypeScript path otherwise.
+ *
+ * Semantic limit enforcement (header count, name/value lengths, forbidden
+ * characters, duplicate reserved headers) always runs in TypeScript
+ * regardless of which backend produced the raw pairs.
+ */
+function extractHeaders(
+  bytes: Uint8Array,
+  parseLimits: ParseLimits,
+): { headers: Map<string, string>; bodyOffset: number } {
+  const backend = getParserBackend();
+
+  if (backend !== null) {
+    const result = backend.parseHeaders(bytes);
+    if (result === null) {
+      throw new CulpeoError(
+        "protocol-error",
+        "Frame headers must terminate with CRLF CRLF",
+      );
+    }
+    const map = new Map<string, string>();
+    const seenReserved = new Set<string>();
+    let lineCount = 0;
+    for (const [name, value] of result.headers) {
+      lineCount += 1;
+      if (lineCount > parseLimits.maxHeaderCount) {
+        throw new CulpeoError("protocol-error", "Header count exceeds maximum");
+      }
+      if (name.length > parseLimits.maxHeaderNameLength) {
+        throw new CulpeoError(
+          "protocol-error",
+          "Header name exceeds maximum length",
+        );
+      }
+      if (value.length > parseLimits.maxHeaderValueLength) {
+        throw new CulpeoError(
+          "protocol-error",
+          "Header value exceeds maximum length",
+        );
+      }
+      if (
+        forbiddenHeaderCharacters.test(name) ||
+        forbiddenHeaderCharacters.test(value)
+      ) {
+        throw new CulpeoError(
+          "protocol-error",
+          "Header name/value contains forbidden character",
+        );
+      }
+      if (reservedHeaders.has(name)) {
+        if (seenReserved.has(name)) {
+          throw new CulpeoError(
+            "protocol-error",
+            `Duplicate reserved header: ${name}`,
+          );
+        }
+        seenReserved.add(name);
+      }
+      map.set(name, value);
+    }
+    return { headers: map, bodyOffset: result.bodyOffset };
+  }
+
+  // Pure-TypeScript fallback
+  const headerBoundary = findHeaderBoundary(
+    bytes,
+    parseLimits.maxHeaderBlockSize,
+  );
+  const headerText = decoder.decode(bytes.subarray(0, headerBoundary));
+  const headers = parseHeaderLines(headerText, parseLimits);
+  return { headers, bodyOffset: headerBoundary + 4 };
+}
+
+/**
+ * Produce frame bytes using the active backend's `serializeFrame` when one
+ * has been registered, or the built-in pure-TypeScript path otherwise.
+ */
+function serializeRawFrame(
+  headerPairs: ReadonlyArray<readonly [string, string]>,
+  body: Uint8Array,
+): Uint8Array {
+  const backend = getParserBackend();
+  if (backend !== null) {
+    return backend.serializeFrame(headerPairs, body);
+  }
+  // Pure-TypeScript fallback
+  const headerStr =
+    headerPairs.map(([k, v]) => `${k}: ${v}\r\n`).join("") + "\r\n";
+  const headerBytes = encoder.encode(headerStr);
+  const result = new Uint8Array(headerBytes.length + body.length);
+  result.set(headerBytes, 0);
+  result.set(body, headerBytes.length);
+  return result;
+}
+
 export function parseFrame(
   input: string | Uint8Array,
   frameType: TransportMessageType,
@@ -466,13 +561,8 @@ export function parseFrame(
 ): CulpeoMessage {
   const bytes = toUint8Array(input);
   const parseLimits: ParseLimits = { ...defaultParseLimits, ...limits };
-  const headerBoundary = findHeaderBoundary(
-    bytes,
-    parseLimits.maxHeaderBlockSize,
-  );
-  const headerText = decoder.decode(bytes.subarray(0, headerBoundary));
-  const headers = parseHeaderLines(headerText, parseLimits);
-  const bodyBytes = bytes.subarray(headerBoundary + 4);
+  const { headers, bodyOffset } = extractHeaders(bytes, parseLimits);
+  const bodyBytes = bytes.subarray(bodyOffset);
 
   if (frameType === "binary") {
     const streamId = headers.get("stream-id");

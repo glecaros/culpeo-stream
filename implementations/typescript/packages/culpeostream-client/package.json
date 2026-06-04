@@ -27,6 +27,7 @@
   ],
   "license": "MIT",
   "dependencies": {
+    "@culpeo/async-ws": "^1.1.0",
     "culpeostream": "file:../culpeostream"
   },
   "devDependencies": {

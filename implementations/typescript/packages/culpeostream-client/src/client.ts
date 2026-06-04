@@ -1,8 +1,8 @@
 /**
  * CulpeoStreamClient — browser + Node.js client for the CulpeoStream protocol.
  *
- * Uses only the standard WebSocket API; works in browsers and Node.js 22+ without
- * any Node.js-specific imports.
+ * Uses the @culpeo/async-ws WebSocketClient for transport; works in browsers
+ * and Node.js 22+ without any Node.js-specific imports.
  *
  * Security invariants enforced here:
  *  - Bearer tokens MUST NOT appear in Error messages, console output, or thrown
@@ -14,6 +14,7 @@
  *    stores and invalidates the nonce atomically.
  */
 
+import { WebSocketClient } from "@culpeo/async-ws";
 import {
   CulpeoClientSession,
   CulpeoError,
@@ -122,14 +123,33 @@ export interface ConnectOptions {
   reconnect?: Partial<ReconnectOptions>;
 }
 
+/**
+ * Minimal interface for a WebSocket client, satisfied by
+ * `WebSocketClient` from `@culpeo/async-ws` and by test mocks.
+ */
+export interface WsClientLike {
+  connect(url: string | URL): Promise<void>;
+  send(data: string | ArrayBuffer | ArrayBufferView): Promise<void>;
+  close(code?: number, reason?: string): Promise<void>;
+  [Symbol.asyncIterator](): AsyncGenerator<{
+    data: string | ArrayBuffer;
+    binary: boolean;
+  }>;
+  readonly lastCloseInfo: {
+    code: number;
+    reason: string;
+    wasClean: boolean;
+  } | null;
+}
+
 /** Constructor options for {@link CulpeoStreamClient}. */
 export interface CulpeoStreamClientOptions {
   /**
-   * Override the WebSocket constructor.
-   * Useful for testing — inject a mock class.
-   * Default: `globalThis.WebSocket`.
+   * Factory function that returns a new WebSocket client instance.
+   * Useful for testing — inject a mock factory.
+   * Default: `() => new WebSocketClient()` from `@culpeo/async-ws`.
    */
-  WebSocket?: WebSocketConstructor;
+  wsClientFactory?: () => WsClientLike;
 
   /**
    * Default reconnect options, applied to every `connect()` call.
@@ -141,11 +161,6 @@ export interface CulpeoStreamClientOptions {
 // ---------------------------------------------------------------------------
 // Internal types
 // ---------------------------------------------------------------------------
-
-type WebSocketConstructor = new (
-  url: string | URL,
-  protocols?: string | string[],
-) => WebSocket;
 
 interface PendingConnect {
   resolve: () => void;
@@ -160,14 +175,14 @@ interface PendingConnect {
  * CulpeoStream browser and Node.js client.
  *
  * Responsibilities:
- *  - Open and manage a WebSocket connection.
+ *  - Open and manage a WebSocket connection via @culpeo/async-ws.
  *  - Run a CulpeoClientSession over it (frame parsing, state machine, auth).
  *  - Automatically reconnect with exponential-backoff + full jitter.
  *  - Resume the session (per-stream offsets) on reconnect.
  *  - Expose typed events for media, application events, RTT, and lifecycle.
  */
 export class CulpeoStreamClient extends TypedEventEmitter<ClientEventMap> {
-  private readonly WebSocketImpl: WebSocketConstructor;
+  private readonly wsClientFactory: (() => WsClientLike) | undefined;
   private readonly globalReconnect: Partial<ReconnectOptions>;
 
   // Set once in connect(); guards against double-connect.
@@ -176,7 +191,7 @@ export class CulpeoStreamClient extends TypedEventEmitter<ClientEventMap> {
   private reconnectOptions: ReconnectOptions = { ...defaultReconnectOptions };
 
   // Mutable per-reconnect state.
-  private ws: WebSocket | undefined;
+  private wsClient: WsClientLike | undefined;
   private session: CulpeoClientSession | undefined;
   private snapshot: SessionSnapshot | undefined;
   private reconnectAttempt = 0;
@@ -184,26 +199,9 @@ export class CulpeoStreamClient extends TypedEventEmitter<ClientEventMap> {
   private pendingConnect: PendingConnect | undefined;
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 
-  // Per-connection WebSocket event handlers; stored so they can be removed
-  // before a new connection is opened, preventing memory leaks on reconnect.
-  private wsHandlers:
-    | {
-        open: () => void;
-        message: (event: MessageEvent) => void;
-        close: () => void;
-        error: () => void;
-      }
-    | undefined;
-
   public constructor(options?: CulpeoStreamClientOptions) {
     super();
-    this.WebSocketImpl =
-      options?.WebSocket ??
-      (globalThis as typeof globalThis & { WebSocket?: WebSocketConstructor })
-        .WebSocket ??
-      (() => {
-        throw new Error("WebSocket is not available in this environment.");
-      })();
+    this.wsClientFactory = options?.wsClientFactory;
     this.globalReconnect = options?.reconnect ?? {};
   }
 
@@ -271,11 +269,10 @@ export class CulpeoStreamClient extends TypedEventEmitter<ClientEventMap> {
       this.reconnectTimer = undefined;
     }
     if (this.session?.state === "established") {
-      // ws.send() is synchronous, so the frame is queued before ws.close().
       void this.session.close("normal", "Client disconnect");
     }
-    this.ws?.close(1000, "Client disconnect");
-    this.ws = undefined;
+    void this.wsClient?.close(1000, "Client disconnect");
+    this.wsClient = undefined;
     this.emit("disconnected");
   }
 
@@ -346,45 +343,50 @@ export class CulpeoStreamClient extends TypedEventEmitter<ClientEventMap> {
   // Internal: connection lifecycle
   // ---------------------------------------------------------------------------
 
-  /**
-   * Remove all four WebSocket event listeners from `ws` using the stored
-   * handler references. Call this before overwriting `this.ws` to allow the
-   * old WebSocket object (and its closures) to be garbage collected.
-   */
-  private cleanupWebSocket(ws: WebSocket): void {
-    if (this.wsHandlers === undefined) return;
-    ws.removeEventListener("open", this.wsHandlers.open);
-    ws.removeEventListener("message", this.wsHandlers.message);
-    ws.removeEventListener("close", this.wsHandlers.close);
-    ws.removeEventListener("error", this.wsHandlers.error);
-    this.wsHandlers = undefined;
+  private openConnection(): void {
+    void this.runConnection();
   }
 
-  private openConnection(): void {
-    // Remove listeners from the previous WebSocket before discarding it so
-    // that old closures (and the session they reference) can be GC'd.
-    if (this.ws !== undefined) {
-      this.cleanupWebSocket(this.ws);
-    }
-
+  private async runConnection(): Promise<void> {
     const url = this.connectUrl!;
     const options = this.connectOptions!;
     // Capture the snapshot for this attempt; may be undefined on first attempt.
     const resumeFrom = this.snapshot;
 
-    const ws = new this.WebSocketImpl(url);
-    ws.binaryType = "arraybuffer";
-    this.ws = ws;
+    const wsClient = this.wsClientFactory
+      ? this.wsClientFactory()
+      : new WebSocketClient();
+    this.wsClient = wsClient;
 
+    // Connect
+    try {
+      await wsClient.connect(url);
+    } catch {
+      if (!this.intentionalDisconnect) this.scheduleReconnect();
+      return;
+    }
+    if (this.intentionalDisconnect) return;
+
+    // On reconnects, try to get a fresh token to avoid auth failures.
+    // The original token is used as the fallback; it is NEVER logged.
+    let authorization = `Bearer ${options.token}`;
+    if (this.reconnectAttempt > 0 && options.getToken !== undefined) {
+      try {
+        const freshToken = await options.getToken();
+        authorization = `Bearer ${freshToken}`;
+      } catch {
+        // Proceed with original token on refresh failure during reconnect.
+      }
+    }
+
+    // Build and start session
     const session = new CulpeoClientSession({
       streams: options.streams,
       version: options.version,
       refreshAuthToken: options.getToken,
       sendFrame: (frame) => {
-        // 1 = WebSocket.OPEN
-        if (ws.readyState !== 1) return;
         const serialized = serializeFrame(frame);
-        ws.send(serialized.data);
+        void wsClient.send(serialized.data);
       },
       onRtt: (measurement) => {
         this.emit("rtt", measurement);
@@ -395,77 +397,53 @@ export class CulpeoStreamClient extends TypedEventEmitter<ClientEventMap> {
     });
     this.session = session;
 
-    // Define named handler variables so they can be stored and later removed.
-    const handleOpen = (): void => {
-      void (async () => {
-        // On reconnects, try to get a fresh token to avoid auth failures.
-        // The original token is used as the fallback; it is NEVER logged.
-        let authorization = `Bearer ${options.token}`;
-        if (this.reconnectAttempt > 0 && options.getToken !== undefined) {
-          try {
-            const freshToken = await options.getToken();
-            authorization = `Bearer ${freshToken}`;
-          } catch {
-            // Proceed with original token on refresh failure during reconnect.
-          }
-        }
-        await session.start({
-          authorization,
-          bufferWindowMs: options.bufferWindowMs ?? 5000,
-          resumeFrom,
-        });
-      })();
-    };
+    try {
+      await session.start({
+        authorization,
+        bufferWindowMs: options.bufferWindowMs ?? 5000,
+        resumeFrom,
+      });
+    } catch (err) {
+      // session.start() threw — reject the pending connect promise so that
+      // connect() doesn't hang forever, then tear down the WebSocket.
+      const error = err instanceof Error ? err : new Error(String(err));
+      const pending = this.pendingConnect;
+      this.pendingConnect = undefined;
+      pending?.reject(error);
+      await wsClient.close(4002, "Session start failed");
+      return;
+    }
 
-    const handleMessage = (event: MessageEvent): void => {
-      try {
-        const { data } = event;
-        let frame;
-        if (typeof data === "string") {
-          frame = parseFrame(data, "text");
-        } else if (data instanceof ArrayBuffer) {
-          frame = parseFrame(new Uint8Array(data), "binary");
-        } else {
-          // Blob or other — not expected when binaryType is 'arraybuffer'.
-          return;
-        }
-        void session.receive(frame);
-      } catch (err) {
-        this.emit("error", err instanceof Error ? err : new Error(String(err)));
-      }
-    };
-
-    const handleClose = (): void => {
-      // Try to snapshot the session state for resumption on reconnect.
-      if (session.state === "established") {
+    // Receive loop — exits on clean close or error/abnormal close
+    try {
+      for await (const msg of wsClient) {
         try {
-          this.snapshot = session.createSnapshot();
-        } catch {
-          // Session was established but snapshot failed; reconnect fresh.
+          const frame = msg.binary
+            ? parseFrame(new Uint8Array(msg.data as ArrayBuffer), "binary")
+            : parseFrame(msg.data as string, "text");
+          await session.receive(frame);
+        } catch (err) {
+          this.emit(
+            "error",
+            err instanceof Error ? err : new Error(String(err)),
+          );
         }
       }
-      if (this.intentionalDisconnect) return;
-      this.scheduleReconnect();
-    };
+    } catch {
+      /* unexpected / abnormal close — fall through to reconnect logic */
+    }
 
-    // The `error` event is always followed by a `close` event on a WebSocket.
-    // We handle reconnect logic in the close handler to avoid double-scheduling.
-    const handleError = (): void => {
-      /* handled in close */
-    };
-
-    // Store handler references so cleanupWebSocket() can remove them later.
-    this.wsHandlers = {
-      open: handleOpen,
-      message: handleMessage,
-      close: handleClose,
-      error: handleError,
-    };
-
-    ws.addEventListener("open", handleOpen);
-    ws.addEventListener("message", handleMessage);
-    ws.addEventListener("close", handleClose);
-    ws.addEventListener("error", handleError);
+    // Post-close: snapshot current offsets for session resumption, then
+    // either stop (intentional disconnect) or schedule reconnect.
+    if (this.intentionalDisconnect) return;
+    if (session.state === "established") {
+      try {
+        this.snapshot = session.createSnapshot();
+      } catch {
+        // Session was established but snapshot failed; reconnect fresh.
+      }
+    }
+    this.scheduleReconnect();
   }
 
   private handleNotification(notification: SessionNotification): void {
@@ -485,7 +463,7 @@ export class CulpeoStreamClient extends TypedEventEmitter<ClientEventMap> {
         // Do NOT reconnect — the server told us to stop.
         this.intentionalDisconnect = true;
         // Close the underlying WebSocket.
-        this.ws?.close(1000, notification.frame.headers.code);
+        void this.wsClient?.close(1000, notification.frame.headers.code);
 
         const { code, reason } = notification.frame.headers;
         // SECURITY: 'code' is an error code string, NOT the token.
@@ -518,7 +496,7 @@ export class CulpeoStreamClient extends TypedEventEmitter<ClientEventMap> {
       case "close": {
         // Server initiated a clean close — respect it, do not reconnect.
         this.intentionalDisconnect = true;
-        this.ws?.close(1000, notification.frame.headers.code);
+        void this.wsClient?.close(1000, notification.frame.headers.code);
         this.emit("close", {
           code: notification.frame.headers.code,
           reason: notification.frame.headers.reason,

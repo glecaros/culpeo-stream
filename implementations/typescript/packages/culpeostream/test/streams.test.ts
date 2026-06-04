@@ -12,7 +12,12 @@ describe("stream registry", () => {
           offset_type: "time",
           purpose: "voice",
         },
-        { content_type: "audio/opus", type: "input", offset_type: "message", purpose: "voice" },
+        {
+          content_type: "audio/opus",
+          type: "input",
+          offset_type: "message",
+          purpose: "voice",
+        },
       ]),
     ).toThrow(/Duplicate purpose/);
   });
@@ -54,7 +59,12 @@ describe("stream registry", () => {
         type: "input",
         offset_type: "time",
       },
-      { id: "s-out", content_type: "audio/opus", type: "output", offset_type: "message" },
+      {
+        id: "s-out",
+        content_type: "audio/opus",
+        type: "output",
+        offset_type: "message",
+      },
     ]);
 
     expect(registry.trackSend("s-in", 640).offset).toBe(0);
@@ -74,7 +84,12 @@ describe("stream registry", () => {
 
   it("builds resume declarations from a previous snapshot", () => {
     const registry = new StreamRegistry("client", [
-      { content_type: "audio/opus", type: "output", offset_type: "message", purpose: "assistant" },
+      {
+        content_type: "audio/opus",
+        type: "output",
+        offset_type: "message",
+        purpose: "assistant",
+      },
     ]);
     const streams = registry.buildInitStreams({
       sessionId: "session-1",
@@ -119,10 +134,19 @@ describe("stream registry", () => {
 
   it("tracks byte-type stream offsets by payload byte length", () => {
     const registry = new StreamRegistry("client", [
-      { content_type: "application/octet-stream", type: "input", offset_type: "byte" },
+      {
+        content_type: "application/octet-stream",
+        type: "input",
+        offset_type: "byte",
+      },
     ]);
     registry.confirmFromAck([
-      { id: "s-byte", content_type: "application/octet-stream", type: "input", offset_type: "byte" },
+      {
+        id: "s-byte",
+        content_type: "application/octet-stream",
+        type: "input",
+        offset_type: "byte",
+      },
     ]);
 
     const first = registry.trackSend("s-byte", 256);

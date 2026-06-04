@@ -1,9 +1,11 @@
 /**
  * Tests for CulpeoStreamClient.
  *
- * A MockWebSocket class simulates the browser WebSocket API. It fires events
- * synchronously, which keeps tests deterministic. Async session operations
- * (start(), receive()) are flushed with tick().
+ * A MockWebSocketClient class simulates the @culpeo/async-ws WebSocketClient
+ * API. Its connect() resolves when simulateOpen() is called. Messages are
+ * delivered through an async iterator that yields on simulateMessage() calls
+ * and ends on simulateClose(). This keeps tests deterministic while matching
+ * the promise-based lifecycle of the real library.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -17,7 +19,7 @@ import type {
 } from "culpeostream";
 
 import { CulpeoStreamClient } from "../src/client.js";
-import type { ConnectOptions } from "../src/client.js";
+import type { ConnectOptions, WsClientLike } from "../src/client.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -119,115 +121,163 @@ function makeMediaFrame(streamId: string): ArrayBuffer {
 }
 
 // ---------------------------------------------------------------------------
-// Mock WebSocket
+// Mock WebSocketClient
 // ---------------------------------------------------------------------------
 
 /**
- * A synchronous mock of the browser WebSocket API.
+ * A deterministic mock of the @culpeo/async-ws WebSocketClient API.
  *
- * - Events fire synchronously (keeps tests deterministic).
- * - `sent` accumulates every payload passed to `send()`.
- * - `simulateOpen()` / `simulateMessage()` / `simulateClose()` trigger events.
+ * - `connect()` returns a Promise resolved by `simulateOpen()`.
+ * - `send()` records payloads in the `sent` array.
+ * - `close()` ends the async iterator cleanly.
+ * - The async iterator yields messages delivered via `simulateMessage()`.
+ * - `simulateClose()` ends the async iterator (triggering reconnect logic).
+ * - `simulateError()` is an alias for `simulateClose(1006)`.
  */
-class MockWebSocket extends EventTarget {
-  static readonly CONNECTING = 0;
-  static readonly OPEN = 1;
-  static readonly CLOSING = 2;
-  static readonly CLOSED = 3;
+class MockWebSocketClient implements WsClientLike {
+  private connectResolve: (() => void) | null = null;
+  private connectReject: ((err: Error) => void) | null = null;
 
-  readonly CONNECTING = 0;
-  readonly OPEN = 1;
-  readonly CLOSING = 2;
-  readonly CLOSED = 3;
+  // Async iterator state
+  private pendingMessages: { data: string | ArrayBuffer; binary: boolean }[] =
+    [];
+  private messageWaiter:
+    | ((
+        result: IteratorResult<{ data: string | ArrayBuffer; binary: boolean }>,
+      ) => void)
+    | null = null;
+  private iteratorDone = false;
 
-  readyState = 0; // CONNECTING
-  binaryType: BinaryType = "arraybuffer";
-  url: string;
-  protocol = "";
-  extensions = "";
-  bufferedAmount = 0;
-  onopen: ((ev: Event) => unknown) | null = null;
-  onclose: ((ev: CloseEvent) => unknown) | null = null;
-  onmessage: ((ev: MessageEvent) => unknown) | null = null;
-  onerror: ((ev: Event) => unknown) | null = null;
+  lastCloseInfo: { code: number; reason: string; wasClean: boolean } | null =
+    null;
 
   /** All data passed to `send()` since construction. */
   sent: Array<string | Uint8Array> = [];
 
-  constructor(url: string | URL) {
-    super();
-    this.url = typeof url === "string" ? url : url.href;
+  connect(_url: string | URL): Promise<void> {
+    return new Promise((resolve, reject) => {
+      this.connectResolve = resolve;
+      this.connectReject = reject;
+    });
   }
 
-  send(data: string | ArrayBuffer | Blob | ArrayBufferView): void {
+  send(data: string | ArrayBuffer | ArrayBufferView): Promise<void> {
     if (typeof data === "string") {
       this.sent.push(data);
     } else if (data instanceof ArrayBuffer) {
       this.sent.push(new Uint8Array(data));
-    } else if (ArrayBuffer.isView(data)) {
+    } else {
       this.sent.push(
         new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
       );
     }
+    return Promise.resolve();
   }
 
-  close(code?: number, reason?: string): void {
-    if (this.readyState === 3) return;
-    this.readyState = 3;
-    this.dispatchEvent(
-      new CloseEvent("close", {
-        code: code ?? 1000,
-        reason: reason ?? "",
-        wasClean: (code ?? 1000) === 1000,
-      }),
-    );
+  close(code = 1000, reason = ""): Promise<void> {
+    this.lastCloseInfo = { code, reason, wasClean: code === 1000 };
+    this.iteratorDone = true;
+    if (this.messageWaiter) {
+      this.messageWaiter({ value: undefined as never, done: true });
+      this.messageWaiter = null;
+    }
+    return Promise.resolve();
   }
 
-  // --- Test helpers --------------------------------------------------------
+  // --- Test helpers ----------------------------------------------------------
 
   simulateOpen(): void {
-    this.readyState = 1;
-    this.dispatchEvent(new Event("open"));
+    this.connectResolve?.();
+    this.connectResolve = null;
+    this.connectReject = null;
+  }
+
+  simulateConnectError(err: Error): void {
+    this.connectReject?.(err);
+    this.connectResolve = null;
+    this.connectReject = null;
   }
 
   simulateMessage(data: string | ArrayBuffer): void {
-    this.dispatchEvent(new MessageEvent("message", { data }));
+    const msg = { data, binary: typeof data !== "string" };
+    if (this.messageWaiter !== null) {
+      const resolve = this.messageWaiter;
+      this.messageWaiter = null;
+      resolve({ value: msg, done: false });
+    } else {
+      this.pendingMessages.push(msg);
+    }
   }
 
   simulateClose(code = 1006, reason = ""): void {
-    if (this.readyState === 3) return;
-    this.readyState = 3;
-    this.dispatchEvent(
-      new CloseEvent("close", {
-        code,
-        reason,
-        wasClean: code === 1000,
-      }),
-    );
+    this.lastCloseInfo = { code, reason, wasClean: code === 1000 };
+    this.iteratorDone = true;
+
+    // If connect() is still pending (connection failed before opening),
+    // reject it so runConnection() takes the catch branch → scheduleReconnect().
+    if (this.connectReject !== null) {
+      const reject = this.connectReject;
+      this.connectResolve = null;
+      this.connectReject = null;
+      reject(new Error(`WebSocket closed before opening (code ${code})`));
+      return;
+    }
+
+    // Connection was already established — end the async iterator.
+    if (this.messageWaiter !== null) {
+      const resolve = this.messageWaiter;
+      this.messageWaiter = null;
+      resolve({ value: undefined as never, done: true });
+    }
   }
 
   simulateError(): void {
-    this.dispatchEvent(new Event("error"));
     this.simulateClose(1006);
+  }
+
+  [Symbol.asyncIterator](): AsyncGenerator<{
+    data: string | ArrayBuffer;
+    binary: boolean;
+  }> {
+    return this._iterate();
+  }
+
+  private async *_iterate(): AsyncGenerator<{
+    data: string | ArrayBuffer;
+    binary: boolean;
+  }> {
+    while (!this.iteratorDone) {
+      if (this.pendingMessages.length > 0) {
+        yield this.pendingMessages.shift()!;
+      } else {
+        const result = await new Promise<
+          IteratorResult<{ data: string | ArrayBuffer; binary: boolean }>
+        >((resolve) => {
+          if (this.iteratorDone) {
+            resolve({ value: undefined as never, done: true });
+          } else {
+            this.messageWaiter = resolve;
+          }
+        });
+        if (result.done) return;
+        yield result.value;
+      }
+    }
   }
 }
 
-// Factory that tracks created instances so tests can reference them.
-function makeMockWsFactory(): {
-  factory: new (url: string | URL) => WebSocket;
-  instances: MockWebSocket[];
+/** Factory that tracks created instances so tests can reference them. */
+function makeMockWsClientFactory(): {
+  factory: () => WsClientLike;
+  instances: MockWebSocketClient[];
 } {
-  const instances: MockWebSocket[] = [];
-  class TrackingMockWebSocket extends MockWebSocket {
-    constructor(url: string | URL) {
-      super(url);
-      instances.push(this);
-    }
-  }
+  const instances: MockWebSocketClient[] = [];
   return {
-    factory: TrackingMockWebSocket as unknown as new (
-      url: string | URL,
-    ) => WebSocket,
+    factory: () => {
+      const client = new MockWebSocketClient();
+      instances.push(client);
+      return client;
+    },
     instances,
   };
 }
@@ -238,8 +288,8 @@ function makeMockWsFactory(): {
 
 describe("CulpeoStreamClient — URL validation", () => {
   it("throws on ws:// without allowInsecure", async () => {
-    const { factory } = makeMockWsFactory();
-    const client = new CulpeoStreamClient({ WebSocket: factory });
+    const { factory } = makeMockWsClientFactory();
+    const client = new CulpeoStreamClient({ wsClientFactory: factory });
     await expect(
       client.connect("ws://localhost:8080", {
         ...makeOpts(),
@@ -249,9 +299,9 @@ describe("CulpeoStreamClient — URL validation", () => {
   });
 
   it("warns but accepts ws:// with allowInsecure: true", async () => {
-    const { factory, instances } = makeMockWsFactory();
+    const { factory, instances } = makeMockWsClientFactory();
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const client = new CulpeoStreamClient({ WebSocket: factory });
+    const client = new CulpeoStreamClient({ wsClientFactory: factory });
     const connectP = client.connect("ws://localhost:8080", makeOpts());
 
     await tick();
@@ -266,9 +316,9 @@ describe("CulpeoStreamClient — URL validation", () => {
   });
 
   it("accepts wss:// without warnings", async () => {
-    const { factory, instances } = makeMockWsFactory();
+    const { factory, instances } = makeMockWsClientFactory();
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const client = new CulpeoStreamClient({ WebSocket: factory });
+    const client = new CulpeoStreamClient({ wsClientFactory: factory });
     const connectP = client.connect(
       "wss://localhost:8443",
       makeOpts({ allowInsecure: false }),
@@ -286,8 +336,8 @@ describe("CulpeoStreamClient — URL validation", () => {
   });
 
   it("throws on non-ws schemes", async () => {
-    const { factory } = makeMockWsFactory();
-    const client = new CulpeoStreamClient({ WebSocket: factory });
+    const { factory } = makeMockWsClientFactory();
+    const client = new CulpeoStreamClient({ wsClientFactory: factory });
     await expect(
       client.connect("http://localhost", makeOpts()),
     ).rejects.toThrow(/scheme/i);
@@ -296,8 +346,8 @@ describe("CulpeoStreamClient — URL validation", () => {
 
 describe("CulpeoStreamClient — basic connect/disconnect", () => {
   it("resolves connect() on init-ack", async () => {
-    const { factory, instances } = makeMockWsFactory();
-    const client = new CulpeoStreamClient({ WebSocket: factory });
+    const { factory, instances } = makeMockWsClientFactory();
+    const client = new CulpeoStreamClient({ wsClientFactory: factory });
     const connected: string[] = [];
     client.on("connected", () => connected.push("connected"));
 
@@ -314,8 +364,8 @@ describe("CulpeoStreamClient — basic connect/disconnect", () => {
   });
 
   it("sends culpeo.init on open", async () => {
-    const { factory, instances } = makeMockWsFactory();
-    const client = new CulpeoStreamClient({ WebSocket: factory });
+    const { factory, instances } = makeMockWsClientFactory();
+    const client = new CulpeoStreamClient({ wsClientFactory: factory });
     void client.connect("wss://localhost:8443", makeOpts());
 
     await tick();
@@ -330,8 +380,8 @@ describe("CulpeoStreamClient — basic connect/disconnect", () => {
   });
 
   it("includes token in init Authorization header (without logging it)", async () => {
-    const { factory, instances } = makeMockWsFactory();
-    const client = new CulpeoStreamClient({ WebSocket: factory });
+    const { factory, instances } = makeMockWsClientFactory();
+    const client = new CulpeoStreamClient({ wsClientFactory: factory });
     void client.connect(
       "wss://localhost:8443",
       makeOpts({ token: "secret-tok" }),
@@ -347,8 +397,8 @@ describe("CulpeoStreamClient — basic connect/disconnect", () => {
   });
 
   it("rejects connect() on init-error", async () => {
-    const { factory, instances } = makeMockWsFactory();
-    const client = new CulpeoStreamClient({ WebSocket: factory });
+    const { factory, instances } = makeMockWsClientFactory();
+    const client = new CulpeoStreamClient({ wsClientFactory: factory });
     const closeReasons: string[] = [];
     client.on("close", (r) => closeReasons.push(r.code));
 
@@ -366,8 +416,8 @@ describe("CulpeoStreamClient — basic connect/disconnect", () => {
   });
 
   it("error message on init-error does not contain the token", async () => {
-    const { factory, instances } = makeMockWsFactory();
-    const client = new CulpeoStreamClient({ WebSocket: factory });
+    const { factory, instances } = makeMockWsClientFactory();
+    const client = new CulpeoStreamClient({ wsClientFactory: factory });
     const connectP = client.connect(
       "wss://localhost:8443",
       makeOpts({ token: "super-secret" }),
@@ -386,8 +436,8 @@ describe("CulpeoStreamClient — basic connect/disconnect", () => {
   });
 
   it("rejects double connect()", async () => {
-    const { factory, instances } = makeMockWsFactory();
-    const client = new CulpeoStreamClient({ WebSocket: factory });
+    const { factory, instances } = makeMockWsClientFactory();
+    const client = new CulpeoStreamClient({ wsClientFactory: factory });
     const p1 = client.connect("wss://localhost:8443", makeOpts());
     await tick();
     await expect(
@@ -403,8 +453,8 @@ describe("CulpeoStreamClient — basic connect/disconnect", () => {
   });
 
   it("disconnect() prevents reconnect", async () => {
-    const { factory, instances } = makeMockWsFactory();
-    const client = new CulpeoStreamClient({ WebSocket: factory });
+    const { factory, instances } = makeMockWsClientFactory();
+    const client = new CulpeoStreamClient({ wsClientFactory: factory });
     const reconnecting: number[] = [];
     client.on("reconnecting", (n) => reconnecting.push(n));
     const disconnectedEvents: string[] = [];
@@ -427,8 +477,8 @@ describe("CulpeoStreamClient — basic connect/disconnect", () => {
 
 describe("CulpeoStreamClient — media", () => {
   it("delivers incoming media frames via the 'media' event", async () => {
-    const { factory, instances } = makeMockWsFactory();
-    const client = new CulpeoStreamClient({ WebSocket: factory });
+    const { factory, instances } = makeMockWsClientFactory();
+    const client = new CulpeoStreamClient({ wsClientFactory: factory });
     const mediaFrames: MediaMessage[] = [];
     client.on("media", (f) => mediaFrames.push(f));
 
@@ -462,16 +512,16 @@ describe("CulpeoStreamClient — media", () => {
   });
 
   it("throws when sendMedia is called before connect", () => {
-    const { factory } = makeMockWsFactory();
-    const client = new CulpeoStreamClient({ WebSocket: factory });
+    const { factory } = makeMockWsClientFactory();
+    const client = new CulpeoStreamClient({ wsClientFactory: factory });
     expect(() => client.sendMedia("s1", new ArrayBuffer(4))).toThrow(
       /not established/i,
     );
   });
 
   it("can send media after session is established", async () => {
-    const { factory, instances } = makeMockWsFactory();
-    const client = new CulpeoStreamClient({ WebSocket: factory });
+    const { factory, instances } = makeMockWsClientFactory();
+    const client = new CulpeoStreamClient({ wsClientFactory: factory });
 
     const connectP = client.connect(
       "wss://localhost:8443",
@@ -507,8 +557,8 @@ describe("CulpeoStreamClient — media", () => {
 
 describe("CulpeoStreamClient — application events", () => {
   it("delivers incoming application events via the 'event' channel", async () => {
-    const { factory, instances } = makeMockWsFactory();
-    const client = new CulpeoStreamClient({ WebSocket: factory });
+    const { factory, instances } = makeMockWsClientFactory();
+    const client = new CulpeoStreamClient({ wsClientFactory: factory });
     const events: string[] = [];
     client.on("event", (f) => events.push(f.event));
 
@@ -535,8 +585,8 @@ describe("CulpeoStreamClient — application events", () => {
   });
 
   it("can send application events when established", async () => {
-    const { factory, instances } = makeMockWsFactory();
-    const client = new CulpeoStreamClient({ WebSocket: factory });
+    const { factory, instances } = makeMockWsClientFactory();
+    const client = new CulpeoStreamClient({ wsClientFactory: factory });
     const connectP = client.connect("wss://localhost:8443", makeOpts());
     await tick();
     instances[0]!.simulateOpen();
@@ -566,9 +616,9 @@ describe("CulpeoStreamClient — reconnection", () => {
   });
 
   it("emits 'reconnecting' and opens a new WebSocket on unexpected close", async () => {
-    const { factory, instances } = makeMockWsFactory();
+    const { factory, instances } = makeMockWsClientFactory();
     const client = new CulpeoStreamClient({
-      WebSocket: factory,
+      wsClientFactory: factory,
       reconnect: { baseDelayMs: 100, maxDelayMs: 100, maxAttempts: 3 },
     });
     const reconnecting: number[] = [];
@@ -597,9 +647,9 @@ describe("CulpeoStreamClient — reconnection", () => {
   });
 
   it("resumes with session snapshot on reconnect (sends session-id in init)", async () => {
-    const { factory, instances } = makeMockWsFactory();
+    const { factory, instances } = makeMockWsClientFactory();
     const client = new CulpeoStreamClient({
-      WebSocket: factory,
+      wsClientFactory: factory,
       reconnect: { baseDelayMs: 0, maxDelayMs: 0, maxAttempts: 3 },
     });
 
@@ -640,9 +690,9 @@ describe("CulpeoStreamClient — reconnection", () => {
   });
 
   it("emits 'disconnected' and rejects initial connect() when max attempts exhausted", async () => {
-    const { factory, instances } = makeMockWsFactory();
+    const { factory, instances } = makeMockWsClientFactory();
     const client = new CulpeoStreamClient({
-      WebSocket: factory,
+      wsClientFactory: factory,
       reconnect: { baseDelayMs: 0, maxDelayMs: 0, maxAttempts: 2 },
     });
     const disconnectedEvents: string[] = [];
@@ -674,14 +724,14 @@ describe("CulpeoStreamClient — reconnection", () => {
 
 describe("CulpeoStreamClient — auth-refresh", () => {
   it("calls getToken and sends auth-response with nonce", async () => {
-    const { factory, instances } = makeMockWsFactory();
+    const { factory, instances } = makeMockWsClientFactory();
     let refreshCount = 0;
     const getToken = async () => {
       refreshCount++;
       return "refreshed-token";
     };
 
-    const client = new CulpeoStreamClient({ WebSocket: factory });
+    const client = new CulpeoStreamClient({ wsClientFactory: factory });
     const connectP = client.connect(
       "wss://localhost:8443",
       makeOpts({ getToken }),
@@ -722,8 +772,8 @@ describe("CulpeoStreamClient — auth-refresh", () => {
   });
 
   it("does not include the token value in any Error message", async () => {
-    const { factory, instances } = makeMockWsFactory();
-    const client = new CulpeoStreamClient({ WebSocket: factory });
+    const { factory, instances } = makeMockWsClientFactory();
+    const client = new CulpeoStreamClient({ wsClientFactory: factory });
     const connectP = client.connect(
       "wss://localhost:8443",
       makeOpts({ token: "my-super-secret-token" }),
@@ -747,8 +797,8 @@ describe("CulpeoStreamClient — auth-refresh", () => {
 
 describe("CulpeoStreamClient — culpeo.close from server", () => {
   it("emits 'close' and does not reconnect on server-initiated close", async () => {
-    const { factory, instances } = makeMockWsFactory();
-    const client = new CulpeoStreamClient({ WebSocket: factory });
+    const { factory, instances } = makeMockWsClientFactory();
+    const client = new CulpeoStreamClient({ wsClientFactory: factory });
     const closeReasons: string[] = [];
     const reconnecting: number[] = [];
     client.on("close", (r) => closeReasons.push(r.code));
@@ -783,14 +833,14 @@ describe("CulpeoStreamClient — culpeo.close from server", () => {
 
 describe("CulpeoStreamClient — confirmedStreams", () => {
   it("returns empty array before connect", () => {
-    const { factory } = makeMockWsFactory();
-    const client = new CulpeoStreamClient({ WebSocket: factory });
+    const { factory } = makeMockWsClientFactory();
+    const client = new CulpeoStreamClient({ wsClientFactory: factory });
     expect(client.confirmedStreams).toHaveLength(0);
   });
 
   it("returns confirmed streams after connect", async () => {
-    const { factory, instances } = makeMockWsFactory();
-    const client = new CulpeoStreamClient({ WebSocket: factory });
+    const { factory, instances } = makeMockWsClientFactory();
+    const client = new CulpeoStreamClient({ wsClientFactory: factory });
 
     const connectP = client.connect("wss://localhost:8443", makeOpts());
     await tick();
@@ -817,8 +867,8 @@ describe("CulpeoStreamClient — confirmedStreams", () => {
 
 describe("CulpeoStreamClient — parse errors", () => {
   it("emits 'error' for unparseable messages rather than throwing", async () => {
-    const { factory, instances } = makeMockWsFactory();
-    const client = new CulpeoStreamClient({ WebSocket: factory });
+    const { factory, instances } = makeMockWsClientFactory();
+    const client = new CulpeoStreamClient({ wsClientFactory: factory });
     const errors: Error[] = [];
     client.on("error", (e) => errors.push(e));
 

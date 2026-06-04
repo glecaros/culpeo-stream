@@ -18,7 +18,9 @@ async function establishServer(
     },
     body: {
       version: "0.3",
-      streams: [{ content_type: "audio/opus", type: "output", offset_type: "message" }],
+      streams: [
+        { content_type: "audio/opus", type: "output", offset_type: "message" },
+      ],
     },
   });
   expect(outbound[0]).toMatchObject({ event: "culpeo.init-ack" });
@@ -58,7 +60,12 @@ describe("session state machine", () => {
           offset_type: "time",
           purpose: "voice",
         },
-        { content_type: "audio/opus", type: "output", offset_type: "message", purpose: "assistant" },
+        {
+          content_type: "audio/opus",
+          type: "output",
+          offset_type: "message",
+          purpose: "assistant",
+        },
       ],
       sendFrame: (frame) => {
         clientOutbound.push(frame);
@@ -121,7 +128,12 @@ describe("session state machine", () => {
           offset_type: "time",
           purpose: "voice",
         },
-        { content_type: "audio/opus", type: "output", offset_type: "message", purpose: "assistant" },
+        {
+          content_type: "audio/opus",
+          type: "output",
+          offset_type: "message",
+          purpose: "assistant",
+        },
       ],
       sendFrame: (frame) => {
         resumeClientOutbound.push(frame);
@@ -172,7 +184,9 @@ describe("session state machine", () => {
   it("surfaces unsupported versions from init-error", async () => {
     const outbound: CulpeoMessage[] = [];
     const client = new CulpeoClientSession({
-      streams: [{ content_type: "audio/opus", type: "output", offset_type: "message" }],
+      streams: [
+        { content_type: "audio/opus", type: "output", offset_type: "message" },
+      ],
       sendFrame: (frame) => {
         outbound.push(frame);
       },
@@ -202,7 +216,9 @@ describe("session state machine", () => {
     const outbound: CulpeoMessage[] = [];
     let now = 100;
     const client = new CulpeoClientSession({
-      streams: [{ content_type: "audio/opus", type: "output", offset_type: "message" }],
+      streams: [
+        { content_type: "audio/opus", type: "output", offset_type: "message" },
+      ],
       sendFrame: (frame) => {
         outbound.push(frame);
       },
@@ -228,7 +244,12 @@ describe("session state machine", () => {
       body: {
         version: "0.3",
         streams: [
-          { id: "stream-1", content_type: "audio/opus", type: "output", offset_type: "message" },
+          {
+            id: "stream-1",
+            content_type: "audio/opus",
+            type: "output",
+            offset_type: "message",
+          },
         ],
       },
     });
@@ -248,7 +269,9 @@ describe("session state machine", () => {
   it("handles auth refresh without leaking tokens in errors", async () => {
     const outbound: CulpeoMessage[] = [];
     const client = new CulpeoClientSession({
-      streams: [{ content_type: "audio/opus", type: "output", offset_type: "message" }],
+      streams: [
+        { content_type: "audio/opus", type: "output", offset_type: "message" },
+      ],
       sendFrame: (frame) => {
         outbound.push(frame);
       },
@@ -271,7 +294,12 @@ describe("session state machine", () => {
       body: {
         version: "0.3",
         streams: [
-          { id: "stream-1", content_type: "audio/opus", type: "output", offset_type: "message" },
+          {
+            id: "stream-1",
+            content_type: "audio/opus",
+            type: "output",
+            offset_type: "message",
+          },
         ],
       },
     });
@@ -294,7 +322,9 @@ describe("session state machine", () => {
 
     const failingOutbound: CulpeoMessage[] = [];
     const failingClient = new CulpeoClientSession({
-      streams: [{ content_type: "audio/opus", type: "output", offset_type: "message" }],
+      streams: [
+        { content_type: "audio/opus", type: "output", offset_type: "message" },
+      ],
       sendFrame: (frame) => {
         failingOutbound.push(frame);
       },
@@ -319,7 +349,12 @@ describe("session state machine", () => {
       body: {
         version: "0.3",
         streams: [
-          { id: "stream-2", content_type: "audio/opus", type: "output", offset_type: "message" },
+          {
+            id: "stream-2",
+            content_type: "audio/opus",
+            type: "output",
+            offset_type: "message",
+          },
         ],
       },
     });
@@ -365,7 +400,13 @@ describe("session state machine", () => {
       },
       body: {
         version: "0.3",
-        streams: [{ content_type: "audio/opus", type: "output", offset_type: "message" }],
+        streams: [
+          {
+            content_type: "audio/opus",
+            type: "output",
+            offset_type: "message",
+          },
+        ],
       },
     });
 
@@ -436,7 +477,9 @@ describe("session state machine", () => {
   it("rejects media frames whose content type does not match the stream", async () => {
     const notifications: CulpeoMessage[] = [];
     const client = new CulpeoClientSession({
-      streams: [{ content_type: "audio/opus", type: "output", offset_type: "message" }],
+      streams: [
+        { content_type: "audio/opus", type: "output", offset_type: "message" },
+      ],
       onNotification: (notification) => {
         if (notification.type === "media") {
           notifications.push(notification.frame);
@@ -459,7 +502,12 @@ describe("session state machine", () => {
       body: {
         version: "0.3",
         streams: [
-          { id: "stream-1", content_type: "audio/opus", type: "output", offset_type: "message" },
+          {
+            id: "stream-1",
+            content_type: "audio/opus",
+            type: "output",
+            offset_type: "message",
+          },
         ],
       },
     });
@@ -483,7 +531,9 @@ describe("session state machine", () => {
 
   it("rejects media frames with offset gaps", async () => {
     const client = new CulpeoClientSession({
-      streams: [{ content_type: "audio/opus", type: "output", offset_type: "message" }],
+      streams: [
+        { content_type: "audio/opus", type: "output", offset_type: "message" },
+      ],
     });
 
     await client.start({
@@ -501,7 +551,12 @@ describe("session state machine", () => {
       body: {
         version: "0.3",
         streams: [
-          { id: "stream-1", content_type: "audio/opus", type: "output", offset_type: "message" },
+          {
+            id: "stream-1",
+            content_type: "audio/opus",
+            type: "output",
+            offset_type: "message",
+          },
         ],
       },
     });
@@ -563,7 +618,12 @@ describe("session state machine", () => {
         bufferWindowMs: 1_000,
         disconnectedAtMs: 1_000,
         streams: [
-          { id: "stream-1", content_type: "audio/opus", type: "output", offset_type: "message" },
+          {
+            id: "stream-1",
+            content_type: "audio/opus",
+            type: "output",
+            offset_type: "message",
+          },
         ],
       },
       sendFrame: (frame) => {
@@ -584,7 +644,12 @@ describe("session state machine", () => {
       body: {
         version: "0.3",
         streams: [
-          { id: "stream-1", content_type: "audio/opus", type: "output", offset_type: "message" },
+          {
+            id: "stream-1",
+            content_type: "audio/opus",
+            type: "output",
+            offset_type: "message",
+          },
         ],
       },
     });

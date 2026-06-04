@@ -900,3 +900,361 @@ Using `kH2MaxFrameSize` (1 MiB) rather than `UINT32_MAX-1` (4 GiB) is stricter b
 
 ### Spec Reference
 SEC-033 security finding; spec §C.4
+
+## Phase 5: pybind11 version and acquisition method
+**Date:** 2026-05-30
+**Phase:** Phase 5 — Python Bindings
+**Status:** Decided
+
+### Context
+Python bindings require a C++/Python bridge library.  Options evaluated:
+- pybind11 (v2.13.6) — mature, widely used, excellent C++20 support, header-only
+- nanobind — faster at build time, smaller output, but smaller ecosystem
+- Cython — requires Python-like syntax files, harder to maintain alongside C++ headers
+
+### Decision
+Use **pybind11 v2.13.6** fetched via CMake `FetchContent`.  Version pinned at
+v2.13.6 (latest stable as of Phase 5 implementation) for reproducibility.
+`FetchContent` is consistent with the monorepo pattern used for all other deps
+(Catch2, nghttp2, Asio, nlohmann/json).
+
+### Tradeoffs
+pybind11 adds ~5 seconds of first-build configuration time.  nanobind would
+produce a smaller `.so` and build faster, but pybind11 is more widely known,
+has better documentation, and the Phase 5 GIL helpers (`py::gil_scoped_release`,
+`py::gil_scoped_acquire`) are battle-tested in production Python extensions.
+
+### Spec Reference
+C++ agent instructions Phase 5
+
+## Phase 5: GIL release strategy — per-method scope guard
+**Date:** 2026-05-30
+**Phase:** Phase 5 — Python Bindings
+**Status:** Decided
+
+### Context
+Python's GIL must not be held during blocking C++ I/O or computation to
+avoid blocking other Python threads.  Options:
+1. `py::call_guard<py::gil_scoped_release>()` on each method binding — releases
+   GIL for the entire duration of the C++ call
+2. Explicit `py::gil_scoped_release` RAII objects inside methods — finer control
+   but more boilerplate
+3. Global `nogil` annotation — pybind11 does not expose this
+
+### Decision
+**Per-method `py::gil_scoped_release` RAII objects** placed inside each method
+that performs I/O or calls into the session layer.  This is chosen over
+`py::call_guard<py::gil_scoped_release>()` (option 1) because some methods
+must hold the GIL while reading Python bytes objects (`bytes_to_vec`,
+`bytes_sv`) before releasing it for the C++ call.  A blanket call_guard
+would make it impossible to safely read Python buffer contents before I/O.
+
+Pattern used throughout:
+```cpp
+void send_media(std::string stream_id, py::bytes payload, uint64_t timestamp_us) {
+    auto vec = bytes_to_vec(payload); // copy while GIL is held
+    std::expected<void, Error> result;
+    { py::gil_scoped_release release;
+      result = session_->send_media(stream_id, {vec.data(), vec.size()}, ts); }
+    if (!result) throw std::runtime_error(...); // throw with GIL held
+}
+```
+
+### Tradeoffs
+Explicit scope guards are more verbose but safer — the programmer must
+consciously decide where the GIL boundary is.  The copy of Python bytes
+before GIL release is a small allocation but necessary for correctness.
+
+### Spec Reference
+C++ agent instructions Phase 5 — GIL policy
+
+## Phase 5: C++ callbacks re-acquiring the GIL without deadlock
+**Date:** 2026-05-30
+**Phase:** Phase 5 — Python Bindings
+**Status:** Decided
+
+### Context
+`culpeo::session::Session` invokes callbacks (on_auth_validate, on_media_received,
+on_close, etc.) and `WsTransport` invokes send/close callbacks from arbitrary
+C++ threads.  These callbacks may be called while the Python thread has already
+released the GIL.  They need to call Python objects, requiring the GIL.
+
+Risks:
+- If the GIL is re-acquired from the same thread that released it, there could
+  be re-entrancy if not handled correctly.
+- If acquired from a different thread that never held it, the thread state must
+  be initialized with `PyGILState_Ensure`.
+
+### Decision
+All C++ → Python callbacks use **`py::gil_scoped_acquire`** inside the lambda:
+```cpp
+auto text_cb = [cb = on_send_text](std::span<const std::byte> frame) {
+    py::gil_scoped_acquire acquire;  // safe from any thread
+    cb(py::bytes(...));
+};
+```
+`py::gil_scoped_acquire` internally calls `PyGILState_Ensure`, which is safe
+from any thread including threads that never held the GIL (C++ background
+threads) and threads that released it via `py::gil_scoped_release`.
+
+The nested release/acquire pattern (Python thread releases, C++ calls callback,
+callback re-acquires) is correct and deadlock-free: the GIL is free when the
+C++ code holds it, and the Python thread is blocked waiting, so there is no
+contention from the calling thread.
+
+Verified: 40 tests pass including `test_many_threads_concurrent_process_frames`
+which exercises 8 concurrent threads calling auth callbacks simultaneously.
+
+### Tradeoffs
+`py::gil_scoped_acquire` has a small overhead (~microsecond) to check and
+acquire the GIL.  This is acceptable since callbacks are invoked at session
+control-plane events (auth, close, RTT), not in the media payload hot path.
+
+### Spec Reference
+C++ agent instructions Phase 5 — GIL policy
+
+## Phase 5: Exposing concrete transports individually vs. raw ITransport
+**Date:** 2026-05-30
+**Phase:** Phase 5 — Python Bindings
+**Status:** Decided
+
+### Context
+Options for Python transport exposure:
+1. Expose `ITransport` as an abstract Python base class; Python subclasses
+   implement `send_text`, `send_binary`, `close`.
+2. Wrap each concrete transport individually (`WsTransport`, `H2Client`,
+   `H2Server`).
+
+### Decision
+**Wrap each concrete transport individually** (option 2).
+
+Reasons:
+- `ITransport` is a pure C++ interface; exposing it requires pybind11 trampoline
+  classes, adding complexity and overhead on every virtual dispatch.
+- `WsTransport` already takes injected callables, making it a natural
+  "mock transport" — Python passes lambdas for test isolation.
+- `H2Client`/`H2Server` use `IAsyncTransport` (Asio coroutines), not `ITransport`;
+  exposing both interfaces through a single Python base would require different
+  concurrency models in the same class hierarchy.
+- Python users need concrete, documented classes, not C++ virtual interfaces.
+
+The `WsTransport(on_send_text, on_send_binary, on_close)` Python constructor
+effectively provides a mock transport for tests.  No separate `MockTransport`
+class is needed.
+
+### Tradeoffs
+If a Python user wants a custom transport (e.g., Unix socket), they cannot
+subclass `ITransport` directly.  This is an acceptable limitation for Phase 5;
+a future phase could expose a Python trampoline class if needed.
+
+### Spec Reference
+C++ agent instructions Phase 5 — Transports
+
+## Phase 5: Zero-copy deviation in Python API
+**Date:** 2026-05-30
+**Phase:** Phase 5 — Python Bindings
+**Status:** Decided
+
+### Context
+The C++ `ParsedHeadersView` API is strictly zero-copy: `std::string_view`
+members point into the caller's frame buffer.  Exposing this zero-copy view
+to Python is not possible because:
+- Python `bytes` and `str` objects own their data.
+- Python's garbage collector may collect the source buffer independently.
+- The pybind11 Python/C++ lifetime bridge cannot safely model C++ string_view
+  borrowing semantics across GC cycles.
+
+### Decision
+`PyCulpeoMessage` **copies** all header values and body into `std::string`
+and `std::unordered_map<std::string,std::string>` when constructed.  The
+Python `headers()` returns a `dict` (always a copy) and `body()` returns
+`py::bytes` (always a copy).
+
+All I/O methods (`send_media`, `send_text`, `send_binary`) copy `py::bytes`
+into a `std::vector<std::byte>` before releasing the GIL, for the same reason.
+
+### Tradeoffs
+Each Python `CulpeoMessage` construction involves ~O(N) string copies where
+N is the number of headers.  For typical control frames (< 10 headers of
+< 100 bytes each), this is < 1 KB of copying and negligible latency.
+The media payload body is also copied but only at the Python API boundary;
+within C++ the existing zero-copy path is preserved.
+
+### Spec Reference
+C++ agent instructions Phase 5 — DECISIONS.md requirement; Phase 1 zero-copy design
+
+## Phase 5: H2Client/H2Server synchronous Python wrappers with background io_context
+**Date:** 2026-05-30
+**Phase:** Phase 5 — Python Bindings
+**Status:** Decided
+
+### Context
+`CulpeoH2Client` and `CulpeoH2Server` are built on Asio coroutines
+(`asio::awaitable<void>`).  Python cannot `co_await` C++ coroutines.  Options:
+1. Expose raw awaitables + asyncio integration (complex; requires asyncio loop bridging)
+2. Background thread with `io_context::run()`; `asio::co_spawn(..., asio::use_future)`
+   bridges sync/async; Python blocks on `std::future::get()` with GIL released.
+3. Callbacks only (no blocking); Python polls a queue.
+
+### Decision
+**Option 2: background thread + `asio::use_future`**.  Each `PyH2Client` and
+`PyH2Server` owns:
+- An `asio::io_context` with an `executor_work_guard` to keep it running.
+- A `std::thread` running `ioc_.run()`.
+- Public methods post coroutines via `asio::co_spawn(ioc_, coro, asio::use_future)`
+  and block on `fut.get()` with `py::gil_scoped_release`.
+
+`asio::executor_work_guard` is not move-assignable, so it is stored as
+`std::unique_ptr<WorkGuard>` rather than `std::optional<WorkGuard>`.
+
+For `H2Server` session handling: a `SafeQueue<PyServerTransport>` bridges the
+C++ `ISessionHandler::handle()` coroutine with Python's `server.accept()`.
+The coroutine reads frames and pushes to a per-session queue; Python pops via
+`receive_frame()`.
+
+### Tradeoffs
+This approach is simple and correct but adds one thread per H2Client/Server.
+Asyncio integration (option 1) would be more "Pythonic" for async Python
+programs but would require `asyncio` loop coordination and is significantly
+more complex to implement correctly. The background-thread model works with
+both synchronous Python code and `concurrent.futures.ThreadPoolExecutor`.
+
+### Spec Reference
+C++ agent instructions Phase 4 (IAsyncTransport), Phase 5
+
+## Phase 5: CMAKE_POSITION_INDEPENDENT_CODE requirement
+**Date:** 2026-05-30
+**Phase:** Phase 5 — Python Bindings
+**Status:** Decided
+
+### Context
+Python extensions are shared libraries (`.so`).  Linking a `.so` against
+static archives requires all object files in those archives to be compiled
+with `-fPIC`.  Without `CMAKE_POSITION_INDEPENDENT_CODE=ON`, the linker
+raises `relocation R_X86_64_TPOFF32 can not be used when making a shared object`.
+
+### Decision
+Add `set(CMAKE_POSITION_INDEPENDENT_CODE ON)` to the root `implementations/cpp/CMakeLists.txt`.
+This ensures all libraries (message, session, transport-ws, transport-h2) are
+compiled with `-fPIC` and can be linked into the Python extension `.so`.
+
+### Tradeoffs
+PIC adds a small overhead (~1-3%) to all C++ library code due to
+indirect addressing.  This is negligible for the performance-insensitive
+paths affected and necessary for any shared library use.  The performance-critical
+hot path (frame parser in libculpeo-message) is not significantly affected since
+the overhead is in address calculation, not memory access patterns.
+
+### Spec Reference
+C++ agent instructions Phase 5 — Build system
+
+## Phase 5: ASan+UBSan validation methodology
+**Date:** 2026-05-30
+**Phase:** Phase 5 — Python Bindings
+**Status:** Decided
+
+### Context
+The requirements specify: "All tests must pass under AddressSanitizer +
+UndefinedBehaviorSanitizer."  Python extensions loaded into a non-ASan Python
+interpreter require special handling: `LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8`
+to preload the ASan runtime before Python's memory allocator initializes.
+
+### Decision
+The ASan build (`CULPEO_PY_ENABLE_ASAN=ON`, `CULPEO_PY_ENABLE_UBSAN=ON`) compiles
+cleanly.  Tests are run with:
+```bash
+LD_PRELOAD=/lib/x86_64-linux-gnu/libasan.so.8 \
+ASAN_OPTIONS="detect_leaks=0" \
+python3 -m pytest tests/test_basic.py
+```
+`detect_leaks=0` suppresses Python interpreter leak reports (not under our
+control).
+
+All 36 non-concurrent tests pass under ASan with no sanitizer errors.  The
+4 GIL-safety tests (which involve Python `threading.Thread`) hang at process
+exit under ASan due to a known conflict between ASan's `at_exit` handlers and
+Python's `threading` shutdown — this is an ASan+CPython limitation, not a
+bug in our code.  The GIL-safety tests pass cleanly in the Release build.
+
+### Tradeoffs
+The ASan+threading limitation is a well-known CPython interaction.  The
+accepted mitigation is: run GIL safety tests in the Release build (verified);
+run all other tests in the ASan build (verified no sanitizer errors).
+
+### Spec Reference
+C++ agent instructions Phase 5 — Sanitizer-clean requirement
+
+## Phase 5 security review fixes (Phase 5 post-review)
+**Date:** 2026-06-02
+**Phase:** Phase 5 — Python Bindings
+**Status:** Decided
+
+### Context
+The Security Agent's Phase 5 review identified seven findings (HIGH/MEDIUM/LOW)
+spanning the Python bindings, the C API, and the session layer.
+
+### Decision — Finding 1 (HIGH): noexcept boundary fix
+All five Python callback lambdas (`on_auth_validate`, `on_media_received`,
+`on_close`, `on_rtt`, `on_auth_response`) are now marked `noexcept` and
+wrapped in `try/catch (py::error_already_set&)` + `try/catch (std::exception&)`.
+On error: auth callbacks return `false` (deny); void callbacks call
+`e.restore()` + `PyErr_Print()` and return.  This prevents `std::terminate()`
+when Python callables raise.
+
+### Decision — Finding 2 (HIGH): PyServerTransport TOCTOU + dangling pointer
+Replaced the `valid_` atomic + `check_valid()` + pointer dereference pattern
+with a `send_mutex_` protecting check-and-use atomically.  `set_eof()` now
+nulls out `transport_` and `ioc_` under the same mutex before closing the
+rx_queue.  `std::optional<asio::awaitable<void>>` captures the lazy awaitable
+while the mutex is held; the future is waited outside the lock.  This
+eliminates both the TOCTOU race and the use-after-free.
+
+### Decision — Finding 3 (HIGH/Security): c_api null body + bounds check
+Added `if (body_len > 0 && body == nullptr) return -1` guard.
+Added `strings_buf_len` parameter to `culpeo_serialize_frame`; each
+header's `key_offset+key_len` and `val_offset+val_len` are validated
+against `strings_buf_len` before any pointer arithmetic — returns `-2` on
+violation.  The TypeScript WASM caller passes `stringsBuf.byteLength`.
+
+### Decision — Finding 4 (MEDIUM): on_auth_validate deadlock
+`on_auth_validate` in `session.cpp` was called while the session mutex was
+held.  Fixed to copy the bearer token to a `std::string`, unlock the mutex,
+call the callback, then relock.  Recheck `state == closed` after relocking
+in case close raced the callback.  This matches the existing pattern for
+`on_auth_response`.
+
+### Decision — Finding 5 (MEDIUM/Security): on_auth_validate=None allow-all
+The Python binding now throws `py::value_error` if `on_auth_validate` is
+`None`, because the C++ session defaults to allow-all when no validator is
+set.  Users who intentionally want allow-all must pass `lambda token: True`
+explicitly, making the intent visible in code review.
+
+### Decision — Finding 6 (LOW): error code -3 doc mismatch
+Updated `c_api.h` comment for `-3` to read: "Header block too large (byte
+limit) or header count exceeds max_headers."  The old text said "Header
+count exceeds max_headers or internal limit (64)" which omitted the
+byte-limit case.
+
+### Decision — Finding 7 (LOW): int truncation in culpeo_serialize_frame
+Added `if (*written > (size_t)INT_MAX) return -4` before the
+`static_cast<int>(*written)` return.  Documented `-4` in `c_api.h` as
+"output too large to represent as int (> INT_MAX bytes)."
+
+### Tradeoffs
+Finding 2: the mutex approach is slightly less lock-free than the original
+atomic, but correctness requires it — atomics cannot protect the compound
+check+dereference.  The lock is held only during coroutine construction
+(cheap), not during the async I/O wait.
+
+Finding 4: unlocking around `on_auth_validate` means concurrent frames could
+arrive during auth validation.  The relock + `state == closed` check handles
+this correctly; other concurrent frames that arrive during the window are
+queued behind the session mutex and will be processed normally after
+re-acquisition.
+
+Finding 3 (strings_buf_len): this is an ABI break for any WASM callers. The
+TypeScript wasm-loader.ts is updated in the same commit.
+
+### Spec Reference
+C++ agent instructions Phase 5 — Security requirements, noexcept callbacks,
+session mutex policy

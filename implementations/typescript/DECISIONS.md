@@ -623,3 +623,247 @@ Placing the check in `flush()` rather than `decodeFrame` keeps `framing.ts` tran
 
 ### Spec Reference
 SEC-032 (security finding); §3.1 (frame type enumeration)
+
+---
+
+## Phase 5 — WASM Parser Backend: Architecture Decision
+**Date:** 2025-07-14
+**Phase:** Phase 5
+**Status:** Decided
+
+### Context
+Phase 5 requires a WebAssembly-accelerated header parser/serializer for the hot binary-frame path, with transparent fallback to the existing pure-TypeScript implementation when WASM is unavailable (SSR, old runtimes, load failure, Emscripten not compiled).
+
+The core design question: how deep should the WASM integration go?  Options were:
+1. Replace the entire `parseFrame`/`serializeFrame` API with WASM.
+2. Replace only the raw text-processing step (finding `\r\n\r\n`, splitting `key: value` lines, assembling the header byte sequence) and keep all semantic validation (limits, forbidden chars, required headers) in TypeScript.
+3. Make WASM an optional entirely separate package with no hooks into the core.
+
+### Decision
+Option 2 was chosen.  A `ParserBackend` interface is added to `culpeostream` core (`src/parser-backend.ts`) with two operations:
+
+- `parseHeaders(buf)` → ordered `[key, value]` pair array + body offset (or `null`/throws)
+- `serializeFrame(headers, body)` → `Uint8Array`
+
+`setParserBackend(backend | null)` registers an override.  All semantic validation (header count, name/value length, forbidden characters, duplicate reserved headers) is enforced in TypeScript *after* the backend produces raw pairs.  The default is `null` (pure-TS path, no behaviour change for existing callers).
+
+A new package `packages/culpeostream-wasm/` wraps the Emscripten-compiled C code and, after a successful `initWasm()`, installs itself via `setParserBackend()`.
+
+### Tradeoffs
+- **Gave up**: uniform WASM acceleration of the full semantic pipeline; duplicate-reserved-header detection relies on the ordered pair list (works correctly since the backend returns all pairs including duplicates).
+- **Gained**: all spec MUST validations remain in TypeScript (auditable, testable, no C complexity); WASM accelerates only the hot text-manipulation path; a clean plug/unplug API that is easy for the Security Agent to review.
+- **Risk accepted**: the TypeScript validation loop runs a second pass over headers already processed by C.  For typical frames (< 10 headers) this overhead is negligible.
+
+### Spec Reference
+TypeScript agent Phase 5 requirements; §3 (frame format)
+
+---
+
+## Phase 5 — ParserBackend Interface Uses Ordered Pairs, Not Record
+**Date:** 2025-07-14
+**Phase:** Phase 5
+**Status:** Decided
+
+### Context
+The `ParserBackend.parseHeaders` return type could be `Record<string, string>` (simple, but loses duplicates and order) or `ReadonlyArray<readonly [string, string]>` (preserves order and duplicates, enabling duplicate-reserved-header detection in TypeScript).
+
+The public `culpeostream-wasm` package API (for direct consumers, not the core integration) uses `Record<string, string>` as specified in the Phase 5 requirements — duplicate info is not needed there since application code typically queries headers by name.
+
+### Decision
+- **`ParserBackend` interface** (core integration): uses `ReadonlyArray<readonly [string, string]>` to preserve order and allow duplicate detection.
+- **`culpeostream-wasm` public API** (`parseHeaders()` / `serializeFrame()`): uses `Record<string, string>` for ergonomic consumer use.
+
+The wasm-loader's `createWasmParserBackend()` returns a `ParserBackend` (pair list API); the module-level `parseHeaders()` converts to `Record<string, string>` before returning to callers.
+
+### Tradeoffs
+Two representations adds a small conversion cost (one `Object.entries` / `Object.fromEntries` loop per call).  Accepted: this is dwarfed by the WASM call overhead itself.
+
+### Spec Reference
+TypeScript agent Phase 5 requirements
+
+---
+
+## Phase 5 — Stub dist Artefacts Committed to Repository
+**Date:** 2025-07-14
+**Phase:** Phase 5
+**Status:** Decided
+
+### Context
+Emscripten is not installed in the devcontainer.  The `dist/` folder needs *some* content for the TypeScript `import("../dist/culpeo_parser.js")` in `wasm-loader.ts` to resolve without a build step in CI.
+
+Options:
+1. Add `dist/` to `.gitignore` and require a build step before tests run.
+2. Commit a stub `dist/culpeo_parser.js` that presents the Emscripten module shape but returns a sentinel (`__culpeoStub: true`) so `initWasm()` resolves `false`.
+3. Bundle the compiled `.wasm` via `base64` in a TypeScript file.
+
+### Decision
+Option 2.  A stub `dist/culpeo_parser.js` is committed that:
+- Exports `createCulpeoParserModule()` (same export name as the real Emscripten glue)
+- Returns an object with `__culpeoStub: true`
+- `initWasm()` detects the sentinel and returns `false`
+
+A 8-byte stub `dist/culpeo_parser.wasm` (magic bytes + version only, no sections) is also committed.
+
+When Emscripten *is* available (`make wasm` or the Docker one-liner in `WASM_BUILD.md`), the real `.js` and `.wasm` files replace the stubs and `initWasm()` returns `true`.
+
+### Tradeoffs
+- CI always runs the TypeScript fallback path (not WASM); WASM correctness can only be verified after a real Emscripten build.  This is documented explicitly in `WASM_BUILD.md`.
+- Stub files must be kept in sync with the real Emscripten module shape (same export name, same factory function signature).
+
+### Spec Reference
+TypeScript agent Phase 5 requirements
+
+---
+
+## Phase 5 — Emscripten Version Target: 3.1.x
+**Date:** 2025-07-14
+**Phase:** Phase 5
+**Status:** Decided
+
+### Context
+Emscripten has historically had breaking changes in how it modularises output (`MODULARIZE=1`), memory growth flags, and exported runtime methods.
+
+### Decision
+Target **Emscripten 3.1.x** (specifically 3.1.74 in Docker image `emscripten/emsdk:3.1.74`).  The build flags used are:
+- `-s WASM=1` — emit WASM output
+- `-s MODULARIZE=1 -s EXPORT_NAME=createCulpeoParserModule` — ES-module-compatible factory function
+- `-s ALLOW_MEMORY_GROWTH=1` — allow heap expansion for large frames
+- `-s EXPORTED_RUNTIME_METHODS=["ccall","cwrap","HEAPU8","getValue","setValue"]` — minimal runtime surface
+
+### Tradeoffs
+Pinning to 3.1.x means we may need to update the flags if a future Emscripten release deprecates any of them.  Accepted; the Makefile and CMakeLists.txt document the exact flags.
+
+### Spec Reference
+TypeScript agent Phase 5 requirements
+
+---
+
+## Phase 5 — WASM Memory Management: All Malloc/Free in TypeScript Wrapper
+**Date:** 2025-07-14
+**Phase:** Phase 5
+**Status:** Decided
+
+### Context
+The Emscripten-compiled WASM module exposes `_malloc` and `_free`.  Two ownership models were considered:
+1. C allocates output buffers and TypeScript frees them.
+2. TypeScript allocates all buffers (input and output), passes pointers to C, TypeScript frees everything.
+
+### Decision
+Option 2: **TypeScript owns all allocations**.  For every call:
+- TypeScript calls `_malloc(size)` for input data, header struct array, and output buffer.
+- Data is copied into WASM heap via `HEAPU8.set`.
+- The C function is called with pointers.
+- TypeScript reads results directly from `HEAPU8`.
+- TypeScript calls `_free` on all pointers in a `finally` block, ensuring no leaks even on error paths.
+
+No WASM heap memory escapes a single call.
+
+### Tradeoffs
+- **Gave up**: the possibility of zero-copy input (we always copy `buf` into WASM heap).
+- **Gained**: simple ownership model with no C-side allocation; `finally`-guaranteed freeing prevents leaks; C code stays stateless with no hidden global heap state.
+- The extra copy cost is dominated by the WASM call overhead for typical frame sizes (< 2 KB headers).
+
+### Spec Reference
+TypeScript agent Phase 5 requirements; security requirements (no data persists on WASM heap between calls)
+
+---
+
+## Phase 5 — WASM backed by libculpeo-message C++ shim
+**Date:** 2025-07-15
+**Phase:** Phase 5
+**Status:** Decided
+
+### Context
+The WASM package previously compiled a standalone `c/culpeo_parser.c` that reimplemented header parsing in C99. The C++ team added an `extern "C"` shim (`c_api.cpp`) to `libculpeo-message` that exposes the same C ABI, backed by the battle-tested C++20 `culpeo::message` parser (which already had fuzz corpus, ASan/UBSan coverage, and property-based tests). Maintaining a separate C reimplementation was unnecessary duplication and missed those quality guarantees.
+
+### Decision
+Replaced `c/culpeo_parser.c` with a Makefile that compiles `libculpeo-message/src/message.cpp` + `libculpeo-message/src/c_api.cpp` using `em++` with `-std=c++20`. The `c/culpeo_parser.h` header is kept as a local documentation mirror of the C ABI but the implementation is no longer in the TypeScript tree. The `src/wasm-loader.ts` wrapper adds `.toLowerCase()` on every decoded key string because the C++ parser returns keys in their original case (no in-place lowercasing), maintaining the same normalised-key contract as the pure-TypeScript fallback.
+
+### Tradeoffs
+- **Gave up**: the ability to build WASM without checking out the C++ subtree. Docker command updated to mount the repo root so `../../../../cpp/libculpeo-message` is accessible.
+- **Gained**: single source of truth for parsing logic; automatic inheritance of fuzz-testing, ASan, and UBSan coverage; C++20 standard library (no custom string-handling).
+- Key lowercasing moved from WASM to JS layer — zero observable difference, but slightly more JS work per call. Acceptable given parsing is already WASM-bound.
+
+### Spec Reference
+TypeScript agent Phase 5 requirements; Section 4.1 (header parsing)
+
+---
+
+## Phase 2 — `@culpeo/async-ws` for WebSocket transport
+**Date:** 2025-07-15
+**Phase:** Phase 2 (revision)
+**Status:** Decided
+
+### Context
+The original `client.ts` used raw `WebSocket` event listeners (`open`, `message`, `close`, `error`) with manual cleanup via a stored `wsHandlers` object. This pattern required careful bookkeeping to remove listeners before each reconnect, and the connection lifecycle was spread across four callbacks. The `@culpeo/async-ws` library provides a promise-based `WebSocketClient` that wraps the same browser WebSocket API plus `ws` for Node.js.
+
+### Decision
+Replaced the raw WebSocket + `wsHandlers` + `cleanupWebSocket()` pattern with `@culpeo/async-ws` `WebSocketClient`. The per-connection lifecycle is now a single `async runConnection()` method: `await wsClient.connect(url)` opens the socket; `await session.start()` sends `culpeo.init`; `for await (const msg of wsClient)` is the receive loop; cleanup is implicit when the iterator ends. `connect()` and `close()` are promise-based, eliminating manual listener removal. The `CulpeoStreamClientOptions.WebSocket` constructor injection field was replaced by `wsClientFactory?: () => WsClientLike`, where `WsClientLike` is a structural interface that tests can implement directly without casting.
+
+### Tradeoffs
+- **Removed**: `WebSocketConstructor` type alias and `wsHandlers` bookkeeping; `cleanupWebSocket()` helper.
+- **Added**: runtime dependency on `@culpeo/async-ws` in `culpeostream-client` (previously zero runtime deps). This is acceptable because the client package already depends on `culpeostream` and is inherently Node.js/browser-coupled.
+- Test mocks were updated from `MockWebSocket extends EventTarget` (synchronous event dispatch) to `MockWebSocketClient implements WsClientLike` (promise-based connect, async iterator for messages). Tests remain fully deterministic — the mock resolves promises synchronously and the async iterator yields synchronously when a waiter is already pending.
+- Security invariants (token never logged, session IDs opaque, wss:// required) are all preserved in the new implementation.
+
+### Spec Reference
+TypeScript agent Phase 2 requirements; Section 9 (reconnection); Addendum A.4 (token handling)
+
+## Server per-connection handling via `@culpeo/async-ws` `fromSocket()`
+**Date:** 2026-07-14
+**Phase:** Phase 3
+**Status:** Decided
+
+### Context
+`culpeostream-server` previously handled per-connection WebSocket lifecycle by registering raw `ws.on("message"/"close"/"error")` callbacks and serialising message processing via a manual `queue` array + `drainQueue()` async mutex. This pattern is correct but verbose and forces consumers to reason about queue draining concurrency manually. `@culpeo/async-ws` v1.1.0 introduced `WebSocketClient.fromSocket(socket)` which wraps an already-open server-side socket and provides `for await...of`, `send()`, and `close()` — the same API used by the client package.
+
+### Decision
+Replace `ws.on("message"/"close"/"error")` callbacks and the `queue`/`drainQueue` mutex with `WebSocketClient.fromSocket(ws)` + `for await...of` in a `runMessageLoop()` method launched with `void this.runMessageLoop()` from the constructor. The `rawDataToBuffer()` helper is removed because `@culpeo/async-ws` normalises binary messages to `ArrayBuffer`. The `ws` package is retained for `WebSocketServer` (accepting connections) and `ws.terminate()` (force-kill path used by `CulpeoServer.close()`). The `ServerSessionImpl` and `ServerConnection` internal helper `sendText()` and `coreSession.sendFrame` callback all use `wsClient` for state checks and sends.
+
+The `removeAllListeners()` calls previously needed to prevent GC leaks (TS-P3-001) are removed because `@culpeo/async-ws` manages listener cleanup internally when the iterator ends.
+
+**Close code note:** `@culpeo/async-ws` v1.1.0 validates close codes and only accepts `1000` (normal) or application-specific codes in the range `3000–4999`. Standard protocol-error codes `1001–1015` are rejected. Code `4001` is used for `unauthorized` rejections and `4002` for protocol errors, preserving semantic distinction from normal closure (`1000`). The application-level error reason is already carried in the `culpeo.init-error` frame, so the WS close code is informational only.
+
+### Tradeoffs
+- **Gained:** Simpler concurrency model (sequential by design via async iteration), less code, consistent API with the client package.
+- **Given up:** Using standard WebSocket protocol-error close codes (1002, 1008 etc.) — replaced with 4001/4002 application-specific codes due to library validation constraints. Clients that inspect WS close codes will see 40xx instead of 10xx for rejected sessions.
+- **Risk accepted:** The `terminate()` force-close path still goes directly to the raw `ws.terminate()`, bypassing `wsClient`. This is intentional: `terminate()` is a last-resort server shutdown operation with no graceful alternative.
+
+### Spec Reference
+Phase 3 server requirements; Security invariants (SEC-020, SEC-021 unchanged).
+
+## Phase 5 Review Findings — Async Error Handling and Memory Safety
+**Date:** 2026-06-04
+**Phase:** Phase 5 (review fixes)
+**Status:** Decided
+
+### Context
+The Phase 5 security review raised six findings across `culpeostream-client`, `culpeostream-server`, and `culpeostream-wasm`. The fixes below were applied together and all 157 tests continue to pass.
+
+### Decision
+
+**Finding 1 (HIGH): `void session.receive(frame)` fire-and-forget**
+Changed to `await session.receive(frame)` inside the existing inner `try/catch` in `runConnection()`. Errors from async session processing (auth-refresh failures, state machine violations, protocol errors) are now caught and emitted as `error` events rather than becoming unhandled promise rejections.
+
+**Finding 2 (HIGH): WASM `serializeFrameWasm` memory leak on second allocation failure**
+Restructured `serializeFrameWasm` from ad-hoc manual frees on each allocation check to a single `try/finally` block that initialises all pointers to `0` before the try and frees all non-zero pointers in `finally`. This is consistent with the existing `parseHeadersWasm` pattern. Previously, if `copyToHeap` for `bodyPtr` threw, `stringsBufPtr` was leaked.
+
+**Finding 3 (MEDIUM): `session.start()` unhandled rejection hangs `connect()` forever**
+Wrapped `session.start()` in a `try/catch` that rejects the pending `connect()` promise, closes the WebSocket with code 4002, and returns early. Without this, a `session.start()` failure left `this.pendingConnect` unsettled indefinitely.
+
+**Finding 4 (MEDIUM/Security): Server leaks `err.message` as WebSocket close reason**
+Replaced `err.message.slice(0, 123)` in the `runMessageLoop` error handler with a generic constant string `"Protocol error"` and a `console.error` on the server side. Session IDs, stream offsets, and state machine names no longer leak to the remote peer.
+
+**Finding 5 (LOW): Double `saveSnapshot()` on client-initiated close**
+Removed the explicit `await this.saveSnapshot()` call from the `"close"` notification handler in `handleNotification()`. `handleWsClose()` already calls `saveSnapshot()` unconditionally when the connection tears down, making the second call redundant for all stores and hazardous for external stores with optimistic locking.
+
+**Finding 6 (LOW): `Math.min(buf.length, buf.length)` no-op in fallback parser**
+Added `const MAX_HEADER_SCAN = 16 * 1024` (matching libculpeo-message's `header_block_max`) and used it in the `Math.min` call in `parseHeadersTs()`. This ensures the TypeScript fallback parser enforces the same scan depth limit as the WASM path and prevents O(n) scanning of arbitrarily large buffers.
+
+### Tradeoffs
+- `await session.receive(frame)` serialises receive processing per frame (no concurrent receive calls on the same session), which is the intended invariant. There is no throughput regression because a single WebSocket connection was already sequential.
+- The `MAX_HEADER_SCAN` limit of 16 KiB means frames whose header blocks exceed 16 KiB will never parse (returns `null`). This is intentional and matches the WASM path; oversized header blocks are a protocol violation.
+- The generic server error reason removes one debugging signal available to clients. Server-side logging compensates.
+
+### Spec Reference
+Section 6 (auth-refresh); Section 4 (frame parsing limits); TypeScript agent security requirements; SEC-020; SEC-021.

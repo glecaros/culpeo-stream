@@ -98,7 +98,11 @@ export class OffsetTracker {
     const state = this.mustGet(streamId);
     const offset = state.nextSendOffset;
     state.lastSentOffset = offset;
-    state.nextSendOffset += computeOffsetIncrement(offsetType, payloadLength, contentType);
+    state.nextSendOffset += computeOffsetIncrement(
+      offsetType,
+      payloadLength,
+      contentType,
+    );
     return offset;
   }
 

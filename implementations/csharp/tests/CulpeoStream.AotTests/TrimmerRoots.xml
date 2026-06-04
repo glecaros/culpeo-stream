@@ -1,0 +1,15 @@
+<linker>
+  <!--
+    Trimmer root descriptor for CulpeoStream.AotTests.
+    This file is referenced by CulpeoStream.AotTests.csproj via <TrimmerRootDescriptor>.
+    It roots the CulpeoStream assemblies under test so the ILC linker does not
+    strip them away during AOT publish, enabling accurate trim-warning analysis.
+
+    CulpeoStream.Client and CulpeoStream.Http2 are intentionally omitted: they are
+    not currently referenced by the AOT test project.  Add them here if/when the
+    AOT test project gains a reference to those assemblies (Finding 4 requires
+    CulpeoStream.Client to be AOT-clean before it can be included).
+  -->
+  <assembly fullname="CulpeoStream.Core" />
+  <assembly fullname="CulpeoStream.AspNetCore" />
+</linker>

@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <RollForward>Major</RollForward>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+    <!-- Roslyn for in-process compilation and generator testing -->
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.14.0" />
+    <PackageReference Include="Microsoft.CodeAnalysis.Analyzers" Version="3.11.0" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <!-- Reference the generator as an analyzer so we can test its output via CSharpGeneratorDriver.
+       Also referenced as a normal assembly so tests can instantiate HandlerGenerator directly. -->
+  <ItemGroup>
+    <ProjectReference
+      Include="..\..\src\CulpeoStream.SourceGen\CulpeoStream.SourceGen.csproj" />
+    <ProjectReference Include="..\..\src\CulpeoStream.Core\CulpeoStream.Core.csproj" />
+    <ProjectReference Include="..\..\src\CulpeoStream.AspNetCore\CulpeoStream.AspNetCore.csproj" />
+  </ItemGroup>
+</Project>

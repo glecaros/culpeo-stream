@@ -1,6 +1,11 @@
-add_library(culpeo_message
-    src/message.cpp
-)
+option(CULPEO_BUILD_C_API "Build the extern \"C\" API shim (for WASM/FFI use)" OFF)
+
+set(CULPEO_MESSAGE_SOURCES src/message.cpp)
+if(CULPEO_BUILD_C_API)
+    list(APPEND CULPEO_MESSAGE_SOURCES src/c_api.cpp)
+endif()
+
+add_library(culpeo_message ${CULPEO_MESSAGE_SOURCES})
 
 add_library(culpeo::message ALIAS culpeo_message)
 

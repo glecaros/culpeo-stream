@@ -816,7 +816,7 @@ public sealed class ClientTests
         await client.ConnectAsync(new Uri("wss://localhost"), cts.Token);
         await ReadNextEventAsync(client, cts.Token);
 
-        await client.SendEventAsync("myapp.hello", new { greeting = "world" }, cts.Token);
+        await client.SendEventAsync("myapp.hello", "{\"greeting\":\"world\"}", cts.Token);
 
         var evtFrame = await serverTask;
         Assert.Equal("myapp.hello", evtFrame.Event);
@@ -838,7 +838,7 @@ public sealed class ClientTests
         await ReadNextEventAsync(client, cts.Token);
 
         await Assert.ThrowsAsync<ArgumentException>(
-            () => client.SendEventAsync("culpeo.custom", null, cts.Token));
+            () => client.SendEventAsync("culpeo.custom", "{}", cts.Token));
 
         await client.DisconnectAsync();
         await serverTask;

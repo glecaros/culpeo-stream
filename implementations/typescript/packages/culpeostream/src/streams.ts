@@ -211,7 +211,11 @@ export class StreamRegistry {
     this.offsets.recordReceived(
       streamId,
       offset,
-      computeOffsetIncrement(stream.offset_type, payloadLength, stream.content_type),
+      computeOffsetIncrement(
+        stream.offset_type,
+        payloadLength,
+        stream.content_type,
+      ),
     );
   }
 

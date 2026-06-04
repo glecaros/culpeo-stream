@@ -515,7 +515,7 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         return true;
     }
 
-    private static void ValidateStreamDeclarations(IReadOnlyList<StreamDeclaration> streams, int maxStreamCount)
+    private static void ValidateStreamDeclarations(IReadOnlyList<StreamInitDeclaration> streams, int maxStreamCount)
     {
         if (streams.Count == 0)
         {
@@ -545,7 +545,7 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         }
     }
 
-    private static StreamState? FindExistingStream(SessionSnapshot snapshot, StreamDeclaration declaration, HashSet<string> matched)
+    private static StreamState? FindExistingStream(SessionSnapshot snapshot, StreamInitDeclaration declaration, HashSet<string> matched)
     {
         if (!string.IsNullOrWhiteSpace(declaration.IdHint) && snapshot.Streams.TryGetValue(declaration.IdHint, out var byId) && !matched.Contains(byId.Id) && MatchesStream(byId, declaration))
         {
@@ -555,7 +555,7 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
         return snapshot.Streams.Values.FirstOrDefault(stream => !matched.Contains(stream.Id) && MatchesStream(stream, declaration));
     }
 
-    private static bool MatchesStream(StreamState stream, StreamDeclaration declaration)
+    private static bool MatchesStream(StreamState stream, StreamInitDeclaration declaration)
         => stream.Type == declaration.Type
            && stream.OffsetType == declaration.OffsetType
            && ContentTypeUtilities.ContentTypesMatch(stream.ContentType, declaration.ContentType)
@@ -683,7 +683,7 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
             throw new ProtocolValidationException("invalid-streams", "culpeo.init must include streams.");
         }
 
-        List<StreamDeclaration> streams = [];
+        List<StreamInitDeclaration> streams = [];
         foreach (var item in streamsProperty.EnumerateArray())
         {
             var contentType = item.TryGetProperty("content_type", out var contentTypeProperty) ? contentTypeProperty.GetString() : null;
@@ -705,7 +705,7 @@ public sealed class CulpeoConnection(CulpeoSessionServer server)
                 resumeOffset = resumeOffsetProperty.GetInt64();
             }
 
-            streams.Add(new StreamDeclaration(
+            streams.Add(new StreamInitDeclaration(
                 contentType,
                 streamType,
                 item.TryGetProperty("purpose", out var purposeProperty) ? purposeProperty.GetString() : null,
@@ -960,9 +960,10 @@ internal sealed class StreamState(string id, string contentType, CulpeoStreamTyp
 
 internal readonly record struct OffsetCheckpoint(long Offset, DateTimeOffset RecordedAt);
 
-internal sealed record StreamDeclaration(string ContentType, CulpeoStreamType Type, string? Purpose, string? IdHint, long? ResumeOffset, OffsetType OffsetType);
+/// <summary>Internal declaration used during <c>culpeo.init</c> parsing — carries resumption metadata.</summary>
+internal sealed record StreamInitDeclaration(string ContentType, CulpeoStreamType Type, string? Purpose, string? IdHint, long? ResumeOffset, OffsetType OffsetType);
 
-internal sealed record InitRequest(string Version, IReadOnlyList<StreamDeclaration> Streams)
+internal sealed record InitRequest(string Version, IReadOnlyList<StreamInitDeclaration> Streams)
 {
     public bool IsResumption => Streams.Any(stream => stream.ResumeOffset.HasValue || !string.IsNullOrWhiteSpace(stream.IdHint));
 }
