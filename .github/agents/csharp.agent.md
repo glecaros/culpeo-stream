@@ -99,6 +99,35 @@ Implement an HTTP/2 transport to validate the transport-agnostic design with a s
 - Interop test: `CulpeoHttp2Client` ↔ existing `CulpeoStream.AspNetCore` WebSocket server (session layer), and `CulpeoStreamClient` (WS) ↔ `CulpeoHttp2Server`
 - All existing tests must pass; add transport-specific and interop tests
 
+### Phase 5 — NativeAOT + Source Generators (`CulpeoStream.SourceGen`)
+
+Make `CulpeoStream.Core` fully trim-safe and NativeAOT-compatible, and introduce a Roslyn source generator that eliminates message-type boilerplate for application developers.
+
+**NativeAOT / Trim Safety:**
+- Audit all reflection usage in `CulpeoStream.Core`, `CulpeoStream.AspNetCore`, `CulpeoStream.Client`, and `CulpeoStream.Http2`
+- Replace `Type.GetType()`, `Activator.CreateInstance`, and dynamic dispatch with source-generated alternatives or `[DynamicallyAccessedMembers]` annotations
+- Add `[RequiresUnreferencedCode]` / `[RequiresDynamicCode]` on any APIs that can't be made trim-safe, with descriptive messages
+- Add a `PublishAot` test project (`tests/CulpeoStream.AotTests/`) that publishes with `<PublishAot>true</PublishAot>` and asserts zero ILC warnings
+- Target `net9.0` minimum for this package (NativeAOT support is significantly better in .NET 9)
+
+**Roslyn Source Generator (`CulpeoStream.SourceGen`):**
+- New project: `src/CulpeoStream.SourceGen/` (a `netstandard2.0` analyzer assembly)
+- Attribute `[CulpeoStreamHandler]` on a class implementing `ICulpeoStreamHandler` — generates:
+  - `RegisteredStreams` property populated from `[DeclareStream]`-annotated fields
+  - `OnMessageAsync` dispatch table (no reflection, no dictionary lookups — switch expression over event names)
+  - `HandleMediaAsync` routed by stream ID to strongly-typed method overloads
+- Attribute `[DeclareStream(id, type, purpose, contentType)]` on handler fields — generates stream registration boilerplate
+- Generates clean, readable, IDE-navigable code (not cryptic templates)
+- Source generator must produce code that compiles under NativeAOT with zero warnings
+- Tests: `tests/CulpeoStream.SourceGen.Tests/` — use Roslyn `CSharpGeneratorDriver` to test generated output directly
+
+**Definition of done for Phase 5:**
+- `dotnet publish -c Release -r linux-x64 --self-contained` with `<PublishAot>true</PublishAot>` on the AOT test project produces a binary with zero ILC trim warnings
+- Source generator produces compilable, correct dispatch code for at least: zero streams, one stream, three streams (mixed types), duplicate stream ID (error diagnostic)
+- All existing 103+ tests continue to pass on net8.0
+- New tests exercise all `[CulpeoStreamHandler]` and `[DeclareStream]` combinations
+- DECISIONS.md updated with NativeAOT strategy and source generator design choices
+
 ## Technical Requirements
 
 - Target **net8.0** minimum

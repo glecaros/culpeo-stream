@@ -260,8 +260,12 @@ public sealed class CulpeoStreamClient : IAsyncDisposable
     /// Sends an application event frame.
     /// </summary>
     /// <param name="eventName">Namespaced event name (must not use <c>culpeo.</c> prefix).</param>
-    /// <param name="body">Optional body to serialize as JSON. <see langword="null"/> emits <c>{}</c>.</param>
-    public async Task SendEventAsync(string eventName, object? body, CancellationToken cancellationToken = default)
+    /// <param name="jsonBody">
+    /// Pre-serialized JSON body. Defaults to <c>{}</c>. The caller is responsible for
+    /// producing valid JSON. Accepting a pre-serialized string (instead of <c>object?</c>)
+    /// makes this method trim-safe and NativeAOT-compatible (Finding 4).
+    /// </param>
+    public async Task SendEventAsync(string eventName, string jsonBody = "{}", CancellationToken cancellationToken = default)
     {
         if (_state != CulpeoClientState.Established)
         {
@@ -279,9 +283,9 @@ public sealed class CulpeoStreamClient : IAsyncDisposable
                 "Application events must not use the reserved 'culpeo.' namespace.", nameof(eventName));
         }
 
-        byte[] bodyBytes = body is null
+        byte[] bodyBytes = string.IsNullOrEmpty(jsonBody)
             ? "{}"u8.ToArray()
-            : Encoding.UTF8.GetBytes(JsonSerializer.Serialize(body));
+            : Encoding.UTF8.GetBytes(jsonBody);
 
         var frame = new CulpeoMessage(
             CulpeoMessageKind.Control,
@@ -532,7 +536,10 @@ public sealed class CulpeoStreamClient : IAsyncDisposable
         }
 
         // Send culpeo.auth-response echoing the nonce (§6.1)
-        var nonceBodyBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new { nonce }));
+        // F4: use source-generated JSON serialization (AuthResponseBody) instead of anonymous type
+        var nonceBody = new AuthResponseBody(nonce);
+        var nonceBodyBytes = Encoding.UTF8.GetBytes(
+            System.Text.Json.JsonSerializer.Serialize(nonceBody, CulpeoClientJsonContext.Default.AuthResponseBody));
         var authResponse = new CulpeoMessage(
             CulpeoMessageKind.Control,
             nonceBodyBytes,
@@ -559,8 +566,10 @@ public sealed class CulpeoStreamClient : IAsyncDisposable
         catch (JsonException) { /* use ts=0 */ }
 
         var serverTs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1000;
+        // F4: use source-generated JSON serialization (PongBody) instead of anonymous type
+        var pongBody = new PongBody(ts, serverTs);
         var pongBodyBytes = Encoding.UTF8.GetBytes(
-            JsonSerializer.Serialize(new { ts, server_ts = serverTs }));
+            System.Text.Json.JsonSerializer.Serialize(pongBody, CulpeoClientJsonContext.Default.PongBody));
 
         var pong = new CulpeoMessage(
             CulpeoMessageKind.Control,

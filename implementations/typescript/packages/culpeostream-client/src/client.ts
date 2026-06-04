@@ -397,11 +397,22 @@ export class CulpeoStreamClient extends TypedEventEmitter<ClientEventMap> {
     });
     this.session = session;
 
-    await session.start({
-      authorization,
-      bufferWindowMs: options.bufferWindowMs ?? 5000,
-      resumeFrom,
-    });
+    try {
+      await session.start({
+        authorization,
+        bufferWindowMs: options.bufferWindowMs ?? 5000,
+        resumeFrom,
+      });
+    } catch (err) {
+      // session.start() threw — reject the pending connect promise so that
+      // connect() doesn't hang forever, then tear down the WebSocket.
+      const error = err instanceof Error ? err : new Error(String(err));
+      const pending = this.pendingConnect;
+      this.pendingConnect = undefined;
+      pending?.reject(error);
+      await wsClient.close(4002, "Session start failed");
+      return;
+    }
 
     // Receive loop — exits on clean close or error/abnormal close
     try {
@@ -410,7 +421,7 @@ export class CulpeoStreamClient extends TypedEventEmitter<ClientEventMap> {
           const frame = msg.binary
             ? parseFrame(new Uint8Array(msg.data as ArrayBuffer), "binary")
             : parseFrame(msg.data as string, "text");
-          void session.receive(frame);
+          await session.receive(frame);
         } catch (err) {
           this.emit(
             "error",

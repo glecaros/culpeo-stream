@@ -92,7 +92,12 @@ internal sealed class DiagnosticInfo : IEquatable<DiagnosticInfo>
         Severity == other.Severity &&
         FilePath == other.FilePath &&
         Line == other.Line &&
-        Column == other.Column;
+        Column == other.Column &&
+        // Include MessageArgs so that incremental cache misses when only the args change
+        // (e.g. class name changes while other fields stay the same). See Phase 5 review F8.
+        (MessageArgs is null
+            ? other.MessageArgs is null
+            : other.MessageArgs is not null && MessageArgs.SequenceEqual(other.MessageArgs));
 
     public override bool Equals(object? obj) => Equals(obj as DiagnosticInfo);
 
@@ -106,6 +111,10 @@ internal sealed class DiagnosticInfo : IEquatable<DiagnosticInfo>
             hash = (hash * 31) ^ (FilePath?.GetHashCode() ?? 0);
             hash = (hash * 31) ^ Line;
             hash = (hash * 31) ^ Column;
+            // Include MessageArgs to match Equals (F8)
+            if (MessageArgs is not null)
+                foreach (var arg in MessageArgs)
+                    hash = (hash * 31) ^ (arg?.GetHashCode() ?? 0);
             return hash;
         }
     }

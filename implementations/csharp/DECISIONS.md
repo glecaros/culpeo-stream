@@ -827,3 +827,109 @@ The meta-test runs `dotnet publish` which takes ~30 seconds. It is tagged `[Trai
 
 ### Spec Reference
 Phase 5 specification — NativeAOT test project
+
+---
+
+## Phase 5 Review Fixes — HandleMediaAsync dispatch via hint map (Finding 1)
+**Date:** 2026-05-28
+**Phase:** Phase 5 — NativeAOT + Source Generators
+**Status:** Decided
+
+### Context
+The generated `HandleMediaAsync` previously dispatched by matching `streamId` against the user-provided hint strings (e.g. `"audio-in"`). However, the server assigns random opaque hex IDs to streams and ignores `IdHint`; no incoming media frame ever matched a generated case arm — everything fell to `OnUnknownStreamAsync`.
+
+### Decision
+Option C/A hybrid: the generator now emits:
+1. A `_culpeo_streamIdMap` dictionary (hint → server-assigned ID).
+2. A `protected void CulpeoRegisterStreamIds(ICulpeoStreamSession session)` method that the handler calls from `OnConnectedAsync`. It iterates `session.Streams` and matches each to a declared stream by content type + stream type + purpose, populating the map.
+3. `HandleMediaAsync` does a reverse linear scan over the (small) map to find the hint for a given server-assigned ID, then dispatches by hint via a switch expression.
+
+This is NativeAOT-safe (no reflection), allocation-minimal (one small dictionary per session), and self-documenting.
+
+### Tradeoffs
+- Users must call `CulpeoRegisterStreamIds(session)` in `OnConnectedAsync`; forgetting it means all frames go to `OnUnknownStreamAsync`. The generated XML doc comment makes this requirement explicit.
+- O(n) linear scan per frame (n ≤ 16 streams) is negligible compared to the WebSocket I/O cost.
+
+### Spec Reference
+§8.2 (media frame routing)
+
+---
+
+## Phase 5 Review Fixes — CULPEO004 method suffix collision (Finding 2)
+**Date:** 2026-05-28
+**Phase:** Phase 5 — NativeAOT + Source Generators
+**Status:** Decided
+
+### Context
+Two streams whose IDs differ only in separator (e.g. `"audio-in"` and `"audio.in"`) produce the same `SafeMethodSuffix = "AudioIn"`, yielding CS0111 (duplicate method) with no helpful diagnostic.
+
+### Decision
+After building the stream list in `TransformHandler`, iterate all computed suffixes and detect first-seen vs duplicate. On collision: emit CULPEO004 (Error) naming both colliding IDs and the shared suffix. Because `hasErrors` is true, generation is suppressed — the broken partial class is never emitted.
+
+### Tradeoffs
+None significant. The check is O(n) over a small list and runs at analysis time only.
+
+### Spec Reference
+N/A (generator quality)
+
+---
+
+## Phase 5 Review Fixes — FQN checks for interface/attribute/type matching (Finding 7)
+**Date:** 2026-05-28
+**Phase:** Phase 5 — NativeAOT + Source Generators
+**Status:** Decided
+
+### Context
+Simple `.Name` comparisons (`iface.Name == "ICulpeoStreamHandler"`, `attr.AttributeClass?.Name == "DeclareStreamAttribute"`, `field.Type.Name != "StreamDeclaration"`) would falsely match user-defined types in different namespaces that happen to share the same simple name.
+
+### Decision
+Replaced all three with fully-qualified display-string comparisons using `symbol.ToDisplayString()`:
+- `"CulpeoStream.AspNetCore.ICulpeoStreamHandler"`
+- `"CulpeoStream.Generated.DeclareStreamAttribute"`
+- `"CulpeoStream.Core.StreamDeclaration"`
+
+### Tradeoffs
+None. More precise matching is always better for a source generator.
+
+### Spec Reference
+N/A (generator correctness)
+
+---
+
+## Phase 5 Review Fixes — JSON AOT safety in CulpeoStreamClient (Finding 4)
+**Date:** 2026-05-28
+**Phase:** Phase 5 — NativeAOT + Source Generators
+**Status:** Decided
+
+### Context
+Three `JsonSerializer.Serialize(...)` calls in `CulpeoStreamClient.cs` used anonymous types or `object?`, which rely on reflection and are stripped by ILC/NativeAOT.
+
+### Decision
+1. Created `AuthResponseBody` and `PongBody` named records to replace the two anonymous types.
+2. Created `CulpeoClientJsonContext : JsonSerializerContext` with `[JsonSerializable]` for both record types, providing source-generated serialization.
+3. Changed `SendEventAsync(string eventName, object? body, ...)` to `SendEventAsync(string eventName, string jsonBody = "{}", ...)`. This matches the server-side `ICulpeoStreamSession.SendEventAsync` signature and eliminates the `object?`-polymorphic serialization. Callers now pre-serialize to JSON (breaking change, but aligned with the server API design).
+
+### Tradeoffs
+`SendEventAsync` is a public API change. Callers that passed anonymous types must now pass pre-serialized JSON. The server-side equivalent already used `string jsonBody`, so this is consistent.
+
+### Spec Reference
+Phase 5 — NativeAOT / trim safety requirement
+
+---
+
+## Phase 5 Review Fixes — Protocol events removed from generated OnMessageAsync (Finding 9)
+**Date:** 2026-05-28
+**Phase:** Phase 5 — NativeAOT + Source Generators
+**Status:** Decided
+
+### Context
+The generated `OnMessageAsync` switch contained eight `culpeo.*` arms that could never be reached: the middleware handles all protocol events before calling `ICulpeoStreamHandler.OnEventAsync`, which is only invoked for application-defined (non-`culpeo.`) events.
+
+### Decision
+Removed all eight `culpeo.*` arms from the generated `OnMessageAsync` switch. Also removed the eight corresponding virtual stubs (they were dead code). Added a class-level XML doc comment explaining that protocol events are middleware-handled and will never reach `OnMessageAsync`.
+
+### Tradeoffs
+Users who had overridden the `OnCulpeoInitAsync` etc. stubs (which had no effect) will get a compile error pointing to dead code. This is the correct behaviour — the dead overrides should be removed.
+
+### Spec Reference
+§5 (session lifecycle — middleware responsibility)

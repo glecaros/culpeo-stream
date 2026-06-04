@@ -466,17 +466,26 @@ struct Session::Impl {
 
         // ── Auth validation ───────────────────────────────────────────────────
         // Bearer token must NOT be logged (spec §A.6)
+        // Unlock before invoking the callback to avoid deadlock if the
+        // callback re-enters the session (same pattern as on_auth_response).
         bool auth_ok = true;
         if (callbacks.on_auth_validate) {
-            std::string_view bearer;
+            std::string bearer_str; // copy so it is valid after lock release
             if (f.authorization.has_value()) {
                 const auto& auth_val = *f.authorization;
                 constexpr std::string_view bearer_prefix = "Bearer ";
                 if (auth_val.starts_with(bearer_prefix)) {
-                    bearer = auth_val.substr(bearer_prefix.size());
+                    bearer_str = std::string(auth_val.substr(bearer_prefix.size()));
                 }
             }
-            auth_ok = callbacks.on_auth_validate(bearer);
+            auto cb = callbacks.on_auth_validate;
+            lock.unlock();
+            auth_ok = cb(bearer_str);
+            // Relock after callback returns; re-check state in case close raced.
+            lock = std::unique_lock<std::mutex>(mutex);
+            if (state == SessionState::closed) {
+                return std::unexpected(Error::auth_failed);
+            }
         }
 
         if (!auth_ok) {

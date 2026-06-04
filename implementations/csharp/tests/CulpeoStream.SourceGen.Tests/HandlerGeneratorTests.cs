@@ -162,9 +162,13 @@ public sealed class HandlerGeneratorTests
         var generated = sources["OneStreamHandler_CulpeoGenerated.g.cs"];
 
         Assert.Contains("audio/pcm", generated);
-        Assert.Contains("audio-in", generated);
         Assert.Contains("OnAudioInAsync", generated);
         Assert.DoesNotContain("Array.Empty", generated);
+
+        // F1: must generate CulpeoRegisterStreamIds and use reverse-lookup dispatch
+        Assert.Contains("CulpeoRegisterStreamIds", generated);
+        Assert.Contains("_culpeo_streamIdMap", generated);
+        Assert.Contains("audio-in", generated); // hint used in registration + dispatch
     }
 
     [Fact]
@@ -292,10 +296,65 @@ public sealed class HandlerGeneratorTests
         Assert.NotEmpty(diagnostics.Where(d => d.Id == "CULPEO003"));
     }
 
+    [Fact]
+    public void SuffixCollision_ProducesCULPEO004_AndNoSource()
+    {
+        // F2: "audio-in" and "audio.in" both normalise to SafeMethodSuffix "AudioIn",
+        // producing CS0111 if emitted. The generator must detect this and emit CULPEO004.
+        var source =
+            Preamble +
+            "[CulpeoStreamHandler]\n" +
+            "public partial class SuffixCollisionHandler : ICulpeoStreamHandler\n" +
+            "{\n" +
+            "    [DeclareStream(\"audio-in\", CulpeoStreamType.Input, OffsetType.Byte, \"audio/opus\")]\n" +
+            "    private StreamDeclaration _audioIn = default!;\n" +
+            "    [DeclareStream(\"audio.in\", CulpeoStreamType.Output, OffsetType.Byte, \"audio/opus\")]\n" +
+            "    private StreamDeclaration _audioIn2 = default!;\n" +
+            HandlerMembers +
+            "}\n";
+
+        var (sources, diagnostics) = RunGenerator(source);
+        // Must produce CULPEO004 error
+        Assert.NotEmpty(diagnostics.Where(d => d.Id == "CULPEO004"));
+        // Must NOT emit the broken partial class (would produce CS0111)
+        Assert.DoesNotContain("SuffixCollisionHandler_CulpeoGenerated.g.cs", sources.Keys);
+    }
+
     // ── Tests: generated content quality ─────────────────────────────────────
 
     [Fact]
-    public void GeneratedCode_ContainsAllProtocolEventDispatches()
+    public void GeneratedCode_DoesNotDispatchProtocolEvents_MiddlewareOwned()
+    {
+        // F9: protocol events (culpeo.*) are handled by middleware and must NOT
+        // appear as switch arms in the generated OnMessageAsync dispatch.
+        var source =
+            Preamble +
+            "[CulpeoStreamHandler]\n" +
+            "public partial class FullHandler : ICulpeoStreamHandler\n" +
+            "{\n" +
+            HandlerMembers +
+            "}\n";
+
+        var (sources, _) = RunGenerator(source);
+        var generated = sources["FullHandler_CulpeoGenerated.g.cs"];
+
+        // Protocol event names must NOT be dispatch arms
+        Assert.DoesNotContain("\"culpeo.init\"", generated);
+        Assert.DoesNotContain("\"culpeo.ping\"", generated);
+        Assert.DoesNotContain("\"culpeo.auth-refresh\"", generated);
+        Assert.DoesNotContain("\"culpeo.close\"", generated);
+
+        // Application event fallback must still be present
+        Assert.Contains("OnUnknownEventAsync", generated);
+        Assert.Contains("OnUnknownStreamAsync", generated);
+
+        // Must contain the middleware explanation comment
+        Assert.Contains("culpeo.*", generated);
+        Assert.Contains("middleware", generated);
+    }
+
+    [Fact]
+    public void GeneratedCode_ContainsAllDispatchInfrastructure()
     {
         var source =
             Preamble +
@@ -308,10 +367,9 @@ public sealed class HandlerGeneratorTests
         var (sources, _) = RunGenerator(source);
         var generated = sources["FullHandler_CulpeoGenerated.g.cs"];
 
-        Assert.Contains("\"culpeo.init\"", generated);
-        Assert.Contains("\"culpeo.ping\"", generated);
-        Assert.Contains("\"culpeo.auth-refresh\"", generated);
-        Assert.Contains("\"culpeo.close\"", generated);
+        Assert.Contains("RegisteredStreams", generated);
+        Assert.Contains("OnMessageAsync", generated);
+        Assert.Contains("HandleMediaAsync", generated);
         Assert.Contains("OnUnknownEventAsync", generated);
         Assert.Contains("OnUnknownStreamAsync", generated);
     }

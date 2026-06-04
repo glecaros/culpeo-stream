@@ -211,33 +211,36 @@ function serializeFrameWasm(
     off += seg.length;
   }
 
-  // Allocate WASM heap buffers
-  const stringsBufPtr = copyToHeap(mod, stringsBuf);
-  const bodyPtr = body.length > 0 ? copyToHeap(mod, body) : 0;
-  const structsPtr = mod._malloc(headers.length * HEADER_STRUCT_SIZE || 1);
-  if (structsPtr === 0) {
-    mod._free(stringsBufPtr);
-    if (bodyPtr !== 0) mod._free(bodyPtr);
-    throw new Error("culpeostream-wasm: malloc failed for header structs");
-  }
-
-  // Calculate required output size (match C formula):
-  // per header: key_len + 2 + val_len + 2; plus 2 (\r\n); plus body_len
-  let outCap = 2 + body.length;
-  for (const d of headerDescs) {
-    outCap += d.keyLen + 2 + d.valLen + 2;
-  }
-  const outPtr = mod._malloc(outCap || 2);
-  if (outPtr === 0) {
-    mod._free(structsPtr);
-    mod._free(stringsBufPtr);
-    if (bodyPtr !== 0) mod._free(bodyPtr);
-    throw new Error("culpeostream-wasm: malloc failed for output buffer");
-  }
-
+  // Allocate WASM heap buffers — all inside a single try/finally so that
+  // every non-zero pointer is freed even if a later allocation or the C call
+  // throws.  (If copyToHeap for bodyPtr threw before this block, stringsBufPtr
+  // would have been leaked; the try/finally below closes that window.)
+  let stringsBufPtr = 0;
+  let bodyPtr = 0;
+  let structsPtr = 0;
+  let outPtr = 0;
   let result: Uint8Array;
 
   try {
+    stringsBufPtr = copyToHeap(mod, stringsBuf);
+    bodyPtr = body.length > 0 ? copyToHeap(mod, body) : 0;
+
+    structsPtr = mod._malloc(headers.length * HEADER_STRUCT_SIZE || 1);
+    if (structsPtr === 0) {
+      throw new Error("culpeostream-wasm: malloc failed for header structs");
+    }
+
+    // Calculate required output size (match C formula):
+    // per header: key_len + 2 + val_len + 2; plus 2 (\r\n); plus body_len
+    let outCap = 2 + body.length;
+    for (const d of headerDescs) {
+      outCap += d.keyLen + 2 + d.valLen + 2;
+    }
+    outPtr = mod._malloc(outCap || 2);
+    if (outPtr === 0) {
+      throw new Error("culpeostream-wasm: malloc failed for output buffer");
+    }
+
     // Write header structs into WASM heap
     for (let i = 0; i < headerDescs.length; i++) {
       const d = headerDescs[i]!;
@@ -252,6 +255,7 @@ function serializeFrameWasm(
       structsPtr,
       headers.length,
       stringsBufPtr,
+      stringsBuf.byteLength,
       bodyPtr,
       body.length,
       outPtr,
@@ -264,10 +268,10 @@ function serializeFrameWasm(
 
     result = mod.HEAPU8.slice(outPtr, outPtr + written);
   } finally {
-    mod._free(outPtr);
-    mod._free(structsPtr);
-    if (bodyPtr !== 0) mod._free(bodyPtr);
-    mod._free(stringsBufPtr);
+    if (outPtr) mod._free(outPtr);
+    if (structsPtr) mod._free(structsPtr);
+    if (bodyPtr) mod._free(bodyPtr);
+    if (stringsBufPtr) mod._free(stringsBufPtr);
   }
 
   return result;

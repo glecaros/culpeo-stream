@@ -350,9 +350,12 @@ class ServerConnection {
             await this.coreSession.receive(frame);
           }
         } catch (err) {
-          const reason =
-            err instanceof Error ? err.message.slice(0, 123) : "Protocol error";
-          await this.wsClient.close(4002, reason);
+          // SECURITY: log the real error server-side only; never send internal
+          // details (stream IDs, offsets, state names) to the remote peer.
+          // Auth tokens must never appear here — CulpeoError already guarantees
+          // that; but we still keep the close reason generic.
+          console.error("[culpeostream-server] Protocol error:", err);
+          await this.wsClient.close(4002, "Protocol error");
           break;
         }
       }
@@ -524,8 +527,11 @@ class ServerConnection {
       }
 
       case "close": {
-        // Client sent culpeo.close — save state and close the WebSocket.
-        await this.saveSnapshot();
+        // Client sent culpeo.close — close the WebSocket.
+        // saveSnapshot() is called unconditionally in handleWsClose() when
+        // the connection tears down, so we must NOT call it here too — doing
+        // so would double-write to external session stores that use
+        // optimistic locking (SEC-020 / Finding 5).
         await this.wsClient.close(1000, n.frame.headers.reason);
         break;
       }

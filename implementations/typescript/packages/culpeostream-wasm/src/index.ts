@@ -45,6 +45,13 @@ const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
 /**
+ * Maximum number of bytes scanned for the \r\n\r\n header terminator.
+ * Matches libculpeo-message's `header_block_max` (16 KiB) so that the
+ * TypeScript fallback enforces the same limit as the WASM path.
+ */
+const MAX_HEADER_SCAN = 16 * 1024;
+
+/**
  * Pure-TypeScript implementation of header parsing.
  * Used when WASM is unavailable.
  */
@@ -52,9 +59,11 @@ function parseHeadersTs(buf: Uint8Array): {
   headers: ReadonlyArray<readonly [string, string]>;
   bodyOffset: number;
 } | null {
-  // Locate \r\n\r\n
+  // Locate \r\n\r\n — only scan up to MAX_HEADER_SCAN bytes so that a
+  // malicious or malformed message with no terminator cannot force an O(n)
+  // scan over an arbitrarily large buffer.
   let termPos = -1;
-  const searchLen = Math.min(buf.length, buf.length);
+  const searchLen = Math.min(buf.length, MAX_HEADER_SCAN);
   for (let i = 0; i <= searchLen - 4; i++) {
     if (
       buf[i] === 13 &&

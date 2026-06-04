@@ -1183,3 +1183,78 @@ run all other tests in the ASan build (verified no sanitizer errors).
 
 ### Spec Reference
 C++ agent instructions Phase 5 — Sanitizer-clean requirement
+
+## Phase 5 security review fixes (Phase 5 post-review)
+**Date:** 2026-06-02
+**Phase:** Phase 5 — Python Bindings
+**Status:** Decided
+
+### Context
+The Security Agent's Phase 5 review identified seven findings (HIGH/MEDIUM/LOW)
+spanning the Python bindings, the C API, and the session layer.
+
+### Decision — Finding 1 (HIGH): noexcept boundary fix
+All five Python callback lambdas (`on_auth_validate`, `on_media_received`,
+`on_close`, `on_rtt`, `on_auth_response`) are now marked `noexcept` and
+wrapped in `try/catch (py::error_already_set&)` + `try/catch (std::exception&)`.
+On error: auth callbacks return `false` (deny); void callbacks call
+`e.restore()` + `PyErr_Print()` and return.  This prevents `std::terminate()`
+when Python callables raise.
+
+### Decision — Finding 2 (HIGH): PyServerTransport TOCTOU + dangling pointer
+Replaced the `valid_` atomic + `check_valid()` + pointer dereference pattern
+with a `send_mutex_` protecting check-and-use atomically.  `set_eof()` now
+nulls out `transport_` and `ioc_` under the same mutex before closing the
+rx_queue.  `std::optional<asio::awaitable<void>>` captures the lazy awaitable
+while the mutex is held; the future is waited outside the lock.  This
+eliminates both the TOCTOU race and the use-after-free.
+
+### Decision — Finding 3 (HIGH/Security): c_api null body + bounds check
+Added `if (body_len > 0 && body == nullptr) return -1` guard.
+Added `strings_buf_len` parameter to `culpeo_serialize_frame`; each
+header's `key_offset+key_len` and `val_offset+val_len` are validated
+against `strings_buf_len` before any pointer arithmetic — returns `-2` on
+violation.  The TypeScript WASM caller passes `stringsBuf.byteLength`.
+
+### Decision — Finding 4 (MEDIUM): on_auth_validate deadlock
+`on_auth_validate` in `session.cpp` was called while the session mutex was
+held.  Fixed to copy the bearer token to a `std::string`, unlock the mutex,
+call the callback, then relock.  Recheck `state == closed` after relocking
+in case close raced the callback.  This matches the existing pattern for
+`on_auth_response`.
+
+### Decision — Finding 5 (MEDIUM/Security): on_auth_validate=None allow-all
+The Python binding now throws `py::value_error` if `on_auth_validate` is
+`None`, because the C++ session defaults to allow-all when no validator is
+set.  Users who intentionally want allow-all must pass `lambda token: True`
+explicitly, making the intent visible in code review.
+
+### Decision — Finding 6 (LOW): error code -3 doc mismatch
+Updated `c_api.h` comment for `-3` to read: "Header block too large (byte
+limit) or header count exceeds max_headers."  The old text said "Header
+count exceeds max_headers or internal limit (64)" which omitted the
+byte-limit case.
+
+### Decision — Finding 7 (LOW): int truncation in culpeo_serialize_frame
+Added `if (*written > (size_t)INT_MAX) return -4` before the
+`static_cast<int>(*written)` return.  Documented `-4` in `c_api.h` as
+"output too large to represent as int (> INT_MAX bytes)."
+
+### Tradeoffs
+Finding 2: the mutex approach is slightly less lock-free than the original
+atomic, but correctness requires it — atomics cannot protect the compound
+check+dereference.  The lock is held only during coroutine construction
+(cheap), not during the async I/O wait.
+
+Finding 4: unlocking around `on_auth_validate` means concurrent frames could
+arrive during auth validation.  The relock + `state == closed` check handles
+this correctly; other concurrent frames that arrive during the window are
+queued behind the session mutex and will be processed normally after
+re-acquisition.
+
+Finding 3 (strings_buf_len): this is an ABI break for any WASM callers. The
+TypeScript wasm-loader.ts is updated in the same commit.
+
+### Spec Reference
+C++ agent instructions Phase 5 — Security requirements, noexcept callbacks,
+session mutex policy

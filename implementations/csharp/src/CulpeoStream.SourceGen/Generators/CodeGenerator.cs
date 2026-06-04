@@ -9,18 +9,6 @@ namespace CulpeoStream.SourceGen.Generators;
 /// </summary>
 internal static class CodeGenerator
 {
-    private static readonly string[] ProtocolEvents =
-    [
-        "culpeo.init",
-        "culpeo.init-ack",
-        "culpeo.init-error",
-        "culpeo.ping",
-        "culpeo.pong",
-        "culpeo.auth-refresh",
-        "culpeo.auth-response",
-        "culpeo.close",
-    ];
-
     public static string Generate(HandlerDescriptor descriptor)
     {
         var sb = new StringBuilder();
@@ -39,6 +27,16 @@ internal static class CodeGenerator
 
         string indent = hasNamespace ? "    " : "";
 
+        // F9: emit a doc comment explaining that protocol events are middleware-handled
+        sb.Append(indent).AppendLine("/// <summary>");
+        sb.Append(indent).AppendLine("/// Generated CulpeoStream dispatch infrastructure for this handler.");
+        sb.Append(indent).AppendLine("/// <para>");
+        sb.Append(indent).AppendLine("/// <b>Note:</b> Protocol events (<c>culpeo.*</c>) are consumed by the");
+        sb.Append(indent).AppendLine("/// CulpeoStream middleware before reaching application code and will");
+        sb.Append(indent).AppendLine("/// <em>never</em> be passed to <see cref=\"OnMessageAsync\"/>.");
+        sb.Append(indent).AppendLine("/// Only application-defined events (non-<c>culpeo.</c> namespace) are routed here.");
+        sb.Append(indent).AppendLine("/// </para>");
+        sb.Append(indent).AppendLine("/// </summary>");
         sb.Append(indent).Append("partial class ").AppendLine(descriptor.ClassName);
         sb.Append(indent).AppendLine("{");
 
@@ -83,13 +81,56 @@ internal static class CodeGenerator
         sb.Append(i2).AppendLine("public global::System.Collections.Generic.IReadOnlyList<global::CulpeoStream.Core.StreamDeclaration> RegisteredStreams");
         sb.Append(i2).AppendLine("    => _culpeo_registeredStreams;");
 
+        // ── F1: Stream ID resolution map (hint → server-assigned ID) ──────
+
+        if (descriptor.Streams.Length > 0)
+        {
+            sb.AppendLine();
+            sb.Append(i2).AppendLine("// ── F1: hint→assigned-ID map (populated by CulpeoRegisterStreamIds) ──────────");
+            sb.Append(i2).AppendLine("/// <summary>Maps each <c>[DeclareStream]</c> hint to the server-assigned stream ID.</summary>");
+            sb.Append(i2).AppendLine("private readonly global::System.Collections.Generic.Dictionary<string, string> _culpeo_streamIdMap =");
+            sb.Append(i3).AppendLine("new global::System.Collections.Generic.Dictionary<string, string>(global::System.StringComparer.Ordinal);");
+
+            sb.AppendLine();
+            sb.Append(i2).AppendLine("/// <summary>");
+            sb.Append(i2).AppendLine("/// Resolves the server-assigned stream IDs by matching declared streams to the");
+            sb.Append(i2).AppendLine("/// session's confirmed stream list. Call this from");
+            sb.Append(i2).AppendLine("/// <see cref=\"global::CulpeoStream.AspNetCore.ICulpeoStreamHandler.OnConnectedAsync\"/>");
+            sb.Append(i2).AppendLine("/// so that <see cref=\"HandleMediaAsync\"/> can dispatch correctly.");
+            sb.Append(i2).AppendLine("/// </summary>");
+            sb.Append(i2).AppendLine("protected void CulpeoRegisterStreamIds(global::CulpeoStream.AspNetCore.ICulpeoStreamSession session)");
+            sb.Append(i2).AppendLine("{");
+            sb.Append(i3).AppendLine("_culpeo_streamIdMap.Clear();");
+            sb.Append(i3).AppendLine("foreach (var stream in session.Streams)");
+            sb.Append(i3).AppendLine("{");
+            foreach (var stream in descriptor.Streams)
+            {
+                var streamTypeExpr = StreamTypeExpression(stream.StreamType);
+                var offsetTypeExpr = OffsetTypeExpression(stream.OffsetType);
+                var purposeCheck = stream.Purpose is null
+                    ? "stream.Purpose is null"
+                    : $"stream.Purpose == \"{EscapeString(stream.Purpose)}\"";
+                sb.Append(i4).AppendLine($"if (stream.ContentType == \"{EscapeString(stream.ContentType)}\"");
+                sb.Append(i4).AppendLine($"    && stream.Type == {streamTypeExpr}");
+                sb.Append(i4).AppendLine($"    && {purposeCheck}");
+                sb.Append(i4).AppendLine($"    && !_culpeo_streamIdMap.ContainsKey(\"{EscapeString(stream.Id)}\"))");
+                sb.Append(i4).AppendLine("{");
+                sb.Append(i4).AppendLine($"    _culpeo_streamIdMap[\"{EscapeString(stream.Id)}\"] = stream.Id;");
+                sb.Append(i4).AppendLine("    continue;");
+                sb.Append(i4).AppendLine("}");
+            }
+            sb.Append(i3).AppendLine("}");
+            sb.Append(i2).AppendLine("}");
+        }
+
         // ── OnMessageAsync ────────────────────────────────────────────────
 
         sb.AppendLine();
         sb.Append(i2).AppendLine("// ── OnMessageAsync — generated switch-expression dispatch (no dictionary, no reflection) ─");
         sb.Append(i2).AppendLine("/// <summary>");
-        sb.Append(i2).AppendLine("/// Dispatches an incoming event by name to the appropriate typed virtual method.");
-        sb.Append(i2).AppendLine("/// Call this from <see cref=\"global::CulpeoStream.AspNetCore.ICulpeoStreamHandler.OnEventAsync\"/>.");
+        sb.Append(i2).AppendLine("/// Dispatches an incoming application event by name to the appropriate typed virtual method.");
+        sb.Append(i2).AppendLine("/// Protocol events (<c>culpeo.*</c>) are handled by the middleware and will never");
+        sb.Append(i2).AppendLine("/// reach this method. Call this from <see cref=\"global::CulpeoStream.AspNetCore.ICulpeoStreamHandler.OnEventAsync\"/>.");
         sb.Append(i2).AppendLine("/// </summary>");
         sb.Append(i2).AppendLine("public global::System.Threading.Tasks.Task OnMessageAsync(");
         sb.Append(i2).AppendLine("    string eventName,");
@@ -98,20 +139,18 @@ internal static class CodeGenerator
         sb.Append(i2).AppendLine("    global::System.Threading.CancellationToken cancellationToken = default)");
         sb.Append(i2).AppendLine("    => eventName switch");
         sb.Append(i2).AppendLine("    {");
-        foreach (var evt in ProtocolEvents)
-        {
-            var methodName = EventToMethodName(evt);
-            sb.Append(i3).Append($"\"{evt}\" => {methodName}(jsonBody, cancellationToken),").AppendLine();
-        }
+        // F9: no culpeo.* arms — those are middleware-only
         sb.Append(i3).AppendLine("_ => OnUnknownEventAsync(eventName, jsonBody, streamId, cancellationToken),");
         sb.Append(i2).AppendLine("    };");
 
         // ── HandleMediaAsync ──────────────────────────────────────────────
 
         sb.AppendLine();
-        sb.Append(i2).AppendLine("// ── HandleMediaAsync — generated switch dispatch over stream IDs ──────────────");
+        sb.Append(i2).AppendLine("// ── HandleMediaAsync — dispatches by server-assigned stream ID via CulpeoRegisterStreamIds ─");
         sb.Append(i2).AppendLine("/// <summary>");
         sb.Append(i2).AppendLine("/// Routes an incoming media frame to the appropriate per-stream virtual method.");
+        sb.Append(i2).AppendLine("/// Requires that <see cref=\"CulpeoRegisterStreamIds\"/> was called in");
+        sb.Append(i2).AppendLine("/// <c>OnConnectedAsync</c> so that server-assigned IDs are known.");
         sb.Append(i2).AppendLine("/// Call this from <see cref=\"global::CulpeoStream.AspNetCore.ICulpeoStreamHandler.OnMediaFrameAsync\"/>.");
         sb.Append(i2).AppendLine("/// </summary>");
         sb.Append(i2).AppendLine("public global::System.Threading.Tasks.Task HandleMediaAsync(");
@@ -119,31 +158,41 @@ internal static class CodeGenerator
         sb.Append(i2).AppendLine("    global::System.ReadOnlyMemory<byte> payload,");
         sb.Append(i2).AppendLine("    long offset,");
         sb.Append(i2).AppendLine("    global::System.Threading.CancellationToken cancellationToken = default)");
-        sb.Append(i2).AppendLine("    => streamId switch");
-        sb.Append(i2).AppendLine("    {");
-        foreach (var stream in descriptor.Streams)
-        {
-            var methodName = $"On{stream.SafeMethodSuffix}Async";
-            sb.Append(i3).Append($"\"{EscapeString(stream.Id)}\" => {methodName}(payload, offset, cancellationToken),").AppendLine();
-        }
-        sb.Append(i3).AppendLine("_ => OnUnknownStreamAsync(streamId, payload, offset, cancellationToken),");
-        sb.Append(i2).AppendLine("    };");
+        sb.Append(i2).AppendLine("{");
 
-        // ── Virtual stubs for event handlers ─────────────────────────────
+        if (descriptor.Streams.Length == 0)
+        {
+            // No declared streams — everything falls through
+            sb.Append(i3).AppendLine("return OnUnknownStreamAsync(streamId, payload, offset, cancellationToken);");
+        }
+        else
+        {
+            // F1: reverse-lookup: find the hint whose assigned ID matches the incoming streamId,
+            // then dispatch by hint. O(n) linear scan over a small set (1–16 streams).
+            sb.Append(i3).AppendLine("string? hint = null;");
+            sb.Append(i3).AppendLine("foreach (var kv in _culpeo_streamIdMap)");
+            sb.Append(i3).AppendLine("{");
+            sb.Append(i4).AppendLine("if (global::System.StringComparer.Ordinal.Equals(kv.Value, streamId)) { hint = kv.Key; break; }");
+            sb.Append(i3).AppendLine("}");
+            sb.Append(i3).AppendLine("return hint switch");
+            sb.Append(i3).AppendLine("{");
+            foreach (var stream in descriptor.Streams)
+            {
+                var methodName = $"On{stream.SafeMethodSuffix}Async";
+                sb.Append(i4).Append($"\"{EscapeString(stream.Id)}\" => {methodName}(payload, offset, cancellationToken),").AppendLine();
+            }
+            sb.Append(i4).AppendLine("_ => OnUnknownStreamAsync(streamId, payload, offset, cancellationToken),");
+            sb.Append(i3).AppendLine("};");
+        }
+
+        sb.Append(i2).AppendLine("}");
+
+        // ── Virtual stub for unknown events ───────────────────────────────
 
         sb.AppendLine();
-        sb.Append(i2).AppendLine("// ── Protocol event stubs — override to handle specific protocol messages ─────");
+        sb.Append(i2).AppendLine("// ── Event handler stub — override to handle application events ───────────────");
 
-        foreach (var evt in ProtocolEvents)
-        {
-            var methodName = EventToMethodName(evt);
-            sb.Append(i2).AppendLine($"/// <summary>Called when event <c>\"{evt}\"</c> is received. Override to handle it.</summary>");
-            sb.Append(i2).AppendLine($"protected virtual global::System.Threading.Tasks.Task {methodName}(string jsonBody, global::System.Threading.CancellationToken cancellationToken)");
-            sb.Append(i2).AppendLine($"    => global::System.Threading.Tasks.Task.CompletedTask;");
-            sb.AppendLine();
-        }
-
-        sb.Append(i2).AppendLine("/// <summary>Called for unrecognised event names. Override to handle custom application events.</summary>");
+        sb.Append(i2).AppendLine("/// <summary>Called for unrecognised (application-defined) event names. Override to handle custom application events.</summary>");
         sb.Append(i2).AppendLine("protected virtual global::System.Threading.Tasks.Task OnUnknownEventAsync(string eventName, string jsonBody, string? streamId, global::System.Threading.CancellationToken cancellationToken)");
         sb.Append(i2).AppendLine("    => global::System.Threading.Tasks.Task.CompletedTask;");
 
@@ -176,28 +225,6 @@ internal static class CodeGenerator
             sb.AppendLine("}");
         }
 
-        return sb.ToString();
-    }
-
-    private static string EventToMethodName(string eventName)
-    {
-        // "culpeo.init" → "OnCulpeoInitAsync"
-        // "culpeo.init-ack" → "OnCulpeoInitAckAsync"
-        var sb = new StringBuilder("On");
-        bool capitalizeNext = true;
-        foreach (char c in eventName)
-        {
-            if (c == '.' || c == '-')
-            {
-                capitalizeNext = true;
-            }
-            else if (char.IsLetterOrDigit(c))
-            {
-                sb.Append(capitalizeNext ? char.ToUpperInvariant(c) : c);
-                capitalizeNext = false;
-            }
-        }
-        sb.Append("Async");
         return sb.ToString();
     }
 

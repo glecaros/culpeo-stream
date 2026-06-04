@@ -249,9 +249,25 @@ class TestSessionLifecycle:
     def test_initial_state_is_uninitialized(self):
         mock = RecordingTransport()
         transport = mock.make_ws_transport()
-        session = culpeostream.Session(transport=transport)
+        # on_auth_validate is now required (Finding 5 fix: None silently allowed
+        # all connections).  Pass an allow-all lambda for this state-check test.
+        session = culpeostream.Session(
+            transport=transport,
+            on_auth_validate=lambda token: True,
+        )
         assert session.state() == culpeostream.SessionState.uninitialized
         assert session.session_id() is None
+
+    def test_auth_validate_none_raises_value_error(self):
+        """Passing on_auth_validate=None must raise ValueError (Finding 5 fix).
+
+        The C++ session defaults to allow-all when no validator is set.
+        The binding now rejects None explicitly to prevent silent auth bypass.
+        """
+        mock = RecordingTransport()
+        transport = mock.make_ws_transport()
+        with pytest.raises(ValueError, match="on_auth_validate is required"):
+            culpeostream.Session(transport=transport)  # no on_auth_validate
 
     def test_init_transitions_to_established(self):
         mock, transport, session = make_established_session()

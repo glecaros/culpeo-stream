@@ -33,7 +33,10 @@ public sealed class HandlerGenerator : IIncrementalGenerator
     // ── Attribute fully-qualified names ─────────────────────────────────────────
 
     private const string HandlerAttrFqn = "CulpeoStream.Generated.CulpeoStreamHandlerAttribute";
-    private const string DeclareStreamAttrName = "DeclareStreamAttribute";
+    // F7: use fully-qualified names to avoid false matches from user-defined types with the same simple name.
+    private const string DeclareStreamAttrFqn = "CulpeoStream.Generated.DeclareStreamAttribute";
+    private const string ICulpeoStreamHandlerFqn = "CulpeoStream.AspNetCore.ICulpeoStreamHandler";
+    private const string StreamDeclarationFqn = "CulpeoStream.Core.StreamDeclaration";
 
     // ── Diagnostic descriptors ────────────────────────────────────────────────
 
@@ -59,6 +62,15 @@ public sealed class HandlerGenerator : IIncrementalGenerator
         messageFormat: "Field '{0}' is annotated with [DeclareStream] but its type is not StreamDeclaration",
         category: "CulpeoStream",
         defaultSeverity: DiagnosticSeverity.Warning,
+        isEnabledByDefault: true);
+
+    // F2: method-suffix collision diagnostic
+    private static readonly DiagnosticDescriptor Culpeo004 = new(
+        id: "CULPEO004",
+        title: "Stream IDs produce duplicate generated method name",
+        messageFormat: "Stream IDs '{0}' and '{1}' produce the same generated method name '{2}'. Rename one to avoid a compile error.",
+        category: "CulpeoStream",
+        defaultSeverity: DiagnosticSeverity.Error,
         isEnabledByDefault: true);
 
     // ── IIncrementalGenerator implementation ──────────────────────────────────
@@ -101,6 +113,7 @@ public sealed class HandlerGenerator : IIncrementalGenerator
                     "CULPEO001" => Culpeo001,
                     "CULPEO002" => Culpeo002,
                     "CULPEO003" => Culpeo003,
+                    "CULPEO004" => Culpeo004,
                     _ => Culpeo002
                 };
 
@@ -147,7 +160,8 @@ public sealed class HandlerGenerator : IIncrementalGenerator
         bool implementsHandler = false;
         foreach (var iface in symbol.AllInterfaces)
         {
-            if (iface.Name == "ICulpeoStreamHandler") { implementsHandler = true; break; }
+            // F7: use fully-qualified name to avoid false match from user-defined ICulpeoStreamHandler
+            if (iface.ToDisplayString() == ICulpeoStreamHandlerFqn) { implementsHandler = true; break; }
         }
         if (!implementsHandler)
         {
@@ -172,7 +186,8 @@ public sealed class HandlerGenerator : IIncrementalGenerator
             AttributeData? declareAttr = null;
             foreach (var attr in field.GetAttributes())
             {
-                if (attr.AttributeClass?.Name == DeclareStreamAttrName)
+                // F7: use fully-qualified attribute name to avoid matching a user-defined DeclareStreamAttribute
+                if (attr.AttributeClass?.ToDisplayString() == DeclareStreamAttrFqn)
                 {
                     declareAttr = attr;
                     break;
@@ -180,8 +195,8 @@ public sealed class HandlerGenerator : IIncrementalGenerator
             }
             if (declareAttr is null) continue;
 
-            // CULPEO003: field type must be StreamDeclaration
-            if (field.Type.Name != "StreamDeclaration")
+            // CULPEO003: field type must be StreamDeclaration (F7: use FQN)
+            if (field.Type.ToDisplayString() != StreamDeclarationFqn)
             {
                 var loc = GetLocation(member.Locations.IsEmpty ? Location.None : member.Locations[0]);
                 diagnostics.Add(new DiagnosticInfo(
@@ -224,6 +239,27 @@ public sealed class HandlerGenerator : IIncrementalGenerator
                 purpose,
                 field.Name,
                 fieldLoc.FilePath, fieldLoc.Line, fieldLoc.Column));
+        }
+
+        // ── F2: Check for SafeMethodSuffix collisions → CULPEO004 ───────────────
+        var suffixToFirstStream = new System.Collections.Generic.Dictionary<string, StreamDescriptor>(StringComparer.Ordinal);
+        foreach (var stream in streams)
+        {
+            var suffix = stream.SafeMethodSuffix;
+            if (suffixToFirstStream.TryGetValue(suffix, out var first))
+            {
+                var loc = GetLocation(Location.None);
+                diagnostics.Add(new DiagnosticInfo(
+                    "CULPEO004",
+                    $"Stream IDs '{first.Id}' and '{stream.Id}' produce the same generated method name '{suffix}'. Rename one to avoid a compile error.",
+                    DiagnosticSeverity.Error,
+                    loc.FilePath, loc.Line, loc.Column,
+                    new object[] { first.Id, stream.Id, suffix }));
+            }
+            else
+            {
+                suffixToFirstStream[suffix] = stream;
+            }
         }
 
         var ns = symbol.ContainingNamespace?.IsGlobalNamespace == true

@@ -192,7 +192,7 @@ public sealed class AotPublishTests
     /// </summary>
     [Fact]
     [Trait("Category", "AotPublish")]
-    public void PublishAot_Core_ZeroIlcWarnings()
+    public async Task PublishAot_Core_ZeroIlcWarnings()
     {
         // Find the CulpeoStream.AotTests project directory by walking up from the
         // base directory of the current process.  AppContext.BaseDirectory is
@@ -233,11 +233,23 @@ public sealed class AotPublishTests
         using var process = Process.Start(psi);
         Assert.NotNull(process);
 
-        var stdout = process.StandardOutput.ReadToEnd();
-        var stderr = process.StandardError.ReadToEnd();
+        // F5: read stdout and stderr concurrently to avoid deadlock when one pipe fills
+        // (~64 KB OS buffer) before the other is drained.
+        var stdoutTask = process.StandardOutput.ReadToEndAsync();
+        var stderrTask = process.StandardError.ReadToEndAsync();
+        await Task.WhenAll(stdoutTask, stderrTask);
         process.WaitForExit(300_000); // 5 min max
 
+        var stdout = await stdoutTask;
+        var stderr = await stderrTask;
         var combinedOutput = stdout + "\n" + stderr;
+
+        // F6: assert the publish process itself succeeded before analysing ILC output.
+        // If it fails, the output may have no 'warning IL' lines and the test would
+        // otherwise pass green while hiding a real build failure.
+        Assert.True(
+            process.ExitCode == 0,
+            $"dotnet publish exited with code {process.ExitCode}. Full output:\n{combinedOutput}");
 
         // Collect ILC warnings that originate from CulpeoStream *source* assemblies
         // (not from the test project itself, which deliberately uses xUnit reflection).

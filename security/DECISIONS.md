@@ -296,3 +296,82 @@ after the check.  One-line fix.
 
 ### Resolution
 Open — awaiting C# agent fix.
+
+## Phase 5 scope decision — WASM integer overflow not filed as High
+**Date:** 2026-06-04
+**Target:** TypeScript
+**Status:** Accepted Risk
+
+### Context
+Phase 5 added `wasm-loader.ts` with a `serializeFrameWasm` function that
+accumulates header+body sizes into `outCap` in JS number arithmetic before
+passing the value to WASM32 `_malloc` and `_culpeo_serialize_frame`.
+
+### Finding or Decision
+If an attacker-controlled input causes `outCap` to exceed 2^32 − 1, the value
+is truncated modulo 2^32 when passed to WASM32 functions. Three outcomes:
+1. Truncated size < actual needed: C++ returns -1 (buffer too small), JS throws.
+2. Truncated size = 0: `_malloc(0 || 2)` allocates 2 bytes; C++ gets `out_cap=0`,
+   returns -1; JS throws.
+3. Truncated size wraps to exactly the right size: allocation succeeds, no issue.
+
+None of these outcomes cause heap corruption. WASM32's 32-bit address space is an
+inherent sandbox. The worst case is a confusing error on malformed input.
+I chose not to file this as a standalone security finding; the risk is DoS-only
+and the WASM sandbox prevents memory corruption. It is noted here for traceability.
+
+### Recommended Action
+Add a JS-side guard: `if (outCap > 0xFFFFFFFF) throw new Error("frame too large")`.
+This makes the failure explicit and avoids the truncation surprise.
+
+### Resolution
+Accepted Risk (Low severity, no memory safety impact).
+
+## Phase 5 scope decision — close code oracle not filed
+**Date:** 2026-06-04
+**Target:** TypeScript
+**Status:** Accepted Risk
+
+### Context
+Phase 5 formalises 4001 (unauthorized) and 4002 (protocol error) close codes.
+Question: does 4001 allow an attacker to enumerate valid session IDs?
+
+### Finding or Decision
+The `authenticate()` callback is invoked before the session store lookup. If the
+callback verifies session ownership (as the inline comment requires — SEC-020),
+an attacker with a stolen token but wrong session ID gets the same 4001 as an
+attacker with no token at all. No oracle is present.
+If the callback does NOT verify ownership, session hijacking is possible, but
+that is already filed as an open finding (2026-05-31-ts-session-resume-no-ownership-check.md).
+The close code itself is not an additional finding.
+
+### Recommended Action
+No new finding. Existing SEC-020 finding covers the ownership-check gap.
+
+### Resolution
+Accepted Risk — close code oracle does not exist when authenticate() is
+correctly implemented.
+
+## Phase 5 priority — auth-validate-optional-bypass classified Medium not Critical
+**Date:** 2026-06-04
+**Target:** C++
+**Status:** Open
+
+### Context
+`bindings.cpp` allows `on_auth_validate=None`, potentially leaving auth
+unenforced if the C++ session defaults to allow-all on a missing callback.
+
+### Finding or Decision
+Filed as Medium (not Critical) because the C++ `session.hpp` implementation is
+not visible in this review and may already default to deny-all on a missing
+callback. If it defaults to allow-all, this immediately upgrades to Critical.
+The test suite gap (no test for omitted callback + culpeo.init) means the
+behaviour is unverified.
+
+### Recommended Action
+C++ agent must clarify `SessionCallbacks.on_auth_validate` default behaviour and
+add a binding-layer assertion. If C++ default is allow-all, severity is Critical
+and blocks Phase 6.
+
+### Resolution
+Open — pending C++ agent response.

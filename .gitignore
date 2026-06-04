@@ -38,3 +38,4 @@ implementations/cpp/build-*/
 project.lock.json
 *.nuget.props
 *.nuget.targets
+implementations/cpp/culpeostream-py/tests/__pycache__/

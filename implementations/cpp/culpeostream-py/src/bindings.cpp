@@ -247,52 +247,102 @@ public:
 
         culpeo::session::SessionCallbacks cbs;
 
-        // on_auth_validate — required for auth enforcement
-        if (!on_auth_validate.is_none()) {
-            cbs.on_auth_validate = [cb = std::move(on_auth_validate)](
-                                       std::string_view token) -> bool {
+        // on_auth_validate — REQUIRED. The C++ session defaults to allow-all
+        // when no validator is set, which would accept every connection without
+        // a token check.  Reject None here to prevent silent security bypass.
+        if (on_auth_validate.is_none()) {
+            throw py::value_error(
+                "on_auth_validate is required; pass a callable to validate "
+                "auth tokens. To explicitly allow all connections (testing "
+                "only), pass: lambda token: True");
+        }
+        cbs.on_auth_validate = [cb = std::move(on_auth_validate)](
+                                   std::string_view token) noexcept -> bool {
+            try {
                 py::gil_scoped_acquire acquire;
                 return cb(std::string(token)).cast<bool>();
-            };
-        }
+            } catch (py::error_already_set& e) {
+                e.restore();
+                PyErr_Print();
+                return false; // deny auth on Python error
+            } catch (const std::exception& e) {
+                PySys_WriteStderr(
+                    "culpeostream-py: on_auth_validate error: %s\n", e.what());
+                return false;
+            }
+        };
 
         // on_media_received — optional
         if (!on_media_received.is_none()) {
             cbs.on_media_received = [cb = std::move(on_media_received)](
                                         const culpeo::session::StreamInfo& info,
                                         uint64_t ts_us,
-                                        std::span<const std::byte> body) {
-                py::gil_scoped_acquire acquire;
-                cb(info.id,
-                   ts_us,
-                   py::bytes(reinterpret_cast<const char*>(body.data()),
-                              body.size()));
+                                        std::span<const std::byte> body) noexcept {
+                try {
+                    py::gil_scoped_acquire acquire;
+                    cb(info.id,
+                       ts_us,
+                       py::bytes(reinterpret_cast<const char*>(body.data()),
+                                  body.size()));
+                } catch (py::error_already_set& e) {
+                    e.restore();
+                    PyErr_Print();
+                } catch (const std::exception& e) {
+                    PySys_WriteStderr(
+                        "culpeostream-py: on_media_received error: %s\n", e.what());
+                }
             };
         }
 
         // on_close — optional
         if (!on_close.is_none()) {
             cbs.on_close = [cb = std::move(on_close)](std::string_view code,
-                                                       std::string_view reason) {
-                py::gil_scoped_acquire acquire;
-                cb(std::string(code), std::string(reason));
+                                                       std::string_view reason) noexcept {
+                try {
+                    py::gil_scoped_acquire acquire;
+                    cb(std::string(code), std::string(reason));
+                } catch (py::error_already_set& e) {
+                    e.restore();
+                    PyErr_Print();
+                } catch (const std::exception& e) {
+                    PySys_WriteStderr(
+                        "culpeostream-py: on_close error: %s\n", e.what());
+                }
             };
         }
 
         // on_rtt — optional
         if (!on_rtt.is_none()) {
-            cbs.on_rtt = [cb = std::move(on_rtt)](std::chrono::microseconds rtt) {
-                py::gil_scoped_acquire acquire;
-                cb(rtt.count());
+            cbs.on_rtt = [cb = std::move(on_rtt)](std::chrono::microseconds rtt) noexcept {
+                try {
+                    py::gil_scoped_acquire acquire;
+                    cb(rtt.count());
+                } catch (py::error_already_set& e) {
+                    e.restore();
+                    PyErr_Print();
+                } catch (const std::exception& e) {
+                    PySys_WriteStderr(
+                        "culpeostream-py: on_rtt error: %s\n", e.what());
+                }
             };
         }
 
         // on_auth_response — required for auth-refresh flow
         if (!on_auth_response.is_none()) {
             cbs.on_auth_response = [cb = std::move(on_auth_response)](
-                                       std::string_view token) -> bool {
-                py::gil_scoped_acquire acquire;
-                return cb(std::string(token)).cast<bool>();
+                                       std::string_view token) noexcept -> bool {
+                try {
+                    py::gil_scoped_acquire acquire;
+                    return cb(std::string(token)).cast<bool>();
+                } catch (py::error_already_set& e) {
+                    e.restore();
+                    PyErr_Print();
+                    return false; // deny refresh on Python error
+                } catch (const std::exception& e) {
+                    PySys_WriteStderr(
+                        "culpeostream-py: on_auth_response error: %s\n", e.what());
+                    return false;
+                }
             };
         }
 
@@ -480,9 +530,13 @@ private:
 // pop frames from the queue.  Python calls send_text/send_binary to post
 // sends back to the io_context.
 //
-// Lifetime contract:
-//   • transport_ (culpeo::IAsyncTransport*) is valid only during handle().
-//   • valid_ is set to false when handle() exits; any subsequent send throws.
+// Lifetime contract (Finding 2 fix):
+//   • transport_ and ioc_ are raw pointers valid only while handle() runs.
+//   • send_mutex_ guards the check+use of transport_/ioc_ atomically,
+//     preventing TOCTOU races between validity check and pointer dereference.
+//   • set_eof() nulls out transport_ and ioc_ under send_mutex_ before
+//     closing the rx_queue_, so no use-after-free is possible even if Python
+//     holds a reference to a PyServerTransport after PyH2Server is destroyed.
 
 class PyServerTransport : public std::enable_shared_from_this<PyServerTransport> {
 public:
@@ -495,8 +549,14 @@ public:
     }
 
     // Called from the C++ coroutine thread when the session ends.
+    // Nulls out the raw pointers under send_mutex_ to prevent use-after-free,
+    // then closes the rx_queue_ to unblock any waiting receive_frame().
     void set_eof() {
-        valid_.store(false, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lk(send_mutex_);
+            transport_ = nullptr;
+            ioc_       = nullptr;
+        }
         rx_queue_.close();
     }
 
@@ -517,46 +577,74 @@ public:
     }
 
     // Python: send a control frame (blocks until sent, GIL released).
+    // Atomically checks validity and captures the awaitable+ioc under
+    // send_mutex_ to eliminate the TOCTOU race (Finding 2 fix).
     void send_text(py::bytes data) {
-        check_valid();
         auto vec = bytes_to_vec(data);
-        spawn_void(transport_->send_text({vec.data(), vec.size()}));
+        asio::io_context* ioc_ptr = nullptr;
+        std::optional<asio::awaitable<void>> coro;
+        {
+            std::lock_guard<std::mutex> lk(send_mutex_);
+            if (!transport_ || !ioc_) {
+                throw std::runtime_error("session transport has been closed");
+            }
+            // Obtain the lazy awaitable while the pointer is guaranteed live.
+            coro    = transport_->send_text({vec.data(), vec.size()});
+            ioc_ptr = ioc_;
+        }
+        auto fut = asio::co_spawn(*ioc_ptr, std::move(*coro), asio::use_future);
+        py::gil_scoped_release release;
+        fut.get();
     }
 
     // Python: send a media frame.
     void send_binary(py::bytes data) {
-        check_valid();
         auto vec = bytes_to_vec(data);
-        spawn_void(transport_->send_binary({vec.data(), vec.size()}));
+        asio::io_context* ioc_ptr = nullptr;
+        std::optional<asio::awaitable<void>> coro;
+        {
+            std::lock_guard<std::mutex> lk(send_mutex_);
+            if (!transport_ || !ioc_) {
+                throw std::runtime_error("session transport has been closed");
+            }
+            coro    = transport_->send_binary({vec.data(), vec.size()});
+            ioc_ptr = ioc_;
+        }
+        auto fut = asio::co_spawn(*ioc_ptr, std::move(*coro), asio::use_future);
+        py::gil_scoped_release release;
+        fut.get();
     }
 
     // Python: close the transport.
     void close_transport(int code, std::string reason) {
-        check_valid();
-        spawn_void(transport_->close(code, std::move(reason)));
-    }
-
-    bool is_valid() const noexcept {
-        return valid_.load(std::memory_order_acquire);
-    }
-
-private:
-    culpeo::IAsyncTransport*                                          transport_;
-    asio::io_context*                                                 ioc_;
-    SafeQueue<std::pair<uint8_t, std::vector<std::byte>>>             rx_queue_;
-    std::atomic<bool>                                                 valid_{true};
-
-    void check_valid() const {
-        if (!valid_.load(std::memory_order_acquire)) {
-            throw std::runtime_error("session transport has been closed");
+        asio::io_context* ioc_ptr = nullptr;
+        std::optional<asio::awaitable<void>> coro;
+        {
+            std::lock_guard<std::mutex> lk(send_mutex_);
+            if (!transport_ || !ioc_) {
+                throw std::runtime_error("session transport has been closed");
+            }
+            coro    = transport_->close(code, std::move(reason));
+            ioc_ptr = ioc_;
         }
-    }
-
-    void spawn_void(asio::awaitable<void> coro) {
-        auto fut = asio::co_spawn(*ioc_, std::move(coro), asio::use_future);
+        auto fut = asio::co_spawn(*ioc_ptr, std::move(*coro), asio::use_future);
         py::gil_scoped_release release;
         fut.get();
     }
+
+    bool is_valid() const noexcept {
+        std::lock_guard<std::mutex> lk(send_mutex_);
+        return transport_ != nullptr;
+    }
+
+private:
+    // Protects transport_, ioc_ check+use atomically (Finding 2 fix).
+    // Reason for mutex: compound check+use — atomic alone cannot protect the
+    // pointer dereference that follows the validity check.
+    mutable std::mutex                                                send_mutex_;
+    culpeo::IAsyncTransport*                                          transport_;
+    asio::io_context*                                                 ioc_;
+    SafeQueue<std::pair<uint8_t, std::vector<std::byte>>>             rx_queue_;
 };
 
 // ISessionHandler implementation: bridges the C++ coroutine API to Python.
