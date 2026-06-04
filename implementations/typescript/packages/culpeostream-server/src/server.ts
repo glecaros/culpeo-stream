@@ -316,7 +316,7 @@ class ServerConnection {
   private closed = false;
 
   public constructor(
-    private readonly ws: WebSocketType,
+    ws: WebSocketType,
     private readonly options: CulpeoServerOptions,
     private readonly store: ISessionStore,
     private readonly onClose: () => void,
@@ -325,9 +325,9 @@ class ServerConnection {
     void this.runMessageLoop();
   }
 
-  /** Terminate the underlying WebSocket immediately (for server shutdown). */
+  /** Close the connection immediately (for server shutdown). */
   public terminate(): void {
-    this.ws.terminate();
+    void this.wsClient.close(1000, "Server shutdown");
   }
 
   // ---------------------------------------------------------------------------
