@@ -1,4 +1,17 @@
-# CulpeoStream Monorepo
+# CulpeoStream Monorepo (archived)
+
+> **This repository has been migrated to [culpeo-labs](https://github.com/culpeo-labs).**
+> It is kept for historical reference only. Please use the new repos below.
+
+| Repo | Description |
+|------|-------------|
+| [culpeo-labs/culpeostream-spec](https://github.com/culpeo-labs/culpeostream-spec) | Protocol specification, security analysis, interop fixtures |
+| [culpeo-labs/culpeostream-ts](https://github.com/culpeo-labs/culpeostream-ts) | TypeScript — browser + Node.js |
+| [culpeo-labs/culpeostream-csharp](https://github.com/culpeo-labs/culpeostream-csharp) | C# — ASP.NET Core |
+| [culpeo-labs/culpeostream-cpp](https://github.com/culpeo-labs/culpeostream-cpp) | C++ core library + Python bindings |
+| [culpeo-labs/culpeo-docs](https://github.com/culpeo-labs/culpeo-docs) | Documentation site |
+
+---
 
 This repository contains the CulpeoStream protocol specification, reference implementations, and security analysis.
 
